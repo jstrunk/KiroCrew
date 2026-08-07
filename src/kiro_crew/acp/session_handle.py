@@ -115,6 +115,12 @@ class WatchdogSettings:
     tool_stall_hard_cap_secs: float = 10800.0
     model_silent_probe_secs: float = 900.0
     wellness_sample_secs: float = 3.0
+    # Whether a per-agent watchdog_tool_stall_* override was applied to this
+    # snapshot. Telemetry-only (the kirocrew.watchdog.action attr): a BOOLEAN,
+    # never the agent name — free-form agent names are a cardinality bomb on
+    # OTel attrs (metrics/schema.py); per-agent joins happen via the always-on
+    # token row store instead.
+    agent_override: bool = False
 
 
 def _load_watchdog_settings(agent: str = "") -> WatchdogSettings:
@@ -140,6 +146,7 @@ def _load_watchdog_settings(agent: str = "") -> WatchdogSettings:
         w = cfg.watchdog
         suspect = float(w.tool_stall_suspect_secs)
         hard_cap = float(w.tool_stall_hard_cap_secs)
+        overridden = False
         if agent:
             crew = cfg.agents.get(agent)
             if crew is None:
@@ -148,8 +155,10 @@ def _load_watchdog_settings(agent: str = "") -> WatchdogSettings:
             if crew is not None:
                 if crew.watchdog_tool_stall_suspect_secs > 0:
                     suspect = float(crew.watchdog_tool_stall_suspect_secs)
+                    overridden = True
                 if crew.watchdog_tool_stall_hard_cap_secs > 0:
                     hard_cap = float(crew.watchdog_tool_stall_hard_cap_secs)
+                    overridden = True
         return WatchdogSettings(
             check_after_secs=float(w.check_after_secs),
             stale_window_secs=float(w.stale_window_secs),
@@ -157,6 +166,7 @@ def _load_watchdog_settings(agent: str = "") -> WatchdogSettings:
             tool_stall_hard_cap_secs=hard_cap,
             model_silent_probe_secs=float(w.model_silent_probe_secs),
             wellness_sample_secs=float(w.wellness_sample_secs),
+            agent_override=overridden,
         )
     except Exception:
         logger.debug("watchdog settings load failed — using defaults", exc_info=True)
@@ -165,6 +175,31 @@ def _load_watchdog_settings(agent: str = "") -> WatchdogSettings:
 
 # How often a WORKING-verdict deferral is logged (evidence trail without spam).
 _WORKING_LOG_INTERVAL_SECS = 600.0
+
+
+def _watchdog_evidence_class(evidence: str) -> str:
+    """Bucket a free-form oracle evidence string into a closed enum.
+
+    OTel attribute values MUST be low-cardinality (metrics/schema.py): the raw
+    evidence carries pids, byte deltas, and command fragments, so only its
+    SHAPE is emitted. Buckets: ``established_flat`` (LLM-shaped — runtime-held
+    backend socket, flat subtree), ``mcp_flat`` (opaque MCP tool, moving or
+    flat), ``shell`` (shell-child evidence), ``wait`` (the declared-duration
+    wait tool), ``degraded`` (everything else: sampling baseline, unreadable
+    /proc, no pid, oracle error — the oracle could not attest either way).
+    """
+    e = evidence or ""
+    if e.startswith(EVIDENCE_ESTABLISHED_FLAT):
+        return "established_flat"
+    if "mcp subtree" in e:
+        return "mcp_flat"
+    if "shell child" in e:
+        return "shell"
+    if e.startswith("wait tool"):
+        return "wait"
+    return "degraded"
+
+
 # Unresponsive-cancel budget: after cancel() is sent, if kiro-cli does not
 # ack (via a cancelled stopReason on the prompt response) within this window,
 # the dispatch loop unblocks the caller with a terminal EVENT_COMPLETE. The
@@ -262,6 +297,10 @@ class AcpSessionHandle:
         # ``agent`` (the session's agent name, when the constructor knows it)
         # lets the snapshot apply that agent's per-agent watchdog_tool_stall_*
         # overrides; an explicit ``watchdog`` (tests) always wins verbatim.
+        # The name itself is kept for logs/row-store joins only — it must NEVER
+        # become an OTel metric attribute (free-form => cardinality bomb; see
+        # metrics/schema.py). Telemetry carries the agent_override BOOLEAN.
+        self._agent = agent
         self._watchdog = watchdog if watchdog is not None else _load_watchdog_settings(agent)
         self._oracle = LivenessOracle(sample_min_secs=self._watchdog.wellness_sample_secs)
         # Snapshot of the most recent EVENT_TOOL_CALL (title/redacted input/
@@ -1192,7 +1231,8 @@ class AcpSessionHandle:
                         # WORKING was already deferred above; the action below is
                         # the existing non-lethal tool-stall recovery.
                         _suspect = wd.tool_stall_suspect_secs
-                        if evidence.startswith(EVIDENCE_ESTABLISHED_FLAT):
+                        _narrowed = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
+                        if _narrowed:
                             _suspect = min(wd.model_silent_probe_secs, _suspect)
                         _acting = (
                             verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT)
@@ -1200,6 +1240,9 @@ class AcpSessionHandle:
                         )
                         if not _acting:
                             continue  # UNKNOWN, within budget — keep waiting
+                        self._emit_watchdog_metric(
+                            "cancel", verdict, evidence, _tool_idle, narrowed=_narrowed
+                        )
                         async for ev in self._end_stalled_tool(verdict, evidence, _tool_idle):
                             yield ev
                         return
@@ -1212,6 +1255,7 @@ class AcpSessionHandle:
                         if verdict == VERDICT_WORKING:
                             self._log_working_deferral(_stale_idle, evidence)
                             continue
+                        _flat_wait = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
                         if verdict != VERDICT_DEAD:
                             # UNKNOWN: probe only past the window. An established-
                             # but-flat backend connection is probably a non-streamed
@@ -1220,7 +1264,7 @@ class AcpSessionHandle:
                             # cap bounds any UNKNOWN deferral absolutely.
                             window = (
                                 wd.model_silent_probe_secs
-                                if evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
+                                if _flat_wait
                                 else wd.stale_window_secs
                             )
                             if _stale_idle <= min(window, wd.tool_stall_hard_cap_secs):
@@ -1231,6 +1275,11 @@ class AcpSessionHandle:
                         # turn-complete branch (auto-recovery, never "cancelled by
                         # user"), and an unacked cancel confirms the wedge via the
                         # unresponsive-cancel branch at the loop top.
+                        # ``narrowed`` here = the extended established_flat window
+                        # governed the decision (not the ordinary stale window).
+                        self._emit_watchdog_metric(
+                            "probe", verdict, evidence, _stale_idle, narrowed=_flat_wait
+                        )
                         logger.warning(
                             "Stale turn on session %s (idle %.0fs, verdict=%s: %s) — "
                             "probing via session/cancel",
@@ -1502,6 +1551,53 @@ class AcpSessionHandle:
             "Watchdog deferral on session %s: idle %.0fs but verdict WORKING (%s)",
             self._session_id, idle, evidence,
         )
+        # Telemetry rides the same rate limit as the log line: one deferral
+        # point per interval per session, so a 3h WORKING build contributes a
+        # bounded handful of points instead of one per 5s dispatch tick.
+        self._emit_watchdog_metric("deferral", VERDICT_WORKING, evidence, idle)
+
+    def _emit_watchdog_metric(
+        self, action: str, verdict: str, evidence: str, idle: float, *, narrowed: bool = False
+    ) -> None:
+        """Emit kirocrew.watchdog.action + kirocrew.watchdog.idle_secs (best-effort).
+
+        One counter point + one histogram point per watchdog DECISION —
+        ``deferral`` (WORKING, rate-limited via _log_working_deferral),
+        ``probe`` (the non-lethal session/cancel stale probe), and ``cancel``
+        (tool-stall recovery via _end_stalled_tool). Attrs are all closed
+        enums (metrics/schema.py cardinality rule): the free-form evidence is
+        bucketed by :func:`_watchdog_evidence_class`; ``window`` says whether
+        the established_flat narrowing chose the effective window;
+        ``agent_override`` is the per-agent-override BOOLEAN from the settings
+        snapshot — deliberately NOT the agent name (per-agent joins happen via
+        the always-on token row store, not OTel attrs). Failures never reach
+        the dispatch loop.
+        """
+        try:
+            # circular import: importing get_recorder at module top would form
+            # config.loader -> ... -> acp.client -> metrics.provider ->
+            # config.loader (provider reads KiroCrewConfig). Keep it lazy so
+            # provider is never loaded during config.loader's import chain
+            # (mirrors AcpClient.ensure_ready's emit).
+            from kiro_crew.metrics.provider import get_recorder
+
+            attrs: dict[str, str | int | bool | float] = {
+                "action": action,
+                "verdict": verdict,
+                "evidence_class": _watchdog_evidence_class(evidence),
+                "window": "narrowed" if narrowed else "standard",
+                "agent_override": bool(self._watchdog.agent_override),
+            }
+            rec = get_recorder()
+            rec.counter("kirocrew.watchdog.action", attrs=attrs)
+            rec.histogram(
+                "kirocrew.watchdog.idle_secs",
+                float(idle),
+                unit="s",
+                attrs={"action": action, "evidence_class": attrs["evidence_class"]},
+            )
+        except Exception:  # telemetry must never break the watchdog
+            logger.debug("watchdog metric emit failed", exc_info=True)
 
     async def _end_stalled_tool(
         self, verdict: str, evidence: str, idle: float

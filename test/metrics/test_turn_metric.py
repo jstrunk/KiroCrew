@@ -70,8 +70,22 @@ class TestTurnMetricOutcomeMapping:
     def test_error_prefix_is_error(self):
         assert _turn_call(_run(2000, "error: cancel unacked"))["attrs"]["outcome"] == "error"
 
-    def test_stale_recover_is_error(self):
-        assert _turn_call(_run(7000, "stale_recover"))["attrs"]["outcome"] == "error"
+    def test_stale_recover_is_distinct_outcome(self):
+        """Watchdog stall recoveries are their own outcome, not folded into
+        error — a recovered stall is re-driven in place, and counting it as a
+        generic fault would both inflate the fault rate and hide the stall
+        population the watchdog metrics exist to measure."""
+        assert _turn_call(_run(7000, "stale_recover"))["attrs"]["outcome"] == "stale_recover"
+
+    def test_tool_stall_is_distinct_outcome(self):
+        """STOP_REASON_TOOL_STALL starts with "error:" by design (branch-less
+        callers degrade to generic handling) — the outcome mapping must check
+        it BEFORE the error/timeout fallbacks."""
+        from kiro_crew.acp.types import STOP_REASON_TOOL_STALL
+
+        assert (
+            _turn_call(_run(9000, STOP_REASON_TOOL_STALL))["attrs"]["outcome"] == "tool_stall"
+        )
 
     def test_timeout_is_timeout(self):
         assert _turn_call(_run(120000, "timeout"))["attrs"]["outcome"] == "timeout"

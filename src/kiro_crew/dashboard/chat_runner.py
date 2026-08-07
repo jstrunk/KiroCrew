@@ -241,10 +241,21 @@ def _turn_outcome(stop_reason: str | None) -> str:
     Single source of truth shared by the ``kirocrew.turn.duration`` emit in
     ``_run_chat`` and its unit test, so the mapping can't silently drift from
     what the test asserts (tests must exercise real production logic).
+
+    The two watchdog stop reasons are distinct outcomes, not ``error``: a
+    stall-recovery turn is re-driven in place (its budget/outcome is tracked
+    by ``kirocrew.watchdog.recovery.outcome``), so folding it into ``error``
+    would make the fault rate count every recovered stall as a fault AND hide
+    the stall population the watchdog work exists to measure. Checked BEFORE
+    the ``timeout`` substring so a stall never misclassifies.
     """
     s = stop_reason or ""
     if s in ("", "end_turn", "stop", "completed"):
         return "ok"
+    if s == STOP_REASON_TOOL_STALL:
+        return "tool_stall"
+    if s == STOP_REASON_STALE_RECOVER:
+        return "stale_recover"
     if "timeout" in s:
         return "timeout"
     return "error"
@@ -297,6 +308,37 @@ def _emit_turn_metric(
         get_recorder().histogram("kirocrew.turn.duration", value, unit="ms", attrs=attrs)
     except Exception:
         logger.debug("turn metric emit failed", exc_info=True)
+
+
+def _emit_recovery_outcome(mechanism: str, outcome: str, attempts: int) -> None:
+    """Emit kirocrew.watchdog.recovery.outcome (best-effort).
+
+    One counter point per RESOLVED recovery cycle, derived from the per-slot
+    retry budgets the stop-reason branches already maintain
+    (``slot._stale_recovery_retries`` / ``slot._tool_stall_retries``):
+
+    - ``outcome=recovered`` — a synthetic recovery turn completed ``ok`` while
+      a budget was armed (emitted at the budget-reset block, which is the one
+      place a completed cycle and its attempt count coexist).
+    - ``outcome=exhausted`` — the budget hit its cap and the slot surfaced
+      "start a new chat" (emitted in the stall branches themselves).
+
+    ``attempt_bucket`` is the attempt count clamped to the budget cap (1-3) —
+    a closed enum per the metrics/schema.py cardinality rule, mirroring the
+    CLI's ``attempt_number_bucket`` precedent. Single source of truth shared
+    with its unit test so the mapping cannot silently drift.
+    """
+    try:
+        get_recorder().counter(
+            "kirocrew.watchdog.recovery.outcome",
+            attrs={
+                "mechanism": mechanism,
+                "outcome": outcome,
+                "attempt_bucket": max(1, min(int(attempts), 3)),
+            },
+        )
+    except Exception:
+        logger.debug("recovery outcome metric emit failed", exc_info=True)
 
 
 def _pre_tool_hooks_should_block(pre_hook_results: Any) -> bool:
@@ -4820,6 +4862,12 @@ async def _run_chat(
                 )
                 _emit_stale("⟳ Recovering a stalled turn…")
             elif slot._stale_recovery_retries >= 3:
+                # Budget exhausted — the terminal outcome of this recovery
+                # cycle (the recovered counterpart is emitted at the budget
+                # reset on a completed turn).
+                _emit_recovery_outcome(
+                    "stale_recover", "exhausted", slot._stale_recovery_retries
+                )
                 _emit_stale("Session stuck — please start a new chat.")
             else:
                 # depth>0 (nested turn) with budget remaining: reset the session
@@ -4865,6 +4913,8 @@ async def _run_chat(
                 )
                 _emit_stall("⟳ Tool appeared stalled — recovering…")
             elif slot._tool_stall_retries >= 3:
+                # Budget exhausted — mirrors the stale_recover branch above.
+                _emit_recovery_outcome("tool_stall", "exhausted", slot._tool_stall_retries)
                 _emit_stall("Session stuck — please start a new chat.")
             else:
                 _emit_stall("⟳ Tool appeared stalled — please retry.")
@@ -5149,6 +5199,23 @@ async def _run_chat(
             # every counter: an empty re-queue is NOT a successful turn, so it must
             # not reset the pipe-death/busy budgets (otherwise an empty interleaved
             # between transient failures would extend the intended 3-retry budget).
+            #
+            # A non-zero stall budget reaching this reset on an OK turn is a
+            # COMPLETED recovery cycle: the stall branches return early, so the
+            # only way here with an armed budget is the synthetic recovery turn
+            # finishing cleanly. Emit outcome=recovered with the attempt count
+            # read BEFORE the reset (the exhausted counterpart lives in the
+            # stall branches). Gated on the ok outcome so a user cancelling the
+            # recovery turn is never counted as a successful recovery.
+            if _turn_outcome(_stop_reason) == "ok":
+                if slot._stale_recovery_retries > 0:
+                    _emit_recovery_outcome(
+                        "stale_recover", "recovered", slot._stale_recovery_retries
+                    )
+                if slot._tool_stall_retries > 0:
+                    _emit_recovery_outcome(
+                        "tool_stall", "recovered", slot._tool_stall_retries
+                    )
             slot._empty_response_retries = 0
             slot._prompt_busy_retries = 0
             slot._acp_pipe_death_retries = 0

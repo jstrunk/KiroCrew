@@ -33,9 +33,10 @@ from kiro_crew.metrics.provider import (
 )
 
 _SRC = Path(provider_mod.__file__).resolve().parent.parent
-# Histogram instrument names are the `.duration` metrics; counters end in
-# `.count` / `.acquire` and carry no bounds.
-_NAME_RE = re.compile(r'"(kirocrew\.[a-z0-9_.]*\.duration)"')
+# Histogram instrument names are the `.duration` metrics plus the seconds-unit
+# `watchdog.idle_secs`; counters end in `.count` / `.acquire` / `.action` /
+# `.outcome` and carry no bounds.
+_NAME_RE = re.compile(r'"(kirocrew\.[a-z0-9_.]*\.(?:duration|idle_secs))"')
 
 
 def _source_histogram_names() -> set[str]:

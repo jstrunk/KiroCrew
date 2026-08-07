@@ -175,6 +175,17 @@ _TURN_BUCKETS_MS: list[float] = [
     1800000, 2700000, 3600000,
 ]
 
+# SECONDS (not ms) — watchdog idle-at-decision. The watchdog consults the
+# oracle from check_after_secs (60s) and the UNKNOWN windows reach the 3h
+# (10800s) hard cap, so the range is 1s .. 4h; densest around the window
+# boundaries (300s stale / 900s model-silent / 10800s build cap) that the
+# distribution is meant to tune. Sub-minute bounds exist because tests and
+# per-agent overrides can legitimately act earlier than the default 60s gate.
+_WATCHDOG_IDLE_BUCKETS_S: list[float] = [
+    1, 5, 15, 30, 60, 120, 180, 300, 450, 600, 900,
+    1800, 3600, 5400, 7200, 10800, 14400,
+]
+
 # Instrument name -> boundaries. This map is the COMPLETE set of kirocrew
 # duration histograms: the Views below are built from it and there is no
 # catch-all, because the OTEL SDK applies EVERY matching View rather than the
@@ -184,7 +195,9 @@ _TURN_BUCKETS_MS: list[float] = [
 # Consequence: a new histogram missing from this map falls back to OTEL's
 # default 10s-ceiling boundaries. `test/metrics/test_provider_bucket_views.py`
 # fails when a histogram metric name in the source has no entry here — add the
-# instrument to this map when you add the metric.
+# instrument to this map when you add the metric. Values are in each
+# instrument's own unit: ms for the `.duration` families, seconds for
+# `kirocrew.watchdog.idle_secs`.
 _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.gateway.request.duration": _FAST_BUCKETS_MS,
     "kirocrew.db.query.duration": _FAST_BUCKETS_MS,
@@ -198,6 +211,7 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.mcp.lazy_load.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.gateway.boot.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.turn.duration": _TURN_BUCKETS_MS,
+    "kirocrew.watchdog.idle_secs": _WATCHDOG_IDLE_BUCKETS_S,
 }
 
 _lock = threading.Lock()
