@@ -411,6 +411,30 @@ class LivenessOracle:
         moved, evidence = self._tree_movement(runtime_pid)
         if moved:
             return VERDICT_WORKING, f"mcp subtree active ({evidence})"
+        # LLM-turn shape inside a tool (e.g. a use_subagent call wrapping a
+        # model turn in kiro-cli): the subtree is GENUINELY flat (a real
+        # two-sample delta, not the baseline tick or unreadable counters) and
+        # the RUNTIME PROCESS ITSELF holds an established backend socket. Tag
+        # it — same tag as the model-wait branch — so the caller narrows the
+        # UNKNOWN window to the model-silent budget instead of the build-scale
+        # forbearance. Verdict stays UNKNOWN: the tag is evidence, never an
+        # action. Deliberately NARROWER than the model-wait branch's full-tree
+        # ``_any_established``: here the descendants include the tool's own
+        # workers, and an MCP server blocked on ITS remote socket (a long
+        # remote call, zero CPU/IO while in recv) must keep the full tool
+        # windows — only kiro-cli's own backend connection is LLM-wait
+        # evidence. Shell-child evidence never reaches this branch (it returns
+        # from _check_shell_child above), and a flat subtree without the
+        # runtime-held socket keeps the plain evidence. Under the OS sandbox
+        # (pid = launcher parent) the runtime holds no sockets, so this fails
+        # toward the old full-window behavior, never toward over-narrowing.
+        if evidence not in ("sampling", "no readable counters"):
+            held = socket_inodes(self._proc, runtime_pid)
+            if held and held & established_inodes(self._proc, runtime_pid):
+                return (
+                    VERDICT_UNKNOWN,
+                    f"{EVIDENCE_ESTABLISHED_FLAT}: mcp subtree flat ({evidence})",
+                )
         return VERDICT_UNKNOWN, f"mcp subtree flat ({evidence})"
 
     def _check_shell_child(self, runtime_pid: int, tool: ToolCallState) -> tuple[str, str]:

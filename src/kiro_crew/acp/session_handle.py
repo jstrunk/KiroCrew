@@ -117,20 +117,44 @@ class WatchdogSettings:
     wellness_sample_secs: float = 3.0
 
 
-def _load_watchdog_settings() -> WatchdogSettings:
+def _load_watchdog_settings(agent: str = "") -> WatchdogSettings:
     """Snapshot ``watchdog.*`` from config. Function-level import (mirrors
     ``_sync_effort_levels``) avoids the config -> dashboard -> acp import
-    cycle; any failure falls back to defaults rather than breaking a handle."""
+    cycle; any failure falls back to defaults rather than breaking a handle.
+
+    ``agent`` overlays that agent's ``watchdog_tool_stall_*`` overrides (> 0
+    means override; 0 inherits the global window — the same empty-inherits
+    convention as the agent's ``model``). Callers pass whichever name they
+    hold — the KiroCrew agent (crew) name or the bound kiro agent name — so
+    the crew namespace is tried first, then an UNAMBIGUOUS ``kiro_agent``
+    binding (mirrors ``_session_model``'s dual-namespace tolerance). Two crews
+    binding the same kiro agent cannot be told apart from the kiro name alone,
+    so that case inherits the global (fails toward the LONG build-safe window,
+    never toward a surprise early cancel).
+    """
     try:
         # circular import: config.loader -> dashboard -> session -> acp
         from kiro_crew.config.loader import KiroCrewConfig
 
-        w = KiroCrewConfig.load().watchdog
+        cfg = KiroCrewConfig.load()
+        w = cfg.watchdog
+        suspect = float(w.tool_stall_suspect_secs)
+        hard_cap = float(w.tool_stall_hard_cap_secs)
+        if agent:
+            crew = cfg.agents.get(agent)
+            if crew is None:
+                bound = [c for c in cfg.agents.values() if c.kiro_agent == agent]
+                crew = bound[0] if len(bound) == 1 else None
+            if crew is not None:
+                if crew.watchdog_tool_stall_suspect_secs > 0:
+                    suspect = float(crew.watchdog_tool_stall_suspect_secs)
+                if crew.watchdog_tool_stall_hard_cap_secs > 0:
+                    hard_cap = float(crew.watchdog_tool_stall_hard_cap_secs)
         return WatchdogSettings(
             check_after_secs=float(w.check_after_secs),
             stale_window_secs=float(w.stale_window_secs),
-            tool_stall_suspect_secs=float(w.tool_stall_suspect_secs),
-            tool_stall_hard_cap_secs=float(w.tool_stall_hard_cap_secs),
+            tool_stall_suspect_secs=suspect,
+            tool_stall_hard_cap_secs=hard_cap,
             model_silent_probe_secs=float(w.model_silent_probe_secs),
             wellness_sample_secs=float(w.wellness_sample_secs),
         )
@@ -224,6 +248,7 @@ class AcpSessionHandle:
         queue: asyncio.Queue[JsonRpcMessage | None],
         runtime: AcpRuntimeProtocol,
         watchdog: WatchdogSettings | None = None,
+        agent: str = "",
     ) -> None:
         self._session_id = session_id
         self._queue = queue
@@ -234,7 +259,10 @@ class AcpSessionHandle:
         # Watchdog windows are snapshotted here (construction time) so the
         # dispatch loop never reads config; the liveness oracle carries the
         # per-session evidence state (tracked child, counter samples).
-        self._watchdog = watchdog if watchdog is not None else _load_watchdog_settings()
+        # ``agent`` (the session's agent name, when the constructor knows it)
+        # lets the snapshot apply that agent's per-agent watchdog_tool_stall_*
+        # overrides; an explicit ``watchdog`` (tests) always wins verbatim.
+        self._watchdog = watchdog if watchdog is not None else _load_watchdog_settings(agent)
         self._oracle = LivenessOracle(sample_min_secs=self._watchdog.wellness_sample_secs)
         # Snapshot of the most recent EVENT_TOOL_CALL (title/redacted input/
         # dispatch time/shell flag) — the oracle's attribution key. Cleared on
@@ -1152,10 +1180,23 @@ class AcpSessionHandle:
                             continue
                         # UNKNOWN acts at the suspect window; the hard cap governs
                         # only the stale/model-wait branch below (it bounds the
-                        # extended UNKNOWN deferral windows there).
+                        # extended UNKNOWN deferral windows there). The 3h suspect
+                        # default is BUILD-scale forbearance — an LLM-shaped stall
+                        # (flat subtree whose only live evidence is an established
+                        # backend socket: a model turn riding inside a tool, e.g.
+                        # kiro-cli use_subagent) narrows to the model-silent budget,
+                        # because its longest legitimate silent gap is minutes, not
+                        # hours. Keyed STRICTLY on the oracle's established_flat
+                        # evidence tag: plain flat-subtree or shell-child evidence
+                        # (a quiet build / quiet MCP tool) keeps the full window.
+                        # WORKING was already deferred above; the action below is
+                        # the existing non-lethal tool-stall recovery.
+                        _suspect = wd.tool_stall_suspect_secs
+                        if evidence.startswith(EVIDENCE_ESTABLISHED_FLAT):
+                            _suspect = min(wd.model_silent_probe_secs, _suspect)
                         _acting = (
                             verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT)
-                            or _tool_idle > wd.tool_stall_suspect_secs
+                            or _tool_idle > _suspect
                         )
                         if not _acting:
                             continue  # UNKNOWN, within budget — keep waiting

@@ -2186,6 +2186,30 @@ class KiroCrewAgentConfig:
         default="kirocrew",
         metadata=_meta("Source", "Agent origin: kirocrew or builtin."),
     )
+    # Per-agent watchdog window overrides. The global ``watchdog.tool_stall_*``
+    # defaults (3h) are build-scale forbearance; an agent that never runs a long
+    # build (a pure-LLM reviewer, read-only git) can declare much lower windows
+    # here. 0 (the default) inherits the global value — mirrors the
+    # empty-inherits convention of ``model`` above.
+    watchdog_tool_stall_suspect_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "Tool stall suspect override (s)",
+            "Per-agent override for watchdog.tool_stall_suspect_secs on sessions "
+            "running this agent. 0 inherits the global window (default 3h, tuned "
+            "for long builds). Set low (e.g. 900) for a pure-LLM agent whose "
+            "longest legitimate silent gap is minutes, not hours.",
+        ),
+    )
+    watchdog_tool_stall_hard_cap_secs: float = field(
+        default=0.0,
+        metadata=_meta(
+            "Tool stall hard cap override (s)",
+            "Per-agent override for watchdog.tool_stall_hard_cap_secs on sessions "
+            "running this agent. 0 inherits the global cap (default 3h). Applies "
+            "ONLY to UNKNOWN verdicts — a WORKING session is never acted on.",
+        ),
+    )
 
 
 @dataclass
@@ -4469,6 +4493,17 @@ class KiroCrewConfig:
                         description=entry.get("description", ""),
                         triggers=raw_triggers if isinstance(raw_triggers, str) else "",
                         source=entry.get("source", "kirocrew"),
+                        # Same guard family as model/triggers: config.json is
+                        # hand-editable, so a junk value must collapse to 0
+                        # (inherit the global window), never crash the load.
+                        # lo=0 keeps a negative override from arming an
+                        # instant-cancel window.
+                        watchdog_tool_stall_suspect_secs=_safe_float(
+                            entry.get("watchdog_tool_stall_suspect_secs", 0.0), 0.0, lo=0.0
+                        ),
+                        watchdog_tool_stall_hard_cap_secs=_safe_float(
+                            entry.get("watchdog_tool_stall_hard_cap_secs", 0.0), 0.0, lo=0.0
+                        ),
                     )
 
         # Migrate workspaces from flat or structured format

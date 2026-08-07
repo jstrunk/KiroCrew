@@ -417,6 +417,198 @@ async def test_unknown_tool_verdict_waits_for_suspect_window():
 
 
 @pytest.mark.asyncio
+async def test_established_flat_tool_verdict_narrows_to_model_silent_window():
+    """UNKNOWN tool evidence tagged established_flat (flat subtree, backend
+    socket on the runtime itself — an LLM turn riding inside a tool, e.g.
+    kiro-cli use_subagent) uses min(model_silent_probe_secs,
+    tool_stall_suspect_secs) as the effective suspect window instead of the
+    build-scale forbearance."""
+    from kiro_crew.acp.liveness import ToolCallState
+
+    # Build-scale suspect window (999s) but a tight model-silent budget: only
+    # the narrowed window can trigger the cancel inside this test's runtime.
+    wd = WatchdogSettings(check_after_secs=0.01, tool_stall_suspect_secs=999.0,
+                          tool_stall_hard_cap_secs=999.0, model_silent_probe_secs=0.05)
+    handle = _make_handle(watchdog=wd)
+    handle._stale_eligible = False
+    handle._tool_dispatched = True
+    handle._inflight_tool = ToolCallState(title="use_subagent", command="{}", is_shell=False)
+    handle._queue = _SilentQueue()  # type: ignore[assignment]
+    handle._oracle.check_tool = lambda pid, tool: (
+        "unknown", "established_flat: mcp subtree flat (io +0B cpu +0t)"
+    )
+
+    events = await _drain(handle, req_id=1, timeout=5.0)
+
+    handle._runtime.send_notification.assert_awaited()
+    assert handle._runtime.send_notification.await_args.args[0] == "session/cancel"
+    assert events[-1].stop_reason == STOP_REASON_TOOL_STALL
+
+
+@pytest.mark.asyncio
+async def test_plain_flat_tool_verdict_keeps_full_suspect_window():
+    """UNKNOWN tool evidence WITHOUT the established_flat tag (a quiet MCP
+    tool / build) keeps the full tool_stall_suspect_secs — the narrowed
+    model-silent window must never leak onto build-shaped stalls."""
+    from kiro_crew.acp.liveness import ToolCallState
+
+    # Tight model-silent budget, build-scale suspect window: if the narrowing
+    # incorrectly applied here, the cancel would fire within this test.
+    wd = WatchdogSettings(check_after_secs=0.01, tool_stall_suspect_secs=999.0,
+                          tool_stall_hard_cap_secs=999.0, model_silent_probe_secs=0.05)
+    handle = _make_handle(watchdog=wd)
+    handle._stale_eligible = False
+    handle._tool_dispatched = True
+    handle._inflight_tool = ToolCallState(title="mystery", command="", is_shell=False)
+    handle._queue = _SilentQueue()  # type: ignore[assignment]
+    handle._oracle.check_tool = lambda pid, tool: (
+        "unknown", "mcp subtree flat (io +0B cpu +0t)"
+    )
+
+    events = await _drain(handle, req_id=1, timeout=0.3)
+
+    handle._runtime.send_notification.assert_not_awaited()
+    assert all(ev.stop_reason != STOP_REASON_TOOL_STALL for ev in events)
+
+
+@pytest.mark.asyncio
+async def test_narrowed_tool_window_never_exceeds_suspect_window():
+    """min() semantics: when the per-agent suspect window is ALREADY tighter
+    than model_silent_probe_secs, the tighter one governs an established_flat
+    tool stall (an override can only ever narrow, never extend)."""
+    from kiro_crew.acp.liveness import ToolCallState
+
+    wd = WatchdogSettings(check_after_secs=0.01, tool_stall_suspect_secs=0.05,
+                          tool_stall_hard_cap_secs=999.0, model_silent_probe_secs=999.0)
+    handle = _make_handle(watchdog=wd)
+    handle._stale_eligible = False
+    handle._tool_dispatched = True
+    handle._inflight_tool = ToolCallState(title="use_subagent", command="{}", is_shell=False)
+    handle._queue = _SilentQueue()  # type: ignore[assignment]
+    handle._oracle.check_tool = lambda pid, tool: (
+        "unknown", "established_flat: mcp subtree flat (io +0B cpu +0t)"
+    )
+
+    events = await _drain(handle, req_id=1, timeout=5.0)
+
+    assert events[-1].stop_reason == STOP_REASON_TOOL_STALL
+
+
+@pytest.mark.asyncio
+async def test_working_verdict_still_never_acted_on_with_established_flat_windows():
+    """Invariant: the narrowed window governs only UNKNOWN — a WORKING tool
+    verdict is never cancelled regardless of the model-silent budget."""
+    from kiro_crew.acp.liveness import ToolCallState
+
+    wd = WatchdogSettings(check_after_secs=0.01, tool_stall_suspect_secs=0.05,
+                          tool_stall_hard_cap_secs=0.05, model_silent_probe_secs=0.05)
+    handle = _make_handle(watchdog=wd)
+    handle._stale_eligible = False
+    handle._tool_dispatched = True
+    handle._inflight_tool = ToolCallState(title="use_subagent", command="{}", is_shell=False)
+    handle._queue = _SilentQueue()  # type: ignore[assignment]
+    handle._oracle.check_tool = lambda pid, tool: ("working", "backend bytes flowing")
+
+    events = await _drain(handle, req_id=1, timeout=0.3)
+
+    handle._runtime.send_notification.assert_not_awaited()
+    assert all(ev.stop_reason != STOP_REASON_TOOL_STALL for ev in events)
+
+
+# ── Per-agent watchdog-window overrides (WatchdogSettings snapshot) ──────────
+
+
+def _cfg_with_agent_overrides(monkeypatch, agents: dict) -> None:
+    """Patch KiroCrewConfig.load() with a real default config carrying *agents*."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig()
+    cfg.agents = agents
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+
+
+def test_per_agent_override_narrows_watchdog_snapshot(monkeypatch):
+    """An agent declaring watchdog_tool_stall_* overrides gets them in the
+    WatchdogSettings snapshot; the untouched windows keep global values."""
+    from kiro_crew.acp.session_handle import _load_watchdog_settings
+    from kiro_crew.config.loader import KiroCrewAgentConfig
+
+    _cfg_with_agent_overrides(monkeypatch, {
+        "pr-reviewer": KiroCrewAgentConfig(
+            kiro_agent="pr-reviewer-kiro",
+            watchdog_tool_stall_suspect_secs=900.0,
+            watchdog_tool_stall_hard_cap_secs=1800.0,
+        ),
+    })
+
+    wd = _load_watchdog_settings("pr-reviewer")
+    assert wd.tool_stall_suspect_secs == 900.0
+    assert wd.tool_stall_hard_cap_secs == 1800.0
+    # Non-overridden windows inherit the globals untouched.
+    assert wd.model_silent_probe_secs == 900.0
+    assert wd.stale_window_secs == 300.0
+
+
+def test_per_agent_override_zero_inherits_global(monkeypatch):
+    """0 (the default) inherits the global window — the same empty-inherits
+    convention as the agent's model field."""
+    from kiro_crew.acp.session_handle import _load_watchdog_settings
+    from kiro_crew.config.loader import KiroCrewAgentConfig
+
+    _cfg_with_agent_overrides(monkeypatch, {
+        "builder": KiroCrewAgentConfig(kiro_agent="builder-kiro"),
+    })
+
+    wd = _load_watchdog_settings("builder")
+    assert wd.tool_stall_suspect_secs == 10800.0
+    assert wd.tool_stall_hard_cap_secs == 10800.0
+
+
+def test_per_agent_override_resolves_via_kiro_agent_binding(monkeypatch):
+    """Callers that only hold the bound kiro agent name (the runtime's spawn
+    agent) still get the crew's overrides when the binding is unambiguous."""
+    from kiro_crew.acp.session_handle import _load_watchdog_settings
+    from kiro_crew.config.loader import KiroCrewAgentConfig
+
+    _cfg_with_agent_overrides(monkeypatch, {
+        "pr-reviewer": KiroCrewAgentConfig(
+            kiro_agent="pr-reviewer-kiro",
+            watchdog_tool_stall_suspect_secs=600.0,
+        ),
+    })
+
+    wd = _load_watchdog_settings("pr-reviewer-kiro")
+    assert wd.tool_stall_suspect_secs == 600.0
+
+
+def test_ambiguous_kiro_agent_binding_inherits_global(monkeypatch):
+    """Two crews binding the same kiro agent cannot be told apart from the
+    kiro name alone — that case fails toward the LONG build-safe global
+    window, never toward a surprise early cancel."""
+    from kiro_crew.acp.session_handle import _load_watchdog_settings
+    from kiro_crew.config.loader import KiroCrewAgentConfig
+
+    _cfg_with_agent_overrides(monkeypatch, {
+        "a": KiroCrewAgentConfig(kiro_agent="shared", watchdog_tool_stall_suspect_secs=60.0),
+        "b": KiroCrewAgentConfig(kiro_agent="shared", watchdog_tool_stall_suspect_secs=120.0),
+    })
+
+    wd = _load_watchdog_settings("shared")
+    assert wd.tool_stall_suspect_secs == 10800.0
+
+
+def test_unknown_agent_inherits_global(monkeypatch):
+    """An agent with no config entry (or no agent name at all) snapshots the
+    plain global windows."""
+    from kiro_crew.acp.session_handle import _load_watchdog_settings
+
+    _cfg_with_agent_overrides(monkeypatch, {})
+
+    assert _load_watchdog_settings("nope").tool_stall_suspect_secs == 10800.0
+    assert _load_watchdog_settings("").tool_stall_suspect_secs == 10800.0
+
+
+@pytest.mark.asyncio
 async def test_established_flat_model_wait_gets_extended_window():
     """UNKNOWN with the established_flat evidence tag (probably a non-streamed
     server-side think) is probed only past model_silent_probe_secs, not the
