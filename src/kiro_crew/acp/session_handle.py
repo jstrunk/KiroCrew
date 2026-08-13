@@ -1234,24 +1234,31 @@ class AcpSessionHandle:
                         _tool_idle = now - last_data_ts
                         if _tool_idle <= wd.check_after_secs:
                             continue
-                        # F2 — TOCTOU guard: snapshot the per-handle ingress
-                        # sequence BEFORE awaiting the oracle (up to 10 s in an
-                        # executor, yielding the event loop). If a progress or
-                        # tool-result frame arrives DURING the oracle and is
-                        # consumed by a concurrent _wait_for_response call, the
-                        # queue depth would be unchanged at oracle return even
-                        # though real activity occurred. Using _ingress_seq (which
-                        # _wait_for_response increments when it buffers a
-                        # notification) solves this: the advance is visible
-                        # regardless of which consumer holds the frame at the
-                        # time of the check.
+                        # F2 — TOCTOU guard: two complementary signals cover
+                        # the two delivery paths for a frame that arrives DURING
+                        # the oracle await (up to 10 s in an executor, event
+                        # loop yielded).
+                        #
+                        # Path A — no concurrent _wait_for_response: the frame
+                        # sits in _queue until the dispatch loop consumes it.
+                        # qsize() advances when the frame lands.
+                        #
+                        # Path B — concurrent _wait_for_response: it dequeues
+                        # the frame (qsize unchanged), buffers it, and re-
+                        # injects it later. _ingress_seq (incremented in
+                        # _wait_for_response for notification frames) advances.
+                        #
+                        # Combining both signals means an UNKNOWN-over-window
+                        # cancel cannot fire while real activity is in-flight on
+                        # either delivery path.
                         _ingress_before = self._ingress_seq
+                        _q_depth_before = self._queue.qsize()
                         verdict, evidence = await self._consult_oracle_offloaded(model_wait=False)
-                        # TOCTOU recheck: if _ingress_seq advanced, a new
-                        # notification arrived while the oracle was running.
-                        # Treat it as fresh activity, reset the stall clock,
-                        # and let the next loop iteration consume it normally.
-                        if self._ingress_seq != _ingress_before:
+                        # TOCTOU recheck — activity on either path prevents the cancel.
+                        if (
+                            self._ingress_seq != _ingress_before
+                            or self._queue.qsize() > _q_depth_before
+                        ):
                             last_data_ts = time.monotonic()
                             continue
                         if verdict == VERDICT_WORKING:

@@ -300,6 +300,33 @@ class _SilentQueue:
         return 0
 
 
+class _SilentQueueWithBacklog:
+    """Queue that times out when empty but delivers items added via put_nowait.
+
+    Used for TOCTOU Path A tests: a frame put_nowait()-ed DURING the oracle
+    await stays in the backlog. qsize() reflects the actual count, so the
+    TOCTOU guard's queue-depth check fires correctly. Once items are present
+    they are delivered immediately on the next get(), so the loop consumes
+    them and updates last_data_ts normally.
+    """
+
+    def __init__(self, tick: float = 0.02) -> None:
+        self._tick = tick
+        self._items: list = []
+
+    async def get(self):
+        if self._items:
+            return self._items.pop(0)
+        await asyncio.sleep(self._tick)
+        raise asyncio.TimeoutError
+
+    def put_nowait(self, item) -> None:
+        self._items.append(item)
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+
 @pytest.mark.asyncio
 async def test_working_verdict_never_probed_at_any_idle():
     """A WORKING model-wait verdict suppresses the stale probe far past every
@@ -746,22 +773,16 @@ def test_extract_log_redirect_target():
 
 
 @pytest.mark.asyncio
-async def test_toctou_progress_during_oracle_prevents_cancel():
-    """F2 regression: a progress frame that arrives in the queue WHILE the
-    oracle is executing (suspended, awaiting the executor result) must reset
-    the stall clock and prevent a spurious session/cancel.
+async def test_toctou_path_b_ingress_seq_prevents_cancel():
+    """F2 Path B: concurrent _wait_for_response consumed the progress frame.
 
-    Scenario:
-    1. _SilentQueue always times out → watchdog fires immediately.
-    2. TOCTOU guard snapshots queue depth (0) before calling the oracle.
-    3. Oracle is mocked to block until released.
-    4. WHILE the oracle is blocked, the test swaps in a real queue that
-       already holds a progress frame (simulating a frame that arrived
-       during the executor await).
-    5. Oracle is released and returns UNKNOWN.
-    6. TOCTOU recheck: new queue.qsize()=1 > snapshot 0 → reset stall
-       clock and continue instead of cancelling.
-    7. No session/cancel is sent.
+    The frame is NOT in the queue when the oracle returns — it is in
+    _wait_for_response's buffer list. qsize() is still 0, but _ingress_seq
+    was incremented when _wait_for_response buffered the notification.
+    The TOCTOU guard detects _ingress_seq advanced and skips the cancel.
+
+    Simulated by incrementing handle._ingress_seq directly (the exact
+    mutation _wait_for_response performs on a notification).
     """
     oracle_entered = asyncio.Event()
     oracle_release = asyncio.Event()
@@ -771,8 +792,6 @@ async def test_toctou_progress_during_oracle_prevents_cancel():
         await oracle_release.wait()
         return ("unknown", "mcp subtree flat")
 
-    # Tight windows so the watchdog fires quickly; huge suspect so the
-    # TOCTOU continue does NOT immediately re-trigger a cancel.
     wd = WatchdogSettings(
         check_after_secs=0.01,
         tool_stall_suspect_secs=999.0,
@@ -783,41 +802,84 @@ async def test_toctou_progress_during_oracle_prevents_cancel():
     handle._tool_dispatched = True
     from kiro_crew.acp.liveness import ToolCallState
     handle._inflight_tool = ToolCallState(title="ReadInternalWebsites", command="")
-    # _SilentQueue always times out so the watchdog branch fires quickly.
     handle._queue = _SilentQueue()  # type: ignore[assignment]
-    # Replace offloaded oracle with the controlled mock
     handle._consult_oracle_offloaded = slow_oracle  # type: ignore[method-assign]
 
     async def do_drain():
         return [ev async for ev in handle._dispatch_events(req_id=99, timeout=2.0)]
 
     drain_task = asyncio.create_task(do_drain())
-
-    # Wait for the oracle to enter (watchdog has fired, oracle is executing)
     await asyncio.wait_for(oracle_entered.wait(), timeout=1.0)
 
-    # Simulate a progress frame arriving WHILE the oracle is suspended by
-    # advancing _ingress_seq directly. This mirrors what _wait_for_response
-    # does when it consumes a notification from the queue — the sequence is
-    # the observable regardless of which consumer holds the frame at any
-    # instant (queue-depth checks fail when the frame is in a consumer's
-    # buffer list rather than the queue itself).
+    # Simulate _wait_for_response buffering a notification during oracle.
     handle._ingress_seq += 1
 
-    # Release the oracle — it returns UNKNOWN
     oracle_release.set()
-
-    # Give the loop a moment to apply the TOCTOU guard
     await asyncio.sleep(0.1)
-
-    # Cancel the drain (would otherwise run until the 2 s timeout)
     drain_task.cancel()
     try:
         await drain_task
     except asyncio.CancelledError:
         pass
 
-    # Key assertion: no session/cancel was sent — the TOCTOU guard prevented it
+    handle._runtime.send_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_toctou_path_a_queue_depth_prevents_cancel():
+    """F2 Path A: no concurrent _wait_for_response — the progress frame lands
+    directly in the session queue and stays there during the oracle await.
+
+    qsize() grows from 0 to 1 while the oracle is blocked. The TOCTOU guard
+    detects the queue-depth change and skips the cancel. The frame is then
+    consumed by the dispatch loop on the next iteration, updating last_data_ts.
+
+    Uses _SilentQueueWithBacklog: times out when empty (fast watchdog trigger)
+    but delivers items added via put_nowait() on the next get() call.
+    """
+    oracle_entered = asyncio.Event()
+    oracle_release = asyncio.Event()
+
+    async def slow_oracle(*, model_wait: bool) -> tuple[str, str]:
+        oracle_entered.set()
+        await oracle_release.wait()
+        return ("unknown", "mcp subtree flat")
+
+    wd = WatchdogSettings(
+        check_after_secs=0.01,
+        tool_stall_suspect_secs=999.0,
+        tool_stall_hard_cap_secs=999.0,
+    )
+    handle = _make_handle(watchdog=wd)
+    handle._stale_eligible = False
+    handle._tool_dispatched = True
+    from kiro_crew.acp.liveness import ToolCallState
+    handle._inflight_tool = ToolCallState(title="ReadInternalWebsites", command="")
+    # Backlog queue: times out fast when empty, delivers put_nowait items.
+    handle._queue = _SilentQueueWithBacklog()  # type: ignore[assignment]
+    handle._consult_oracle_offloaded = slow_oracle  # type: ignore[method-assign]
+
+    async def do_drain():
+        return [ev async for ev in handle._dispatch_events(req_id=99, timeout=2.0)]
+
+    drain_task = asyncio.create_task(do_drain())
+    await asyncio.wait_for(oracle_entered.wait(), timeout=1.0)
+
+    # Put a progress frame directly into the queue DURING the oracle.
+    # No _wait_for_response is active — qsize() will grow from 0 to 1.
+    handle._queue.put_nowait(  # type: ignore[union-attr]
+        JsonRpcMessage(method="notifications/progress", params={})
+    )
+
+    oracle_release.set()
+    await asyncio.sleep(0.1)
+    drain_task.cancel()
+    try:
+        await drain_task
+    except asyncio.CancelledError:
+        pass
+
+    # TOCTOU guard detected qsize() > 0 → no cancel.
     handle._runtime.send_notification.assert_not_awaited()
 
 
