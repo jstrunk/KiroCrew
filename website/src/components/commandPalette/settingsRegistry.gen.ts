@@ -330,6 +330,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.session-summaries",
+    "label": "Session summaries",
+    "description": "Summarize each session by intent in the chat right panel — what it's about, what's happened, and what to do next. Uses tokens on turns that change the session; unchanged sessions are served free from cache.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "chat.show-context-percentage",
     "label": "Show Context Percentage",
     "description": "Display usage percentage next to the context progress bar",

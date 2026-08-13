@@ -3613,7 +3613,10 @@
         "somewhat": "Somewhat",
         "tail_preserve_end_final_summary": "Tail (preserve end / final summary)",
         "ux_designer": "UX Designer",
-        "failed_to_save_knowledge_setting": "Failed to save knowledge setting"
+        "failed_to_save_knowledge_setting": "Failed to save knowledge setting",
+        "session_summaries": "Session summaries",
+        "summarize_each_session_by_intent_in_the_right_pa": "Summarize each session by intent in the chat right panel — what it's about, what's happened, and what to do next. Uses tokens on turns that change the session; unchanged sessions are served free from cache.",
+        "failed_to_save_session_summaries": "Failed to save session summaries setting"
       },
       "displayPanel": {
         "color": "Color {{n}}",
