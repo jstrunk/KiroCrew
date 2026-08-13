@@ -4176,6 +4176,25 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 # force-deletes ``~/.kirocrew`` once the move completes — there is no rollback
 # copy left behind to gate.
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
+
+#: Trailing boundary for a path match in the command-text matchers: what can
+#: legitimately END a path token in a shell command. Whitespace, end-of-string
+#: and quotes were the original set; GPT round-14 added the shell CONTROL
+#: characters, because a command ending in a terminator
+#: (``> ~/.kiro/crew/crons.json;``, ``…|tee /tmp/x``, ``(…)``) puts a delimiter
+#: immediately after the leaf, and every branch carrying the old class then
+#: failed to match. That gap affected the PRE-EXISTING fences too — the
+#: credential directories and the data-home marker, not only the entries this PR
+#: added — so it is defined once here and shared, rather than patched per
+#: branch. ``}`` covers ``${VAR}``-adjacent spellings; ``,``/``:`` cover
+#: list-joined arguments; ``<``/``>`` were added in round 16 because a redirect
+#: can be attached with no space (``> …/crons.json>/tmp/out``), which puts an
+#: operator immediately after the leaf exactly like a terminator does.
+_PATH_END = r"(?:\s|$|['\";&|)},:<>])"
+#: Same, for a matcher whose path may legitimately continue with a separator
+#: (a directory match that must also fire on ``<dir>/<anything>``). POSIX form;
+#: the Windows branches build their own from ``win_sep``.
+_PATH_END_OR_SEP = r"(?:/|\s|$|['\";&|)},:<>])"
 _CREW_SECRET_LEAVES: list[str] = [
     ".env",
     # The Notes builtin stores a GitHub Personal Access Token here so it can
@@ -4381,7 +4400,20 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # would make the next boot skip migration and ignore the legacy home's
     # governance policy + secrets. The migration code writes it directly and
     # does NOT route through this gate, so legitimate stamping still works.
-    for leaf in ("config.json", "config.local.json", ".data-home-ready")
+    # crons.json: the scheduler STORE, and an input to an authorization
+    # decision in exactly the sense rotation.yaml is below. Every scheduling
+    # invariant the tools enforce — the operator-only gate on perpetual
+    # creation, agent_sleep's deadline clamp, the kind='self' inheritance
+    # overrides — is enforced at the TOOL boundary and then persisted here, so
+    # an agent tool that could rewrite this file would author a job the tools
+    # would have refused. It stays READABLE (the dashboard and `cron list`
+    # read it constantly); only the agent's own file/bash tools are refused.
+    # CronService writes it through its own file-lock + atomic-replace path,
+    # which does not route through this gate, so the product still writes it.
+    # Found by review on the perpetual-agent PR; the exposure predates it —
+    # an agent that could rewrite the store could already author a
+    # `command`-mode cron, i.e. arbitrary shell on the operator's schedule.
+    for leaf in ("config.json", "config.local.json", ".data-home-ready", "crons.json")
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write
     # sensitive: it holds no secret and every teammate's instance must READ it to
@@ -4488,8 +4520,24 @@ _WRITE_PROTECTED_HOME_PATHS += [
 # agent that rewrites it can have the gate approve one signal while the sink mutates another.
 # Reads stay allowed for the same reason as the schedule — it is the board every instance
 # renders, and it holds no secret.
+# ``crons.json`` is the fourth, and it meets the same bar one step further out: it is the
+# scheduler STORE, and every scheduling invariant lives at the TOOL boundary and is then
+# persisted here — the operator-only gate on perpetual creation, ``agent_sleep``'s deadline
+# clamp, the ``kind='self'`` inheritance overrides. An agent that rewrites it authors a job the
+# tools would have refused, and nothing downstream re-validates a job the loader reads back.
+# The exposure is not introduced by perpetual agents: an agent able to rewrite this file could
+# already author a ``command``-mode cron, i.e. arbitrary shell on the operator's own schedule,
+# which is strictly worse than any perpetual-scheduling knob. ``CronService`` writes it through
+# its own file-lock + atomic-replace path rather than this gate, so the product's own scheduling
+# is unaffected, and ``is_sensitive_path`` (the READ gate) still excludes it, so the CLI, the
+# dashboard and the read tool render it as before. Shell READS of it are blocked, like the
+# other entries here — this branch is verb-independent so that no write form can bypass it,
+# and that is acceptable for the same reason it is for the marker: the file holds no secret and
+# legitimate readers do not use shell ``cat``. Found by review on the perpetual-agent PR
+# (#3202).
 _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
     ".data-home-ready",
+    "crons.json",
     "apps/ops-mission-control/data/rotation.yaml",
     "apps/ops-mission-control/data/incidents/index.json",
 )
@@ -4552,18 +4600,74 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     home_alts = f"(?:{home}|{tilde}|{home_var}|{generic_home})"
     escaped_dirs = [re.escape(d) for d in _SENSITIVE_HOME_DIRS]
     dirs_pattern = "|".join(escaped_dirs)
-    sensitive_path = rf"{home_alts}/(?:{dirs_pattern})(?:/|\s|$|['\"])"
+    sensitive_path = rf"{home_alts}/(?:{dirs_pattern}){_PATH_END_OR_SEP}"
     # Write-protected leaves (e.g. the data-home marker): a full home-anchored
     # path to a specific leaf file, matched verb-INDEPENDENTLY (below) so no
     # write form can bypass it. See _WRITE_PROTECTED_BASH_LEAVES for why reads
     # are blocked too (harmless: no secret; legitimate readers use Python).
-    wp_prefixes = "|".join(re.escape(p) for p in _CREW_HOME_PREFIXES)
-    wp_leaves = "|".join(re.escape(leaf) for leaf in _WRITE_PROTECTED_BASH_LEAVES)
+    # GPT round-12: canonical no-op segments are accepted here too, the same way
+    # the agent-life branch below does it. Without this,
+    # ``> ~/.kiro/crew/./crons.json`` named a fenced leaf that this branch could
+    # not see — the same dot-segment class that was fixed for the goal file in
+    # round 6 but never applied to the leaf list. Entry-internal separators get
+    # the tolerance as well, so ``apps/./ops-mission-control/...`` matches.
+    _wp_gsep = r"(?:/(?:\.|[^/\s'\"]{1,64}/\.\.))*/"
+    wp_leaves = "|".join(
+        _wp_gsep.join(re.escape(part) for part in leaf.split("/"))
+        for leaf in _WRITE_PROTECTED_BASH_LEAVES
+    )
+    wp_prefixes_gsep = "|".join(
+        _wp_gsep.join(re.escape(part) for part in p.split("/"))
+        for p in _CREW_HOME_PREFIXES
+    )
     write_protected_path = (
         # trailing ``/`` is included so ``mkdir -p ~/.kiro/crew/.data-home-ready/x``
         # (which also MATERIALISES the marker as a directory, satisfying
         # ``marker.exists()``) is caught, not just the exact-leaf forms.
-        rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves})(?:/|\s|$|['\"])"
+        rf"{home_alts}{_wp_gsep}(?:{wp_prefixes_gsep})"
+        rf"{_wp_gsep}(?:{wp_leaves}){_PATH_END_OR_SEP}"
+    )
+    # Perpetual agents' LIFE.md: agents/<generated id>/LIFE.md — the id
+    # segment is dynamic, so this cannot live in the literal leaf list. Named
+    # verb-independently like the leaves above: writing one's own goal file
+    # is the self-modification the RFC hard-refuses (§6/Non-goals), and reads
+    # via bash are harmless (the prompt already carries the content).
+    #
+    # GPT round-6 hardening, both in this one branch:
+    #  * every separator is the POSIX ``gsep`` below (mirroring ``win_gsep``),
+    #    so canonical no-op spellings — ``agents/<id>/./LIFE.md``,
+    #    ``agents/x/../x/LIFE.md``, ``~/.kiro/./crew/...`` — still match;
+    #  * when ``KIROCREW_HOME`` re-anchors the data home, the live agents dir
+    #    is ``$KIROCREW_HOME/agents`` and carries NO home-anchored spelling,
+    #    so the resolved env root is added as an extra literal anchor (both
+    #    the expanded and realpath forms, matching the keystone-leaf duality
+    #    in ``_home_dir_targets_uncached``). The regex is process-cached, and
+    #    ``KIROCREW_HOME`` is fixed at process start, so build-time capture
+    #    is sound; tests that churn the env call ``_build_sensitive_regex``
+    #    directly, as the existing gate tests do.
+    gsep = r"(?:/(?:\.|[^/\s'\"]{1,64}/\.\.))*/"
+    # Separator-agnostic gsep for literal env-root forms: on a Windows host
+    # ``KIROCREW_HOME`` (and its realpath) is spelled with backslashes, so the
+    # env anchors must accept either separator plus the same no-op chains.
+    gsep_any = r"(?:[\\/](?:\.|[^\\/\s'\"]{1,64}[\\/]\.\.))*[\\/]"
+    wp_prefixes_g = "|".join(re.escape(p).replace("/", gsep) for p in _CREW_HOME_PREFIXES)
+    life_anchor_alts = [rf"{home_alts}{gsep}(?:{wp_prefixes_g})"]
+    _crew_env = os.environ.get("KIROCREW_HOME")
+    if _crew_env:
+        _env_forms = {os.path.abspath(os.path.expanduser(_crew_env))}
+        try:
+            _env_forms.add(os.path.realpath(os.path.expanduser(_crew_env)))
+        except (OSError, ValueError):
+            pass
+        for _form in sorted(_env_forms):
+            _parts = [p for p in re.split(r"[\\/]+", _form) if p]
+            _anchor = gsep_any.join(re.escape(p) for p in _parts)
+            if _form.startswith(("/", "\\")):
+                _anchor = gsep_any + _anchor
+            life_anchor_alts.append(_anchor)
+    agent_life_path = (
+        rf"(?:{'|'.join(life_anchor_alts)})"
+        rf"{gsep}agents{gsep}[^/\s'\"]+{gsep}LIFE\.md{_PATH_END}"
     )
     # Windows-native spellings of the same fenced dirs, matched in the RAW
     # command text. POSIX shlex consumes unquoted backslashes during
@@ -4616,7 +4720,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # plain separator, so ``%APPDATA%\.\kiro-cli\data.sqlite3`` and
     # ``...\AppData\Roaming\..\Roaming\kiro-cli\...`` still name the store.
     win_sensitive_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern})(?:{win_sep}|\s|$|['\";&|)}},:<>])"
     )
     # ``%APPDATA%`` already points INTO ``AppData\Roaming``, so a spelling like
     # ``%APPDATA%\kiro-cli\data.sqlite3`` names a fenced store WITHOUT the
@@ -4637,7 +4741,92 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # right after it is a canonical no-op specific to this anchor.
     appdata_sensitive_path = (
         rf"{appdata_var}(?:{win_sep}\.\.{win_sep}Roaming)*"
-        rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
+        rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\";&|)}},:<>])"
+    )
+    # GPT round-7 (BLOCKING): two spellings the round-6 branch still missed.
+    #
+    # (a) Windows-native direct spelling of the goal file — the POSIX branch
+    # above cannot see backslash separators or %USERPROFILE% anchors, exactly
+    # the gap ``win_sensitive_path`` closes for the fenced dirs. Same anchors,
+    # same ``win_gsep`` no-op chains, same crew prefixes.
+    crew_prefixes_win = "|".join(
+        win_gsep.join(re.escape(part) for part in p.split("/"))
+        for p in _CREW_HOME_PREFIXES
+    )
+    win_agent_life_path = (
+        rf"{win_home_alts}{win_gsep}(?:{crew_prefixes_win})"
+        rf"{win_gsep}agents{win_gsep}[^\\/\s'\"]+{win_gsep}LIFE\.md{_PATH_END}"
+    )
+    # (b) CHAINED RELATIVE writes: ``cd <crew agents dir> && echo x > LIFE.md``
+    # names the goal file only as a bare relative token, so no path-anchored
+    # branch can bind the two together. The two halves are compiled SEPARATELY
+    # and evaluated in :func:`is_sensitive_bash_command` behind a substring
+    # pre-guard, NOT as another alternation branch here: as two whole-command
+    # ``[\s\S]*`` lookaheads inside this pattern they re-scanned every command
+    # twice, and this matcher is already superlinear in command length
+    # (measured on main: 26ms at 1KB, 409ms at 4KB). Out here the check costs a
+    # C-speed ``in`` test on anything that does not name an agents directory.
+    #
+    # ``LIFE.md`` written with shell quote-splices (``LI''FE.md``,
+    # ``"LIFE".md``) is the same file, and this half matches RAW text no
+    # tokenizer has touched, so quote runs are tolerated inside the name with a
+    # bounded character class (GPT round-9). The path-anchored branches get the
+    # same coverage from the normalizer pass, which dequotes before checking.
+    global _AGENT_LIFE_DIR_RE, _AGENT_LIFE_LEAF_RE, _AGENT_LIFE_VAR_WRITE_RE
+    _AGENT_LIFE_DIR_RE = re.compile(
+        rf"(?:{'|'.join(life_anchor_alts)}){gsep}agents{_PATH_END_OR_SEP}"
+        rf"|{win_home_alts}{win_gsep}(?:{crew_prefixes_win})"
+        rf"{win_gsep}agents(?:{win_sep}|\s|$|['\";&|)}},:<>])",
+        re.IGNORECASE,
+    )
+    _AGENT_LIFE_LEAF_RE = re.compile(
+        r"L['\"]{0,8}I['\"]{0,8}F['\"]{0,8}E['\"]{0,8}\.['\"]{0,8}md",
+        re.IGNORECASE,
+    )
+    # GPT round-13: the same chained-relative shape, one directory up. After
+    # ``cd ~/.kiro/crew`` the fenced leaf is named as a BARE token
+    # (``printf … > crons.json``), so no path-anchored branch and no
+    # resolved-path check can bind the two — the normalizer resolves a relative
+    # token against the agent's cwd, not against a ``cd`` earlier in the same
+    # command line. Third appearance of this class in this file (the goal file
+    # in round 7, variable-derived targets in round 10), so it is handled the
+    # same way: a conjunction evaluated outside the big alternation, in write
+    # context only. The leaf half matches the final basename of each fenced
+    # entry, which is what a relative spelling leaves behind.
+    global _CREW_HOME_DIR_RE, _WP_LEAF_BASENAME_RE
+    _CREW_HOME_DIR_RE = re.compile(
+        rf"(?:{'|'.join(life_anchor_alts)})(?:{gsep}|{_PATH_END})"
+        rf"|{win_home_alts}{win_gsep}(?:{crew_prefixes_win})"
+        rf"(?:{win_sep}|{_PATH_END})",
+        re.IGNORECASE,
+    )
+    _WP_LEAF_BASENAME_RE = re.compile(
+        "(?:"
+        + "|".join(
+            re.escape(leaf.rsplit("/", 1)[-1]) for leaf in _WRITE_PROTECTED_BASH_LEAVES
+        )
+        + r")" + _PATH_END,
+        re.IGNORECASE,
+    )
+    # GPT round-10: variable indirection removes the literal entirely —
+    # ``cd <agents dir> && n=LIFE; echo hacked > "$n.md"`` names the goal file
+    # nowhere, and no static layer can resolve it (the value can come from the
+    # environment, a command substitution, or a read). Inside a command that
+    # ALREADY names a crew agents directory, a write whose target is
+    # variable-derived is therefore refused outright: the caller can always
+    # spell the path literally, and the alternative is a fence with a trivial
+    # bypass. Scoped to that conjunction, so ordinary variable-target writes
+    # elsewhere on the filesystem are untouched.
+    #
+    # Covers shell-level indirection: a redirect (with optional fd digits and
+    # quoting) or a write verb whose operand carries ``$`` / backtick / ``${``.
+    # It does NOT cover indirection built inside an embedded interpreter
+    # script (``python -c "open(f'{n}.md','w')"``) — that is unbounded static
+    # analysis, and the edit-tool gate plus the normalizer's resolved-path
+    # check remain the layers that catch those.
+    _AGENT_LIFE_VAR_WRITE_RE = re.compile(
+        r"(?:(?:^|[\s;&|(])\d*>>?\s*['\"]?[^\s;&|)]*[$`]"
+        r"|\b(?:tee|cp|mv|install|dd|truncate|ln|rsync)\b[^;&|]*[$`])",
     )
     return re.compile(
         # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
@@ -4654,6 +4843,8 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"{sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){agent_life_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){win_agent_life_path}"
         # (4) Windows-native spelling, verb-independent (same token anchor):
         # covers quoted backslash paths AND embedded-script literals that the
         # tokenizing passes cannot see. (5) the %APPDATA% alias of the fenced
@@ -4665,6 +4856,17 @@ def _build_sensitive_regex() -> re.Pattern[str]:
 
 
 _SENSITIVE_RE: re.Pattern[str] | None = None
+# Halves of the chained-relative LIFE.md check, populated by
+# :func:`_build_sensitive_regex` (they share its anchor computation) and
+# evaluated by :func:`is_sensitive_bash_command`. Kept OUT of the big
+# alternation on purpose — see the comment at their assignment.
+_AGENT_LIFE_DIR_RE: re.Pattern[str] | None = None
+_AGENT_LIFE_LEAF_RE: re.Pattern[str] | None = None
+_AGENT_LIFE_VAR_WRITE_RE: re.Pattern[str] | None = None
+#: Halves of the chained-relative WRITE-PROTECTED-LEAF check (GPT round-13),
+#: same construction and rationale as the ``_AGENT_LIFE_*`` pair above.
+_CREW_HOME_DIR_RE: re.Pattern[str] | None = None
+_WP_LEAF_BASENAME_RE: re.Pattern[str] | None = None
 
 
 def _get_sensitive_re() -> re.Pattern[str]:
@@ -4999,9 +5201,61 @@ def is_sensitive_write_path(path_str: str, base_dir: str | None = None) -> bool:
     (``hooks.on_tool_call`` on the ACP ``edit`` kind) — see
     :data:`_WRITE_PROTECTED_HOME_PATHS` for the rationale.
     """
+    if _is_agent_life_md(path_str, base_dir):
+        return True
     return _path_in_home_dirs(
         path_str, _SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS, base_dir
     )
+
+
+def _is_agent_life_md(path_str: str, base_dir: str | None = None) -> bool:
+    """True when the path is a perpetual agent's ``LIFE.md``.
+
+    ``agents/<id>/LIFE.md`` under any crew home prefix is the agent's GOAL
+    file — §6 of the perpetual-agent RFC: owner is the human, the agent may
+    read it every wake and may never write it. An auto-approved perpetual
+    agent that could rewrite its own LIFE.md would self-modify its goal and
+    boundaries and ingest them on the very next wake. The middle segment is
+    the generated job id, so this cannot be expressed as a literal entry in
+    :data:`_WRITE_PROTECTED_HOME_PATHS`; the shape check lives here instead.
+    Reads stay allowed (the whole point of the file), and JOURNAL.md in the
+    same directory stays agent-writable.
+    """
+    try:
+        raw = Path(path_str).expanduser()
+        if not raw.is_absolute() and base_dir:
+            raw = Path(base_dir) / raw
+        resolved = Path(os.path.realpath(raw))
+    except (OSError, ValueError):
+        return True  # unresolvable path aimed at a guarded name: fail closed
+    if resolved.name.casefold() != "life.md":
+        return False
+    parent = resolved.parent
+    agents_roots = [Path.home() / prefix / "agents" for prefix in _CREW_HOME_PREFIXES]
+    # GPT round-6: when KIROCREW_HOME re-anchors the data home, the live
+    # agents directory is ``$KIROCREW_HOME/agents`` — NOT under either
+    # default crew prefix. Without this anchor both guards permit a write to
+    # the real goal file whenever the env override is set (the same gap the
+    # keystone leaves close in ``_home_dir_targets_uncached``). The default
+    # ``~``-rooted forms stay, so every location is always covered.
+    crew_env = os.environ.get("KIROCREW_HOME")
+    if crew_env:
+        try:
+            agents_roots.append(Path(crew_env).expanduser() / "agents")
+        except (OSError, ValueError):
+            pass
+    for root in agents_roots:
+        try:
+            # Casefolded comparison: on case-insensitive filesystems
+            # (macOS/Windows) a re-cased spelling still names the same
+            # directory. Over-matching on a case-SENSITIVE filesystem (two
+            # dirs differing only by case) is the documented fail-safe
+            # direction — the guarded name is machine-generated lowercase.
+            if str(parent.parent).casefold() == os.path.realpath(root).casefold():
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def sensitive_home_dirs() -> tuple[str, ...]:
@@ -5052,7 +5306,7 @@ _EXTRACT_INTO_TRUST_ROOT_RE = re.compile(
     + re.escape(str(Path.home()))
     + r")(?:"
     + _CREW_HOME_ALT
-    + r")(?:/[^\s]*)?(?:\s|$|['\"])",
+    + r")(?:/[^\s]*)?" + _PATH_END + r"",
     re.IGNORECASE,
 )
 
@@ -5142,6 +5396,27 @@ _NORMALIZER_READ_VERBS: frozenset[str] = frozenset(
 # same fidelity as reading it. npm's own fs.link() never transits this gate.
 _LINK_CREATE_VERBS: frozenset[str] = frozenset({"ln", "link"})
 
+#: Write verbs the normalizer pass uses as COARSE write context for the
+#: write-protected check (GPT round-12). Deliberately separate from the
+#: ``_WRITE_CMDS`` regex: this is a token-level membership test, and it exists
+#: only to keep that check from turning write-protection into read-blocking on
+#: a verb-independent pass. Keep it in sync with ``_WRITE_CMDS``' verb list.
+_NORMALIZER_WRITE_VERBS: frozenset[str] = frozenset(
+    {
+        "tee",
+        "cp",
+        "mv",
+        "install",
+        "dd",
+        "truncate",
+        "ln",
+        "rsync",
+        "sed",
+        "unzip",
+        "tar",
+    }
+)
+
 # Shell redirection operators attached without a space (``>~/path``,
 # ``>>~/path``, ``2>~/path``, ``2>>~/path``, ``<~/path``).  shlex keeps these
 # as a single token; we strip the operator prefix to expose the path for
@@ -5149,6 +5424,35 @@ _LINK_CREATE_VERBS: frozenset[str] = frozenset({"ln", "link"})
 # each with an optional fd number prefix.  Does NOT match heredoc (``<<``)
 # since that takes a delimiter word, not a path.
 _REDIR_PREFIX_RE = re.compile(r"^\d*(?:>>?|<(?!<))")
+
+#: A token that is ONLY a redirect operator — the spaced form ``> path``, where
+#: shlex hands the operator and the path over as two tokens. Output redirects
+#: only (``>``/``>>``, optional fd digits): a ``<`` input redirect is a read and
+#: must not count as write context. Used by the normalizer pass to decide that
+#: the NEXT token is a write target.
+_REDIR_OP_ONLY_RE = re.compile(r"^\d*>>?$")
+
+#: An OUTPUT redirect anywhere in the command (optional fd digits, ``>``/``>>``),
+#: excluding the ``2>&1``-style fd duplication that redirects no file. Used as
+#: the write-context signal; ``<`` is a read and is deliberately absent.
+_WRITE_REDIR_RE = re.compile(r"(?:^|[\s;&|(])\d*>>?(?!&)")
+
+
+def _command_has_write_context(command: str) -> bool:
+    """True when the command carries an output redirect or a write verb.
+
+    Coarse, whole-command signal shared by the two conjunction checks that must
+    not turn write-protection into read-blocking: a command that only NAMES a
+    fenced leaf while reading it keeps whatever posture that leaf's own regex
+    branch defines. ``<`` is a read and does not count.
+    """
+    if _WRITE_REDIR_RE.search(command):
+        return True
+    # GPT round-15: shell word separators are not just U+0020 — ``tee\tcrons.json``
+    # is the same command. Collapse every whitespace run to a single space before
+    # the membership test rather than testing one separator.
+    low = " " + " ".join(command.lower().split()) + " "
+    return any(f" {v} " in low for v in _NORMALIZER_WRITE_VERBS)
 
 
 def is_sensitive_bash_command(command: str) -> str | None:
@@ -5168,6 +5472,49 @@ def is_sensitive_bash_command(command: str) -> str | None:
     # ── Pass 1: regex fast-path ──
     if _get_sensitive_re().search(command):
         return "Blocked: command accesses sensitive credential path"
+    # Chained-relative goal-file write (``cd <agents dir> && echo x > LIFE.md``).
+    # Evaluated here rather than as an alternation branch so the two
+    # whole-command scans only happen for a command that actually names an
+    # agents directory; ``"agents" in`` is a C-speed reject for everything else.
+    if (
+        "agents" in command.lower()
+        and _AGENT_LIFE_LEAF_RE is not None
+        and _AGENT_LIFE_DIR_RE is not None
+        and _AGENT_LIFE_DIR_RE.search(command)
+    ):
+        if _AGENT_LIFE_LEAF_RE.search(command):
+            return "Blocked: command writes a perpetual agent's LIFE.md"
+        if _AGENT_LIFE_VAR_WRITE_RE is not None and _AGENT_LIFE_VAR_WRITE_RE.search(command):
+            return (
+                "Blocked: variable-derived write target inside a perpetual "
+                "agent's directory (spell the path literally)"
+            )
+    # Chained-relative write to a fenced leaf one directory up
+    # (``cd ~/.kiro/crew && printf … > crons.json``). Same conjunction shape as
+    # the goal-file check above, and gated on WRITE context so shell reads of
+    # those leaves keep the posture their own regex branch defines rather than
+    # gaining a second, wider block. Pre-guarded on the crew-prefix substring so
+    # the two whole-command scans never run for an unrelated command.
+    _low_cmd = command.lower()
+    if (
+        ("crew" in _low_cmd or "kirocrew" in _low_cmd)
+        and _CREW_HOME_DIR_RE is not None
+        and _WP_LEAF_BASENAME_RE is not None
+        and _command_has_write_context(command)
+        and _CREW_HOME_DIR_RE.search(command)
+    ):
+        if _WP_LEAF_BASENAME_RE.search(command):
+            return "Blocked: command writes a write-protected path in the crew home"
+        # GPT round-16: the leaf name can be composed from a variable
+        # (``f=crons; : > "$f.json"``), so the basename half sees nothing. Same
+        # answer as the agents-directory case in round 10 and the SAME matcher:
+        # inside a command that already names the crew home, a variable-derived
+        # write target is refused, because no static layer can resolve it.
+        if _AGENT_LIFE_VAR_WRITE_RE is not None and _AGENT_LIFE_VAR_WRITE_RE.search(command):
+            return (
+                "Blocked: variable-derived write target in the crew home "
+                "(spell the path literally)"
+            )
     if _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
         return "Blocked: command extracts into the governance trust-root directory"
     # Block ANY command referencing a sensitive path via relative traversal,
@@ -5224,8 +5571,23 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
     if not tokens:
         return None
 
+    # Write context for the write-protected check below (see its comment for
+    # why it must not fire on a read). Delegated to the shared helper rather
+    # than re-implemented: GPT round-15 found the duplicate here recognised
+    # only U+0020 as a word separator, so ``tee\tcrons.json`` slipped past one
+    # copy while the other caught it. One definition, one behaviour.
+    _has_write_verb = _command_has_write_context(command)
+
     # Route each path-like token through is_sensitive_path()
+    _prev_was_redir_op = False
     for token in tokens:
+        # A bare redirect operator is its own token when written with a space
+        # (``> path``), so the NEXT token is the write target. Tracked across
+        # iterations because the attached form (``>path``) is handled below and
+        # the spaced form is the common one — missing it left the write-context
+        # gate blind to ``echo x > <write-protected>``.
+        _redir_ctx = _prev_was_redir_op
+        _prev_was_redir_op = bool(_REDIR_OP_ONLY_RE.fullmatch(token or ""))
         if not token:
             continue
         # ``key=value`` operands carry the real path to the RIGHT of the first
@@ -5244,12 +5606,16 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
             # shlex.  Strip the leading operator so the path portion is
             # checked.  Pattern: optional fd digit(s), then ``>`` or ``>>``.
             stripped = _REDIR_PREFIX_RE.sub("", cand)
+            was_redirect = _redir_ctx
             if stripped != cand:
                 # The stripped form is the real path candidate; if empty
                 # after stripping, skip (bare ``>`` alone).
                 if not stripped:
                     continue
                 cand = stripped
+                # Remembered so the write-protected check below can require
+                # write context instead of firing on every named token.
+                was_redirect = True
             # Skip flags
             if cand.startswith("-"):
                 continue
@@ -5265,6 +5631,34 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
             if is_sensitive_path(cand):
                 return (
                     "Blocked: command accesses sensitive credential path "
+                    f"(resolved via normalizer: {cand[:80]})"
+                )
+            # The WRITE-protected set is not in is_sensitive_path's read set by
+            # design (those files stay readable), so this pass — the ONLY layer
+            # that can undo shell quoting and resolve dot segments — has to
+            # check it separately or every normalized spelling walks past.
+            #
+            # GPT round-9 added the perpetual-agent goal file here; round-12
+            # widened it to the whole write-protected set. The widening is
+            # gated on WRITE CONTEXT, which the reviewer's one-line version was
+            # not: this pass is verb-INDEPENDENT, so an ungated
+            # ``is_sensitive_write_path`` call turns write-protection into
+            # read-blocking and refuses ``cat ~/.kiro/crew/config.json`` — an
+            # invariant test_normal_crew_access_not_overblocked pins, and the
+            # deliberate asymmetry between the edit-tool list (which holds
+            # config.json) and the bash leaf list (which does not). Write
+            # context here = the token was a redirect target, or the command
+            # carries a write verb. ``_is_agent_life_md`` stays unconditional:
+            # the goal file is refused on naming alone, matching its regex
+            # branch.
+            if _is_agent_life_md(cand):
+                return (
+                    "Blocked: command writes a perpetual agent's LIFE.md "
+                    f"(resolved via normalizer: {cand[:80]})"
+                )
+            if (was_redirect or _has_write_verb) and is_sensitive_write_path(cand):
+                return (
+                    "Blocked: command writes a write-protected path "
                     f"(resolved via normalizer: {cand[:80]})"
                 )
     return None
