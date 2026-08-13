@@ -154,6 +154,92 @@ list; while it is off they are removed and the agent uses `web_fetch` instead.
 | `skills/browser-auth/SKILL.md` | Agent skill for auth + Playwright MCP workflow |
 | `scripts/refresh-playwright-cookies.py` | Standalone script: `~/.kiro/crew/browser-cookies.txt` → storage state |
 | `config/playwright-mcp-config.json.template` | Template for the Playwright config structure |
+| `playwright-cli.sh` | Standalone installer for the Playwright **CLI** (macOS/Linux); bootstraps Node, classifies enterprise-registry failures |
+| `playwright-cli.ps1` | The same installer for Windows (PowerShell spelling of the same flags and exit codes) |
+
+### Standalone Playwright CLI Installer
+
+`playwright-cli.sh` / `playwright-cli.ps1` install the **`@playwright/cli`
+package** — a terminal-driven browser automation tool — for a human at a shell.
+This is a different artifact from `@playwright/mcp` above: Browser Mode is
+provisioned in-process by `ensure_playwright_installed`, needs no user action,
+and is not touched by these scripts.
+
+They exist because upstream publishes this tool only through the npm registry,
+which assumes two things an enterprise laptop often lacks: a Node toolchain of a
+recent enough major, and a default registry that answers without a login. The
+scripts remove both assumptions without introducing a private artifact channel —
+there is no Kiro Crew-hosted Playwright build to keep in sync or to trust.
+
+**Node is bootstrapped, not required.** A Node already on PATH is reused when its
+major is at least the package's declared floor of 18, as is one recorded by
+`ensure-node.sh` in `<data home>/node-bin-dir` — these installers *read* that
+marker but never write it, so the sharing is one-directional: a Node they
+bootstrap stays private to them, and `ensure-node.sh` still downloads its own.
+That is deliberate, because `env.py` hands the marked interpreter to the gateway,
+whose floor is higher than this package's.
+
+A reused Node is only reused if `npm` is actually beside it. On Debian and Ubuntu
+`nodejs` and `npm` are separate packages, so `apt install nodejs` alone leaves a
+perfectly good Node with no npm — and telling that user to install npm would hand
+back the one prerequisite these installers exist to remove. Such a Node is
+abandoned and a private one bootstrapped instead, because the release tarball
+bundles npm. Missing npm in a tree the installer itself unpacked is a different
+thing entirely — a truncated archive — and aborts rather than retrying.
+
+Otherwise the release build for the detected platform is downloaded and its
+SHA-256 checked against that release's `SHASUMS256.txt` **before it is
+executed**; a mismatch, or an artifact the manifest does not list at all, aborts
+the install. Selection is libc-aware because an official tarball is not portable:
+musl hosts (Alpine) get the unofficial-builds variant, and so do pre-2.28-glibc
+hosts (RHEL 7-era) **on x64 only**, which is the only architecture that variant
+is published for. The manifest is fetched over the same channel as the artifact
+and is not itself signed — identical to `ensure-node.sh`, so this is corruption
+detection plus transport trust, not an independent trust root like the signed
+manifest `cli.sh` verifies.
+
+**The install is unprivileged and self-contained.** `npm install --global` is run
+with `npm_config_prefix` pointed at `<data home>/playwright-cli`, so nothing is
+written outside the user's home and sudo is never involved. The generated entry
+point is a **wrapper script, not a symlink**: npm's own shim starts
+`#!/usr/bin/env node`, which resolves against the *caller's* PATH, so a user whose
+Node the installer had to bootstrap would get `node: not found` from a tool that
+installed perfectly. The wrapper pins the exact interpreter that was verified,
+and every path interpolated into it is escaped, because a generated script treats
+its inputs as code.
+
+**The public registry is pinned, same rationale as the Browser-Mode path.** An
+ambient `.npmrc` that redirects the default registry at a private mirror makes a
+*public* package 401 the moment that mirror's token expires. `--registry` re-points
+it for the opposite case (public registry firewalled, mirror reachable), and
+`--isolated-npmrc` ignores the ambient config entirely. A registry URL carrying
+userinfo is redacted everywhere the script prints it, and the log is created
+owner-only, because npm writes that URL into its own output.
+
+**Enterprise failures are classified, not passed through.** npm's output is kept
+at `<prefix>/install.log` and matched against the failures a corporate network
+actually produces, because the remedies are mutually exclusive and a raw npm dump
+does not distinguish them. The full exit-code table is in `--help`; the codes that
+carry a diagnosis are:
+
+| Code | Cause | What the script tells the user to do |
+|------|-------|--------------------------------------|
+| 11 | Node download failed | `--node-mirror` pointing at an internal Node mirror |
+| 12 | Node checksum mismatch or absent from the manifest | hard stop — nothing is executed |
+| 13 | Registry demanded auth (`E401`, `E403`, `ENEEDAUTH`) | `--isolated-npmrc` for a public package behind a mirror; `npm login` + `--registry` when the mirror is the only egress; or ask for these packages to be proxied |
+| 14 | Registry unreachable (DNS, proxy, TLS interception) | `HTTPS_PROXY`/`NO_PROXY`, or `NODE_EXTRA_CA_CERTS` for an internal CA — never disabling verification |
+| 15 | Package/version absent (`E404`, `ETARGET`) | `npm view … versions --registry …`; a mirror commonly carries only versions someone already pulled through it |
+| 16 | Browser binaries blocked | `--download-host` for a CDN mirror, or `--skip-browsers` |
+| 10 / 17 / 18 | Unusable platform or missing downloader / unwritable prefix / installed CLI will not run | named directly, with the path or tool at fault |
+
+Codes 16 and 14 share the same underlying transport errors, so the browser-CDN
+signature is matched **first**: telling a user to fix a proxy that is already
+working would send them down the wrong path entirely.
+
+Both scripts are documented for the audit-then-run flow (`curl -fsSLO`, read, then
+`sh`) as well as the one-liner, because piping a script into a shell is prohibited
+on many corporate machines. `--dry-run` reports the resolved plan — platform, Node
+decision, registry, paths — and changes nothing.
 
 ### Context Window Optimization (Playwright Proxy)
 
