@@ -295,6 +295,10 @@ class _SilentQueue:
         await asyncio.sleep(self._tick)
         raise asyncio.TimeoutError
 
+    def qsize(self) -> int:
+        """Always empty — no frames accumulate in the silent queue."""
+        return 0
+
 
 @pytest.mark.asyncio
 async def test_working_verdict_never_probed_at_any_idle():
@@ -736,3 +740,117 @@ def test_extract_log_redirect_target():
     assert extract_log_redirect_target("cmd 2>&1") == ""  # fd-dup only — no file
     assert extract_log_redirect_target("cmd > /dev/null 2>&1") == ""
     assert extract_log_redirect_target("plain command") == ""
+
+
+# ── F2: TOCTOU race — progress frame during oracle must prevent cancel ────────
+
+
+@pytest.mark.asyncio
+async def test_toctou_progress_during_oracle_prevents_cancel():
+    """F2 regression: a progress frame that arrives in the queue WHILE the
+    oracle is executing (suspended, awaiting the executor result) must reset
+    the stall clock and prevent a spurious session/cancel.
+
+    Scenario:
+    1. _SilentQueue always times out → watchdog fires immediately.
+    2. TOCTOU guard snapshots queue depth (0) before calling the oracle.
+    3. Oracle is mocked to block until released.
+    4. WHILE the oracle is blocked, the test swaps in a real queue that
+       already holds a progress frame (simulating a frame that arrived
+       during the executor await).
+    5. Oracle is released and returns UNKNOWN.
+    6. TOCTOU recheck: new queue.qsize()=1 > snapshot 0 → reset stall
+       clock and continue instead of cancelling.
+    7. No session/cancel is sent.
+    """
+    oracle_entered = asyncio.Event()
+    oracle_release = asyncio.Event()
+
+    async def slow_oracle(*, model_wait: bool) -> tuple[str, str]:
+        oracle_entered.set()
+        await oracle_release.wait()
+        return ("unknown", "mcp subtree flat")
+
+    # Tight windows so the watchdog fires quickly; huge suspect so the
+    # TOCTOU continue does NOT immediately re-trigger a cancel.
+    wd = WatchdogSettings(
+        check_after_secs=0.01,
+        tool_stall_suspect_secs=999.0,
+        tool_stall_hard_cap_secs=999.0,
+    )
+    handle = _make_handle(watchdog=wd)
+    handle._stale_eligible = False
+    handle._tool_dispatched = True
+    from kiro_crew.acp.liveness import ToolCallState
+    handle._inflight_tool = ToolCallState(title="ReadInternalWebsites", command="")
+    # _SilentQueue always timeouts so the watchdog branch fires after the
+    # first tick (well before the 1s wait below); qsize() returns 0.
+    handle._queue = _SilentQueue()  # type: ignore[assignment]
+    # Replace offloaded oracle with the controlled mock
+    handle._consult_oracle_offloaded = slow_oracle  # type: ignore[method-assign]
+
+    async def do_drain():
+        return [ev async for ev in handle._dispatch_events(req_id=99, timeout=2.0)]
+
+    drain_task = asyncio.create_task(do_drain())
+
+    # Wait for the oracle to enter (watchdog has fired, oracle is executing)
+    await asyncio.wait_for(oracle_entered.wait(), timeout=1.0)
+
+    # Simulate a progress frame arriving WHILE the oracle is suspended:
+    # swap in a real queue that already holds the frame so qsize() > 0 when
+    # the TOCTOU guard checks after oracle return.
+    real_queue: asyncio.Queue = asyncio.Queue()
+    real_queue.put_nowait(JsonRpcMessage(method="notifications/progress", params={}))
+    handle._queue = real_queue  # type: ignore[assignment]
+
+    # Release the oracle — it returns UNKNOWN
+    oracle_release.set()
+
+    # Give the loop a moment to apply the TOCTOU guard and consume the frame
+    await asyncio.sleep(0.1)
+
+    # Cancel the drain (would otherwise run until the 2 s timeout)
+    drain_task.cancel()
+    try:
+        await drain_task
+    except asyncio.CancelledError:
+        pass
+
+    # Key assertion: no session/cancel was sent — the TOCTOU guard prevented it
+    handle._runtime.send_notification.assert_not_awaited()
+
+
+# ── F3: hard cap bounds UNKNOWN forbearance absolutely ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_hard_cap_below_suspect_window_fires_at_cap():
+    """F3: when tool_stall_hard_cap_secs < tool_stall_suspect_secs, the cancel
+    must fire just after the hard cap, not after the (larger) suspect window.
+
+    With cap=0.05s and suspect=999s, the cancel would never fire within this
+    test's runtime unless the hard cap is applied as min(suspect, hard_cap).
+    """
+    from kiro_crew.acp.liveness import ToolCallState
+
+    wd = WatchdogSettings(
+        check_after_secs=0.01,
+        tool_stall_suspect_secs=999.0,   # would never fire without the cap
+        tool_stall_hard_cap_secs=0.05,   # hard cap < suspect → governs
+    )
+    handle = _make_handle(watchdog=wd)
+    handle._stale_eligible = False
+    handle._tool_dispatched = True
+    handle._inflight_tool = ToolCallState(title="mystery", command="", is_shell=False)
+    handle._queue = _SilentQueue()  # type: ignore[assignment]
+    handle._oracle.check_tool = lambda pid, tool: ("unknown", "mcp subtree flat")
+
+    events = await _drain(handle, req_id=1, timeout=5.0)
+
+    # The cancel must have fired (hard cap governs) ...
+    handle._runtime.send_notification.assert_awaited()
+    assert handle._runtime.send_notification.await_args.args[0] == "session/cancel"
+    # ... and the terminal event carries the tool-stall stop reason.
+    assert events and events[-1].kind == EVENT_COMPLETE
+    assert events[-1].stop_reason == STOP_REASON_TOOL_STALL

@@ -1213,27 +1213,48 @@ class AcpSessionHandle:
                         _tool_idle = now - last_data_ts
                         if _tool_idle <= wd.check_after_secs:
                             continue
+                        # F2 — TOCTOU guard: snapshot queue depth before
+                        # awaiting the oracle (which runs in an executor for
+                        # up to 10 s, yielding the event loop). A progress or
+                        # tool-result frame arriving in the queue during that
+                        # window means a real activity burst just occurred;
+                        # acting on the stale pre-oracle idle snapshot would
+                        # be a spurious cancel. Recheck after the oracle and
+                        # reset the stall clock if the queue grew.
+                        _q_depth_before = self._queue.qsize()
                         verdict, evidence = await self._consult_oracle_offloaded(model_wait=False)
+                        # TOCTOU recheck: if a frame arrived while the oracle
+                        # was running, treat it as fresh activity, reset the
+                        # stall clock, and let the loop consume it normally.
+                        if self._queue.qsize() > _q_depth_before:
+                            last_data_ts = time.monotonic()
+                            continue
                         if verdict == VERDICT_WORKING:
                             self._log_working_deferral(_tool_idle, evidence)
                             continue
-                        # UNKNOWN acts at the suspect window; the hard cap governs
-                        # only the stale/model-wait branch below (it bounds the
-                        # extended UNKNOWN deferral windows there). The 3h suspect
-                        # default is BUILD-scale forbearance — an LLM-shaped stall
-                        # (flat subtree whose only live evidence is an established
-                        # backend socket: a model turn riding inside a tool, e.g.
-                        # kiro-cli use_subagent) narrows to the model-silent budget,
-                        # because its longest legitimate silent gap is minutes, not
-                        # hours. Keyed STRICTLY on the oracle's established_flat
-                        # evidence tag: plain flat-subtree or shell-child evidence
-                        # (a quiet build / quiet MCP tool) keeps the full window.
-                        # WORKING was already deferred above; the action below is
-                        # the existing non-lethal tool-stall recovery.
+                        # UNKNOWN acts at the suspect window. The 3h suspect
+                        # default is BUILD-scale forbearance — an LLM-shaped
+                        # stall (flat subtree whose only live evidence is an
+                        # established backend socket: a model turn riding inside
+                        # a tool, e.g. kiro-cli use_subagent) narrows to the
+                        # model-silent budget, because its longest legitimate
+                        # silent gap is minutes, not hours. Keyed STRICTLY on
+                        # the oracle's established_flat evidence tag: plain
+                        # flat-subtree or shell-child evidence (a quiet build /
+                        # quiet MCP tool) keeps the full window.
+                        # F3 — hard cap: watchdog_tool_stall_hard_cap_secs is
+                        # the absolute ceiling for UNKNOWN forbearance. Apply
+                        # min(suspect_window, hard_cap) so the configured cap
+                        # always bounds the effective window. WORKING deferred
+                        # unconditionally above; DEAD/STUCK_INPUT act
+                        # immediately regardless of the window.
+                        # WORKING was already deferred above; the action below
+                        # is the existing non-lethal tool-stall recovery.
                         _suspect = wd.tool_stall_suspect_secs
                         _narrowed = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
                         if _narrowed:
                             _suspect = min(wd.model_silent_probe_secs, _suspect)
+                        _suspect = min(_suspect, wd.tool_stall_hard_cap_secs)
                         _acting = (
                             verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT)
                             or _tool_idle > _suspect
@@ -1908,6 +1929,7 @@ class AcpSessionHandle:
                     command=ev.tool_input,
                     dispatch_ts=time.monotonic(),
                     is_shell=ev.is_shell,
+                    tool_name=ev.tool_name,
                 )
                 self._oracle.reset()
             elif ev.kind == EVENT_TOOL_RESULT:

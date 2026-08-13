@@ -153,6 +153,56 @@ def test_aggregate_startup_turn_and_other(tmp_path: Path):
     assert warm_rows[0]["by_attr"]["result=miss"] == 1.0
 
 
+def _turn_dp(attrs: dict, count: int = 1) -> dict:
+    """Minimal turn histogram data-point (single bucket, no distribution)."""
+    counts = [0] * (len(_BOUNDS) + 1)
+    counts[1] = count
+    return {
+        "attributes": attrs,
+        "count": count,
+        "sum": float(count * 20),
+        "min": 20.0,
+        "max": 20.0,
+        "bucket_counts": counts,
+        "explicit_bounds": _BOUNDS,
+    }
+
+
+def test_fault_rate_excludes_watchdog_recovery_outcomes(tmp_path: Path):
+    """F4 regression: tool_stall and stale_recover must NOT count toward
+    fault_rate even though they are not 'ok'. Only genuine terminal faults
+    (error, timeout) are faults; watchdog recovery outcomes are tracked
+    separately under kirocrew.watchdog.recovery.outcome."""
+    turn = {"name": "kirocrew.turn.duration", "data": {"data_points": [
+        _turn_dp({"outcome": "ok"}, count=4),
+        _turn_dp({"outcome": "error"}, count=1),      # terminal fault
+        _turn_dp({"outcome": "timeout"}, count=1),    # terminal fault
+        _turn_dp({"outcome": "tool_stall"}, count=3),     # watchdog recovery — NOT a fault
+        _turn_dp({"outcome": "stale_recover"}, count=2),  # watchdog recovery — NOT a fault
+    ]}}
+    result = _aggregate([_write_shard(tmp_path, [turn])])
+
+    total = 4 + 1 + 1 + 3 + 2  # = 11
+    true_faults = 1 + 1          # error + timeout only
+    expected_rate = round(true_faults / total, 4)
+
+    assert result["turn"]["outcome"] == {
+        "ok": 4, "error": 1, "timeout": 1, "tool_stall": 3, "stale_recover": 2,
+    }
+    assert result["turn"]["fault_rate"] == expected_rate  # ≈ 0.1818
+
+    # Ensure genuine error/timeout STILL count as faults (not accidentally
+    # excluded by an overly aggressive allowlist).
+    sub = tmp_path / "sub"
+    sub.mkdir(exist_ok=True)
+    error_only_turn = {"name": "kirocrew.turn.duration", "data": {"data_points": [
+        _turn_dp({"outcome": "ok"}, count=3),
+        _turn_dp({"outcome": "error"}, count=1),
+    ]}}
+    result2 = _aggregate([_write_shard(sub, [error_only_turn])])
+    assert result2["turn"]["fault_rate"] == 0.25  # 1 error / 4 — unchanged
+
+
 # ── Bucket-generation truthfulness + the acquire warm/cold split ──────────
 #
 # Two shipped defects are pinned here:

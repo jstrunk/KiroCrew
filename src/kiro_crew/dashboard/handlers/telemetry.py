@@ -476,9 +476,16 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
             }
         )
 
+    # F4: only terminal-fault outcomes count toward fault_rate. The two watchdog
+    # recovery outcomes ("tool_stall" and "stale_recover") are NOT faults: a
+    # recovered stall is re-driven in place and tracked separately under
+    # kirocrew.watchdog.recovery.outcome. Counting them as faults inflated the
+    # fault rate and hid the true error population. Use an explicit allowlist so
+    # future outcome labels added to _turn_outcome() must actively opt in.
+    _TERMINAL_FAULT_OUTCOMES = frozenset({"error", "timeout", "cancelled"})
     turn_outcome = turn.outcomes
     turn_total = sum(turn_outcome.values())
-    turn_faults = sum(v for k, v in turn_outcome.items() if k != "ok")
+    turn_faults = sum(v for k, v in turn_outcome.items() if k in _TERMINAL_FAULT_OUTCOMES)
     turn_block = {
         # ``other_generations`` arrives via stats(): >0 means the window
         # straddles a bucket-boundary change and only the dominant generation

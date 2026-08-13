@@ -187,6 +187,14 @@ class _SilentQueue:
         await asyncio.sleep(self._tick)
         raise asyncio.TimeoutError
 
+    def qsize(self) -> int:
+        # The silent queue never accumulates frames (get() always times out
+        # before any put_nowait could be served), so depth is always 0.  The
+        # TOCTOU guard reads qsize() before and after the oracle; equal values
+        # here mean "no progress arrived" — correct for all tests that use this
+        # queue, where the test scenario has no concurrent producer.
+        return 0
+
 
 async def _drain(handle, req_id, timeout):
     return [ev async for ev in handle._dispatch_events(req_id, timeout)]
