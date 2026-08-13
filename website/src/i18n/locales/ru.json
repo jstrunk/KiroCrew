@@ -5262,7 +5262,11 @@
       "tunnel_connected_token_valid_auto_refresh": "Туннель подключён. Токен действителен {{valid}}; автообновление {{refresh}}.",
       "tunnel_connecting": "Туннель подключается…",
       "tunnel_error": "ошибка туннеля",
-      "tunnel_state": "Туннель {{state}}."
+      "tunnel_state": "Туннель {{state}}.",
+      "n_unread": "Непрочитанных: {{n}}",
+      "switch_crew_active": "Сменить экипаж, сейчас {{name}}",
+      "switch_crew_active_unread": "Сменить экипаж, сейчас {{name}}, непрочитанных в других: {{n}}",
+      "stopped": "остановлен"
     },
     "instancesViewport": {
       "connecting": "Подключение…",
@@ -11327,7 +11331,18 @@
         "tier_spec": "{{instanceType}} · {{arch}} · {{vcpu}} vCPU · {{ramGb}} GB RAM · {{diskGb}} GB disk",
         "start": "Start",
         "start_crew": "Start {{name}}",
-        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew."
+        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew.",
+        "more_actions": "Другие действия для {{name}}",
+        "edit_settings": "Изменить настройки",
+        "edit_crew": "Изменить {{name}}",
+        "save_changes": "Сохранить изменения",
+        "saving": "Сохранение…",
+        "failed_to_save_crew": "Не удалось сохранить этот экипаж",
+        "edit_reconnect_note": "Изменение хоста, порта или способа подключения закрывает текущий туннель. Подключитесь заново, когда будете готовы.",
+        "remove": "Убрать…",
+        "transport_locked_note": "Kiro Crew связывает этот экипаж с его ресурсами AWS через идентификатор подключения, поэтому способ подключения и цель здесь изменить нельзя.",
+        "port_must_be_in_range": "Укажите порт от 1 до 65535.",
+        "ttl_must_be_hours_or_minutes": "Укажите срок в виде 20h или 30m."
       },
       "webhooksPanel": {
         "inbound_webhooks": "Входящие webhooks",

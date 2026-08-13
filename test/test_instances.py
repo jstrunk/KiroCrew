@@ -1370,6 +1370,23 @@ class _FakeReq:
         return self._body
 
 
+def _fake_reconfigure(mgr, keep_intent=True):
+    """Mirror SshTunnelManager.reconfigure on a stub: teardown then persist.
+
+    The real method holds the manager lock across both steps; a stub cannot model
+    the lock, so it models the ORDER, which is what the handler depends on.
+    """
+
+    async def reconfigure(instance_id, apply):
+        try:
+            await mgr.disconnect(instance_id, keep_intent=keep_intent)
+        except Exception:
+            pass  # the real method logs and persists anyway
+        return apply()
+
+    return reconfigure
+
+
 class _State:
     def __init__(self, registry, manager=None):
         self.instances_registry = registry
@@ -1386,6 +1403,198 @@ def _enable(tmp_path: Path, monkeypatch, *, enabled=True):
 
 def _body(resp):
     return json.loads(resp.body.decode())
+
+
+class TestValidatorsRejectEmbeddedNewlines:
+    """Every anchored validator in this package must use ``\\Z``, not ``$``.
+
+    Python's ``$`` also matches just BEFORE a trailing newline, so a value like
+    ``"20h\\n"`` passes a ``$``-anchored check and then reaches an ssh/ssm
+    argument list carrying an embedded newline. Every regex here guards a value
+    that ends up on such a command line, so this is one bug class rather than one
+    regex — a ratchet is the only thing that keeps a future edit from
+    reintroducing it.
+    """
+
+    def test_no_anchored_pattern_uses_a_dollar_anchor(self):
+        import re as _re
+
+        offenders = []
+        for mod in ("registry", "validation", "constants"):
+            path = (
+                Path(__file__).resolve().parents[1]
+                / "src"
+                / "kiro_crew"
+                / "instances"
+                / f"{mod}.py"
+            )
+            for line in path.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                # An anchored pattern literal that still ends a branch with `$`.
+                if _re.search(r'r"\^[^"]*\$(?:\|\^\$)?"', stripped):
+                    offenders.append(f"{mod}.py: {stripped}")
+        assert not offenders, (
+            "anchored with `$`, which also matches before a trailing newline; "
+            "use `\\Z`:\n  " + "\n  ".join(offenders)
+        )
+
+    def test_a_trailing_newline_never_survives_validation(self, tmp_path):
+        """Two safe answers, and every guard must give one of them.
+
+        ``validation.py`` SANITIZES — it strips before matching and returns the
+        cleaned value, so a newline cannot reach the argument list it guards. The
+        registry and the ttl check REJECT, because they persist what they are
+        given. What must not happen is a guard accepting the value and passing the
+        newline through unchanged.
+        """
+        from kiro_crew.instances import validation
+        from kiro_crew.instances.registry import (
+            InstancesRegistry,
+            InvalidInstanceError,
+            validate_ttl,
+        )
+
+        for fn, dirty in (
+            (validation.validate_ssh_host, "host\n"),
+            (validation.validate_remote_bin, "/usr/bin/kirocrew\n"),
+            (validation.validate_ssm_target, "i-0123456789abcdef0\n"),
+            (validation.validate_ssm_run_as, "ec2-user\n"),
+            (validation.validate_aws_profile, "Admin\n"),
+            (validation.validate_aws_region, "us-west-2\n"),
+        ):
+            cleaned = fn(dirty)
+            assert "\n" not in cleaned, f"{fn.__name__} passed a newline through"
+
+        # The persisting layers refuse outright rather than silently rewriting.
+        with pytest.raises(InvalidInstanceError):
+            validate_ttl("20h\n")
+        reg = InstancesRegistry(tmp_path / "instances.json")
+        with pytest.raises(InvalidInstanceError):
+            reg.add(name="CD", ssh_host="cd-1-alias\n", instance_id="cd-1")
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        with pytest.raises(InvalidInstanceError):
+            reg.update("cd-1", ttl="20h\n")
+
+
+class TestReconfigureAtomicity:
+    """`reconfigure` must serialize against everything else taking the lock."""
+
+    def _manager(self, tmp_path):
+        from kiro_crew.instances.registry import InstancesRegistry
+        from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager
+
+        reg = InstancesRegistry(tmp_path / "instances.json")
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        return SshTunnelManager(reg), reg
+
+    def test_reconfigure_holds_the_lock_across_teardown_and_persist(self, tmp_path):
+        """`connect` takes the same lock, so a reconfiguration in progress must
+        block it — that mutual exclusion is what removes the window where a
+        connect could read the pre-edit coordinates."""
+        mgr, _reg = self._manager(tmp_path)
+        applied: list[str] = []
+
+        async def scenario():
+            # Stand in for a connect that already holds the lock.
+            async with mgr._lock:
+                task = asyncio.create_task(
+                    mgr.reconfigure("cd-1", lambda: applied.append("persisted"))
+                )
+                # Yield generously: while the lock is held, nothing may persist.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert applied == [], "reconfigure wrote without holding the lock"
+            await task
+            assert applied == ["persisted"]
+
+        asyncio.run(scenario())
+
+    def test_reconfigure_cancels_this_instances_in_flight_recovery(self, tmp_path):
+        """Self-heal reads the record BEFORE it takes the lock, so a recovery
+        already in flight carries the pre-edit coordinates. It must be cancelled
+        and awaited, or it reinstalls a tunnel to the old machine after the edit —
+        and `connect()` being idempotent would then hand that tunnel out for the
+        new settings. Another instance's recovery must be left alone."""
+        mgr, _reg = self._manager(tmp_path)
+        started = asyncio.Event()
+        outcome: list[str] = []
+
+        async def scenario():
+            async def stale_recovery():
+                started.set()
+                try:
+                    await asyncio.sleep(30)
+                    outcome.append("reinstalled-old-coordinates")
+                except asyncio.CancelledError:
+                    outcome.append("cancelled")
+                    raise
+
+            async def other_instance_recovery():
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    outcome.append("other-cancelled")
+                    raise
+
+            mgr._track_recovery("cd-1", asyncio.create_task(stale_recovery()))
+            other = asyncio.create_task(other_instance_recovery())
+            mgr._track_recovery("cd-2", other)
+            await started.wait()
+
+            await mgr.reconfigure("cd-1", lambda: outcome.append("persisted"))
+            # The stale recovery is finished (not merely signalled) before the
+            # coordinates are written.
+            assert outcome == ["cancelled", "persisted"], outcome
+            assert not other.done(), "another instance's recovery was cancelled"
+            other.cancel()
+            await asyncio.gather(other, return_exceptions=True)
+
+        asyncio.run(scenario())
+
+    def test_a_recovery_scheduled_mid_reconfigure_is_refused(self, tmp_path):
+        """Cancelling the recoveries in flight is not enough on its own.
+
+        Self-heal reads the record before it takes the lock, and the cancellation
+        itself awaits — so a tunnel exiting during that await schedules a FRESH
+        recovery holding pre-edit coordinates. The barrier raised at the start of
+        a reconfiguration is what makes that new attempt refuse to run. This drives
+        the exact window: the tunnel dies while the cancellation is in flight.
+        """
+        mgr, _reg = self._manager(tmp_path)
+        applied: list[str] = []
+        original = mgr._cancel_recovery
+
+        async def cancel_then_the_tunnel_dies(instance_id: str) -> None:
+            await original(instance_id)
+            # Barrier is up, lock not yet taken: the scheduling seam must refuse.
+            mgr._on_tunnel_exit(instance_id)
+
+        mgr._cancel_recovery = cancel_then_the_tunnel_dies  # type: ignore[method-assign]
+
+        async def scenario():
+            await mgr.reconfigure("cd-1", lambda: applied.append("persisted"))
+            assert applied == ["persisted"]
+            # No recovery was scheduled for this instance while the barrier held.
+            assert not mgr._recovery_by_instance.get("cd-1")
+            # And the barrier is down afterwards, so normal self-heal resumes.
+            assert "cd-1" not in mgr._reconfiguring
+
+        asyncio.run(scenario())
+
+    def test_reconfigure_persists_even_when_the_teardown_raises(self, tmp_path):
+        """A teardown that fails must not strand the caller on coordinates they
+        already know are wrong."""
+        mgr, _reg = self._manager(tmp_path)
+        applied: list[str] = []
+
+        async def boom(instance_id, *, keep_intent):
+            raise OSError("ssh process will not die")
+
+        mgr._teardown_locked = boom  # type: ignore[method-assign]
+        asyncio.run(mgr.reconfigure("cd-1", lambda: applied.append("persisted")))
+        assert applied == ["persisted"]
 
 
 class TestHandlers:
@@ -1684,6 +1893,401 @@ class TestHandlers:
             == 400
         )
 
+    def test_update_tears_down_a_tunnel_its_own_edit_invalidated(self, tmp_path, monkeypatch):
+        """A tunnel is built from ssh_host/remote_port/connection_method, so editing
+        one of those leaves a live tunnel forwarding the OLD port to the OLD host
+        under the new label. The edit must tear it down, and must keep
+        ``was_connected`` — that flag records an explicit user disconnect, which an
+        edit is not, and clearing it would drop the crew out of the switcher."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _Manager:
+            def __init__(self):
+                self.disconnected = []
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnected.append((instance_id, keep_intent))
+                # Mirror the real manager: the port hint always clears, and the
+                # connect intent clears ONLY for an explicit user disconnect.
+                hints = {"local_port": 0}
+                if not keep_intent:
+                    hints["was_connected"] = False
+                reg.update(instance_id, **hints)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mgr = _Manager()
+        mgr.reconfigure = _fake_reconfigure(mgr)  # type: ignore[method-assign]
+        state = _State(reg, manager=mgr)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200 and _body(r)["remote_port"] == 7999
+        # One teardown before the write. The post-write sweep is dated — it fires
+        # only for a tunnel that connected before the record changed — and this
+        # manager reports none live afterwards, so nothing more to tear down. The
+        # teardown is a reconfiguration, so it must not claim to be a user
+        # disconnect (that flag is what keeps the crew in the switcher).
+        assert mgr.disconnected == [("cd-1", True)], (
+            "the stale tunnel was left running, or the teardown claimed to be a "
+            "user disconnect"
+        )
+        inst = reg.get("cd-1")
+        assert inst is not None and inst.was_connected is True
+
+    def test_ttl_beyond_the_minters_bound_is_refused(self, tmp_path, monkeypatch):
+        """The token minters accept at most four digits. A ttl this layer lets
+        through is persisted happily and then fails at the next connect, blaming
+        the tunnel for a value the edit should have refused — so the registry
+        enforces the same bound the minters do."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.registry import InvalidInstanceError
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        # Direct registry write: the API is not the only caller.
+        with pytest.raises(InvalidInstanceError):
+            reg.update("cd-1", ttl="99999h")
+        # Accepted forms still are.
+        assert reg.update("cd-1", ttl="9999h").ttl == "9999h"
+        assert reg.update("cd-1", ttl="30m").ttl == "30m"
+
+        state = _State(reg)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"ttl": "99999h"})
+            )
+        )
+        assert r.status == 400 and _body(r)["code"] == "instance_invalid"
+
+    def test_update_refuses_an_invalid_edit_without_touching_the_tunnel(
+        self, tmp_path, monkeypatch
+    ):
+        """A rejected save must not cost the user their connection: the proposed
+        record is validated before the teardown, so a typo answers 400 with the
+        crew still connected."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _Manager:
+            def __init__(self):
+                self.disconnected = []
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnected.append(instance_id)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mgr = _Manager()
+        mgr.reconfigure = _fake_reconfigure(mgr)  # type: ignore[method-assign]
+        state = _State(reg, manager=mgr)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"ssh_host": "bad host;rm"})
+            )
+        )
+        assert r.status == 400 and _body(r)["code"] == "instance_invalid"
+        assert mgr.disconnected == [], "a rejected edit tore down the tunnel anyway"
+        inst = reg.get("cd-1")
+        assert inst is not None
+        assert inst.ssh_host == "cd-1-alias" and inst.was_connected is True
+
+    def test_update_restores_intent_even_when_the_sweep_found_no_tunnel(
+        self, tmp_path, monkeypatch
+    ):
+        """``disconnect()`` clears the persisted intent whether or not it tracked
+        a live tunnel, and reports False in that case. Restoring only on a True
+        return would drop the crew out of the switcher."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _NoTunnelManager:
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                # Mirrors the real manager: the registry cleanup runs even with
+                # no live tunnel tracked, and the return value is False.
+                hints = {"local_port": 0}
+                if not keep_intent:
+                    hints["was_connected"] = False
+                reg.update(instance_id, **hints)
+                return False
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        no_tunnel = _NoTunnelManager()
+        no_tunnel.reconfigure = _fake_reconfigure(no_tunnel)  # type: ignore[method-assign]
+        state = _State(reg, manager=no_tunnel)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200
+        inst = reg.get("cd-1")
+        assert inst is not None and inst.remote_port == 7999
+        assert inst.was_connected is True, "the crew lost its switcher entry"
+
+    def test_update_tears_the_tunnel_down_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        """One teardown, inside the reconfiguration. An extra one after the write
+        would hit whatever connected next — i.e. a Connect the user just made on
+        the new coordinates."""
+        import time as _time
+
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, TunnelStatus
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        class _FreshTunnelManager:
+            def __init__(self):
+                self.disconnect_calls = 0
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnect_calls += 1
+                return True
+
+            def status(self, instance_id):
+                # Connected just now — i.e. after the write this handler is about
+                # to make, which is the case the dated sweep must spare.
+                return TunnelStatus(
+                    instance_id=instance_id,
+                    state=TunnelState.CONNECTED,
+                    connected_at=_time.time() + 60,
+                )
+
+            def last_error(self, instance_id):
+                return None
+
+            def token_ttl_remaining(self, instance_id):
+                return None
+
+        mgr = _FreshTunnelManager()
+        mgr.reconfigure = _fake_reconfigure(mgr)  # type: ignore[method-assign]
+        state = _State(reg, manager=mgr)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200 and _body(r)["remote_port"] == 7999
+        # Only the pre-edit teardown ran; the sweep spared the newer tunnel.
+        assert mgr.disconnect_calls == 1
+
+    def test_update_does_not_revive_a_crew_disconnected_mid_edit(
+        self, tmp_path, monkeypatch
+    ):
+        """An explicit Disconnect landing while a transport edit is in flight must
+        win. The edit's teardown preserves intent rather than restoring a snapshot
+        of it, so the user's disconnect is not overwritten."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _DisconnectMidEdit:
+            def __init__(self):
+                self.calls = 0
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.calls += 1
+                hints = {"local_port": 0}
+                if not keep_intent:
+                    hints["was_connected"] = False
+                reg.update(instance_id, **hints)
+                if self.calls == 1:
+                    # The user presses Disconnect while the save is in flight.
+                    reg.set_was_connected(instance_id, False)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mid_edit = _DisconnectMidEdit()
+        mid_edit.reconfigure = _fake_reconfigure(mid_edit)  # type: ignore[method-assign]
+        state = _State(reg, manager=mid_edit)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200 and _body(r)["remote_port"] == 7999
+        inst = reg.get("cd-1")
+        assert inst is not None
+        assert inst.was_connected is False, "the edit revived a crew the user disconnected"
+        # The response must report the same thing, so the dashboard does not
+        # reconnect off a stale view.
+        assert _body(r)["was_connected"] is False
+
+    def test_update_rewrites_the_coordinates_inside_the_teardown_critical_section(
+        self, tmp_path, monkeypatch
+    ):
+        """The teardown and the coordinate rewrite must reach the manager as ONE
+        operation. Done as two, a connect can read the OLD record in between, and
+        whether its tunnel is CONNECTED or still CONNECTING when the write lands
+        decides whether anything notices — so the handler must not persist on its
+        own when a manager is present."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        events: list[str] = []
+
+        class _OrderingManager:
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                events.append(f"teardown(keep_intent={keep_intent})")
+                return True
+
+            async def reconfigure(self, instance_id, apply):
+                events.append("enter-critical-section")
+                await self.disconnect(instance_id, keep_intent=True)
+                out = apply()
+                events.append("leave-critical-section")
+                return out
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+            def token_ttl_remaining(self, instance_id):
+                return None
+
+        state = _State(reg, manager=_OrderingManager())
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"remote_port": 7999})
+            )
+        )
+        assert r.status == 200 and _body(r)["remote_port"] == 7999
+        assert events == [
+            "enter-critical-section",
+            "teardown(keep_intent=True)",
+            "leave-critical-section",
+        ], events
+        inst = reg.get("cd-1")
+        assert inst is not None and inst.was_connected is True
+
+    def test_update_saves_the_edit_even_when_the_tunnel_teardown_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """A teardown that raises must not strand the user on coordinates they
+        already know are wrong: the record is what the next connect builds from,
+        so the edit is persisted and the failure is logged, not surfaced as a
+        500."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+        reg.set_was_connected("cd-1", True)
+
+        class _WedgedManager:
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                raise OSError("ssh process will not die")
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        wedged = _WedgedManager()
+        wedged.reconfigure = _fake_reconfigure(wedged)  # type: ignore[method-assign]
+        state = _State(reg, manager=wedged)
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(state, match={"id": "cd-1"}, body={"ssh_host": "cd-2-alias"})
+            )
+        )
+        assert r.status == 200 and _body(r)["ssh_host"] == "cd-2-alias"
+        inst = reg.get("cd-1")
+        assert inst is not None and inst.ssh_host == "cd-2-alias"
+        assert inst.was_connected is True
+
+    def test_update_leaves_a_healthy_tunnel_alone_when_only_the_label_changes(
+        self, tmp_path, monkeypatch
+    ):
+        """A rename does not change how the tunnel is opened, so dropping the
+        connection for it would be a self-inflicted outage."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        class _Manager:
+            def __init__(self):
+                self.disconnected = []
+
+            async def disconnect(self, instance_id, *, keep_intent=False):
+                self.disconnected.append(instance_id)
+                return True
+
+            def status(self, instance_id):
+                return None
+
+            def last_error(self, instance_id):
+                return None
+
+        mgr = _Manager()
+        mgr.reconfigure = _fake_reconfigure(mgr)  # type: ignore[method-assign]
+        state = _State(reg, manager=mgr)
+        # Re-sending the SAME host alongside a new name is still only a rename.
+        r = asyncio.run(
+            handlers.api_instances_update(
+                _FakeReq(
+                    state,
+                    match={"id": "cd-1"},
+                    body={"name": "Renamed", "ssh_host": "cd-1-alias"},
+                )
+            )
+        )
+        assert r.status == 200 and _body(r)["name"] == "Renamed"
+        assert mgr.disconnected == []
+
     def test_remove_success_and_404(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
 
@@ -1727,6 +2331,7 @@ class TestHandlers:
                 return True
 
         mgr = _RacingManager()
+        mgr.reconfigure = _fake_reconfigure(mgr)  # type: ignore[method-assign]
         state = _State(reg, manager=mgr)
         r = asyncio.run(handlers.api_instances_remove(_FakeReq(state, match={"id": "cd-1"})))
         assert r.status == 200

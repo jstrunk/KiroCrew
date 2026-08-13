@@ -18,6 +18,8 @@ crosses this boundary, it is never logged, and it never appears in list/status.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import functools
 import logging
 from typing import TYPE_CHECKING
 
@@ -35,6 +37,7 @@ from kiro_crew.instances.registry import (
     InstancesError,
     InstancesRegistry,
     InvalidInstanceError,
+    validate_ttl,
 )
 from kiro_crew.sel import sel
 
@@ -102,6 +105,17 @@ def _registry(state: "DashboardState"):
         reg = InstancesRegistry()
         state.instances_registry = reg
     return reg
+
+
+def _apply_update(reg, instance_id: str, changes: dict) -> object:
+    """Write *changes* to *instance_id*. Blocking — callers offload it.
+
+    Module level on purpose: the registry write must never run on the event loop,
+    and a closure defined inside the async handler reads (to a human and to the
+    AST ratchet in ``test_apps_instances_loop_offload``) as a call on the loop
+    even when every caller hands it to a thread.
+    """
+    return reg.update(instance_id, **changes)
 
 
 def _status_for(state: "DashboardState", instance_id: str) -> dict:
@@ -262,11 +276,75 @@ async def api_instances_update(request: web.Request) -> web.Response:
         "aws_region",
     }
     changes = {k: v for k, v in body.items() if k in allowed}
+    # A tunnel is opened from these fields, so editing one of them makes a live
+    # tunnel wrong rather than merely out of date: it keeps forwarding the old
+    # port to the old host under the new label. Tear it down as part of the save
+    # so the next connect builds from what the user just entered.
+    transport_keys = {
+        "ssh_host",
+        "remote_port",
+        "connection_method",
+        "ssm_target",
+        "ssm_run_as",
+        "aws_profile",
+        "aws_region",
+        "remote_bin",
+    }
+    current = await asyncio.to_thread(reg.get, instance_id)
+    if current is None:
+        _audit("update", "denied", request_id=instance_id, error="not found")
+        return web.json_response(
+            {"error": "not found", "code": "instance_not_found"}, status=404
+        )
+    transport_changed = any(
+        k in transport_keys and v != getattr(current, k) for k, v in changes.items()
+    )
+    # Validate the PROPOSED record before touching the tunnel. The registry
+    # validates too, but that happens after the teardown — so a rejected edit
+    # would answer 400 having already disconnected a healthy crew, punishing the
+    # user for a typo the save never accepted.
     try:
-        inst = await asyncio.to_thread(lambda: reg.update(instance_id, **changes))
+        dataclasses.replace(current, **changes).validate()  # type: ignore[arg-type]
+        # Not part of the record invariant: a ttl is checked where it is WRITTEN,
+        # so a legacy value cannot fail an unrelated hint write (see
+        # registry.validate_ttl). The edit path is such a write.
+        if "ttl" in changes:
+            validate_ttl(str(changes["ttl"]))
+    except (InvalidInstanceError, TypeError, ValueError) as e:
+        _audit("update", "denied", request_id=instance_id, error=str(e))
+        return web.json_response({"error": str(e), "code": "instance_invalid"}, status=400)
+    mgr = getattr(state, "instances_manager", None)
+
+    try:
+        if transport_changed and mgr is not None:
+            # The teardown and the coordinate rewrite must not be observable
+            # apart. With the lock released between them a `connect` can read the
+            # OLD record, and whether its tunnel is already CONNECTED or still
+            # CONNECTING when the write lands decides whether any after-the-fact
+            # sweep would notice — so the window is closed rather than narrowed:
+            # reconfigure() holds the manager lock across both, and a racing
+            # connect either finishes before (and is torn down inside) or starts
+            # after (and reads the new coordinates).
+            inst = await mgr.reconfigure(
+                instance_id, functools.partial(_apply_update, reg, instance_id, changes)
+            )
+        else:
+            if transport_changed:
+                # No manager: nothing to tear down, but say so — a silent skip
+                # would look identical to a teardown that ran.
+                logger.warning(
+                    "instance %s transport edited with no manager running; "
+                    "no tunnel teardown performed",
+                    instance_id,
+                )
+            inst = await asyncio.to_thread(
+                functools.partial(_apply_update, reg, instance_id, changes)
+            )
     except InstanceNotFoundError as e:
         _audit("update", "denied", request_id=instance_id, error=str(e))
-        return web.json_response({"error": str(e)}, status=404)
+        return web.json_response(
+            {"error": str(e), "code": "instance_not_found"}, status=404
+        )
     except (InvalidInstanceError, InstancesError) as e:
         _audit("update", "denied", request_id=instance_id, error=str(e))
         return web.json_response({"error": str(e)}, status=400)

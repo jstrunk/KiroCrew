@@ -35,6 +35,9 @@ import {
   X,
   Power,
   Loader2,
+  MoreHorizontal,
+  Pencil,
+  Play,
 } from 'lucide-react'
 import {
   api,
@@ -44,7 +47,14 @@ import {
   type CloudPreflight,
   type CloudCoords,
 } from '../../api/client'
-import { Card, Btn, Badge } from '../../components/ui'
+import { Card, Btn, Badge, IconButton } from '../../components/ui'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from '../../components/ui/dropdown-menu'
 import ErrorNotice from '../../components/ErrorNotice'
 import { readPersistedString, usePersistedString } from '../../hooks/usePersistedString'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -52,6 +62,7 @@ import { useAppDispatch } from '../../store'
 import { removeWarm } from '../../store/instancesSlice'
 import { i18nT } from '../../i18n/t'
 import { AddInstanceForm, StatusBadge } from './InstancesPanel'
+import { EditInstanceForm } from './InstanceFormFields'
 
 
 /** A launch job the user is still waiting on (not yet a switchable crew). */
@@ -219,6 +230,10 @@ function CrewRow({
   onDelete,
   onRequestDelete,
   onRequestRemove,
+  onEdit,
+  onEditSaved,
+  editing,
+  otherPorts,
 }: {
   inst: InstanceView
   cloudTag: string | null
@@ -235,6 +250,11 @@ function CrewRow({
   onDelete: (tag: string, coords: CloudCoords) => void
   onRequestDelete: (tag: string | null) => void
   onRequestRemove: (id: string | null) => void
+  onEdit: (id: string | null) => void
+  onEditSaved: () => void
+  editing: boolean
+  /** Ports held by the OTHER crews, so the edit form can flag a real conflict. */
+  otherPorts: number[]
 }) {
   const connected = inst.status.state === 'connected'
   const isCloud = cloudTag !== null
@@ -246,9 +266,15 @@ function CrewRow({
   // as possibly-cloud: same confirm step, and copy that says what Remove does and does
   // not do.
   const unverifiedCloud = !isCloud && inst.connection_method === 'ssm' && !!inst.ssm_target
+  // A stop/start this row asked for is still in flight.
+  const lifecycleBusy = busy === `stop:${cloudTag}` || busy === `start:${cloudTag}`
+  // States that occupy the row's second control slot with an inline button.
+  const transient =
+    deleting || lifecycleBusy || (isCloud && confirmDelete) || (!isCloud && confirmRemove)
   const target = inst.connection_method === 'ssm' ? inst.ssm_target : inst.ssh_host
   return (
-    <div className="flex items-start justify-between gap-3 py-2.5 border-b border-border last:border-b-0">
+    <div className="py-2.5 border-b border-border last:border-b-0">
+    <div className="flex items-start justify-between gap-3">
       <div className="flex items-start gap-3 min-w-0">
         <span className={`mt-0.5 w-8 h-8 shrink-0 grid place-items-center rounded-md ${isCloud ? 'bg-accent-subtle text-accent' : 'bg-bg-hover text-muted'}`}>
           {isCloud ? <Rocket size={16} /> : <Server size={16} />}
@@ -271,10 +297,11 @@ function CrewRow({
         </div>
       </div>
       <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
-        <Btn onClick={() => onDiagnose(inst.id)} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.instancesPanel.diagnose_2', { name: inst.name })}>
-          <Stethoscope className="lucide-inline" /> {busy === `diagnose:${inst.id}` ? '…' : i18nT('pages.settings.instancesPanel.diagnose')}
-        </Btn>
-        {connected ? (
+        {/* A row shows at most two controls. While a transient state occupies
+            them — an armed confirm plus its Cancel, or a teardown in progress —
+            the primary action stands down; connecting is not what the user is
+            being asked about at that moment. */}
+        {transient ? null : connected ? (
           <Btn onClick={() => onDisconnect(inst.id)} disabled={!!busy || deleting}>
             <Unplug className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.disconnect')}
           </Btn>
@@ -283,50 +310,140 @@ function CrewRow({
             <Plug className="lucide-inline" /> {busy === `connect:${inst.id}` ? i18nT('pages.settings.instancesPanel.connecting') : i18nT('pages.settings.instancesPanel.connect')}
           </Btn>
         )}
-        {isCloud ? (
+        {/* A teardown and a pending confirmation stay OUT of the overflow menu:
+            both are transient states the user must see without reopening a menu —
+            the delete only requested the teardown, and AWS confirms minutes later
+            when the row is dropped. Hiding that read as "nothing happened". */}
+        {deleting ? (
+          <Btn danger disabled aria-label={i18nT('pages.settings.remoteCrewPanel.deleting')}>
+            <RefreshCw className="lucide-inline animate-spin" /> {i18nT('pages.settings.remoteCrewPanel.deleting')}
+          </Btn>
+        ) : lifecycleBusy ? (
+          // The action was chosen from the menu, which then closed. Report its
+          // progress on the row under the SAME accessible name the menu item
+          // carried, so the crew a request belongs to is never ambiguous.
+          <Btn
+            disabled
+            aria-label={
+              busy === `stop:${cloudTag}`
+                ? i18nT('pages.settings.remoteCrewPanel.stop_crew', { name: inst.name })
+                : i18nT('pages.settings.remoteCrewPanel.start_crew', { name: inst.name })
+            }
+          >
+            <RefreshCw className="lucide-inline animate-spin" /> …
+          </Btn>
+        ) : isCloud && confirmDelete ? (
           <>
-            <Btn onClick={() => onStop(cloudTag, coordsOf(inst))} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.remoteCrewPanel.stop_crew', { name: inst.name })}>
-              {busy === `stop:${cloudTag}` ? '…' : i18nT('pages.settings.remoteCrewPanel.stop')}
+            <Btn danger onClick={() => onDelete(cloudTag, coordsOf(inst))} disabled={!!busy} aria-label={i18nT('pages.settings.remoteCrewPanel.confirm_delete_of', { name: inst.name })}>
+              <Trash2 className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.confirm_delete')}
             </Btn>
-            {/* Stop without Start is a one-way door: the route exists and the client
-                method existed, but nothing called it — a stopped crew had no path back
-                to running from the dashboard, while its EBS volume kept billing. */}
-            <Btn onClick={() => onStart(cloudTag, coordsOf(inst))} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.remoteCrewPanel.start_crew', { name: inst.name })}>
-              {busy === `start:${cloudTag}` ? '…' : i18nT('pages.settings.remoteCrewPanel.start')}
+            {/* An armed destructive button needs a way out. The overflow menu is
+                hidden while armed, so without this a mis-click leaves the row
+                showing nothing but a button that terminates an EC2 instance. */}
+            <Btn onClick={() => onRequestDelete(null)} disabled={!!busy}>
+              {i18nT('pages.settings.remoteCrewPanel.cancel')}
             </Btn>
-            {deleting ? (
-              // The delete only requested the teardown; AWS confirms minutes later and
-              // the row is dropped then. Show that it is in progress instead of leaving
-              // the row looking untouched (which read as "nothing happened").
-              <Btn danger disabled aria-label={i18nT('pages.settings.remoteCrewPanel.deleting')}>
-                <RefreshCw className="lucide-inline animate-spin" /> {i18nT('pages.settings.remoteCrewPanel.deleting')}
-              </Btn>
-            ) : confirmDelete ? (
-              <Btn danger onClick={() => onDelete(cloudTag, coordsOf(inst))} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.remoteCrewPanel.confirm_delete_of', { name: inst.name })}>
-                <Trash2 className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.confirm_delete')}
-              </Btn>
-            ) : (
-              <Btn danger onClick={() => onRequestDelete(cloudTag)} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.remoteCrewPanel.delete_crew', { name: inst.name })}>
-                <Trash2 className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.delete')}
-              </Btn>
-            )}
           </>
-        ) : unverifiedCloud ? (
-          confirmRemove ? (
-            <Btn danger onClick={() => onRemove(inst.id)} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.instancesPanel.remove', { name: inst.name })}>
+        ) : !isCloud && confirmRemove ? (
+          <>
+            <Btn danger onClick={() => onRemove(inst.id)} disabled={!!busy} aria-label={i18nT('pages.settings.instancesPanel.remove', { name: inst.name })}>
               <Trash2 className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.confirm_remove')}
             </Btn>
-          ) : (
-            <Btn danger onClick={() => onRequestRemove(inst.id)} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.instancesPanel.remove', { name: inst.name })}>
-              <Trash2 className="lucide-inline" />
+            <Btn onClick={() => onRequestRemove(null)} disabled={!!busy}>
+              {i18nT('pages.settings.remoteCrewPanel.cancel')}
             </Btn>
-          )
-        ) : (
-          <Btn danger onClick={() => onRemove(inst.id)} disabled={!!busy || deleting} aria-label={i18nT('pages.settings.instancesPanel.remove', { name: inst.name })}>
-            <Trash2 className="lucide-inline" />
-          </Btn>
+          </>
+        ) : null}
+        {/* A row shows at most two controls. Connect/Disconnect is the primary
+            action and everything else lives in this menu; while a transient
+            action occupies the second slot the menu yields, since it is
+            disabled in those states anyway. */}
+        {!transient && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <IconButton
+              aria-label={i18nT('pages.settings.remoteCrewPanel.more_actions', { name: inst.name })}
+              disabled={!!busy || deleting}
+            >
+              <MoreHorizontal className="lucide-inline" />
+            </IconButton>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-[200px]">
+            <DropdownMenuItem
+              className="gap-2 text-[13px]"
+              onSelect={() => onDiagnose(inst.id)}
+              aria-label={i18nT('pages.settings.instancesPanel.diagnose_2', { name: inst.name })}
+            >
+              <Stethoscope className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.diagnose')}
+            </DropdownMenuItem>
+            <DropdownMenuItem className="gap-2 text-[13px]" onSelect={() => onEdit(inst.id)}>
+              <Pencil className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.edit_settings')}
+            </DropdownMenuItem>
+            {isCloud ? (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="gap-2 text-[13px]"
+                  onSelect={() => onStop(cloudTag, coordsOf(inst))}
+                  aria-label={i18nT('pages.settings.remoteCrewPanel.stop_crew', { name: inst.name })}
+                >
+                  <Power className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.stop')}
+                </DropdownMenuItem>
+                {/* Stop without Start is a one-way door: the route exists and the client
+                    method existed, but nothing called it — a stopped crew had no path back
+                    to running from the dashboard, while its EBS volume kept billing. */}
+                <DropdownMenuItem
+                  className="gap-2 text-[13px]"
+                  onSelect={() => onStart(cloudTag, coordsOf(inst))}
+                  aria-label={i18nT('pages.settings.remoteCrewPanel.start_crew', { name: inst.name })}
+                >
+                  <Play className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.start')}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="gap-2 text-[13px] text-danger"
+                  onSelect={() => onRequestDelete(cloudTag)}
+                  aria-label={i18nT('pages.settings.remoteCrewPanel.delete_crew', { name: inst.name })}
+                >
+                  <Trash2 className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.delete')}
+                </DropdownMenuItem>
+              </>
+            ) : (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  className="gap-2 text-[13px] text-danger"
+                  // Always confirm-gated: the label ends in an ellipsis because a
+                  // second step follows, and the record being removed (host, port,
+                  // TTL, profile) is the one this panel exists to let you correct
+                  // — losing it to a single click has no undo.
+                  onSelect={() => onRequestRemove(inst.id)}
+                  aria-label={i18nT('pages.settings.instancesPanel.remove', { name: inst.name })}
+                >
+                  <Trash2 className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.remove')}
+                </DropdownMenuItem>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
         )}
       </div>
+    </div>
+    {editing && (
+      <EditInstanceForm
+        inst={inst}
+        usedPorts={otherPorts}
+        onSaved={onEditSaved}
+        onCancel={() => onEdit(null)}
+        // Only a CORRELATED cloud crew is addressed by its connection identity:
+        // Stop / Start / Delete resolve the machine through {profile, region,
+        // ssm_target}, so editing those would leave a billing instance the
+        // dashboard can no longer reach. A crew we cannot correlate is offered no
+        // lifecycle action at all, so freezing its fields would protect nothing
+        // and would take away a legitimate way to correct its AWS profile.
+        lockTransport={isCloud}
+      />
+    )}
     </div>
   )
 }
@@ -507,6 +624,9 @@ export function RemoteCrewPanel() {
   const [activeLaunchId, setActiveLaunchId] = useState<string | null>(null)
   const [confirmDeleteTag, setConfirmDeleteTag] = useState<string | null>(null)
   const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null)
+  // Only one crew is editable at a time: two open forms on the same list would
+  // let the user save conflicting ports without ever seeing the clash.
+  const [editingId, setEditingId] = useState<string | null>(null)
   // Tags whose delete has been accepted by the gateway but not yet confirmed by AWS.
   // The DELETE endpoint returns `cleanup: "pending"` the moment the CloudFormation
   // delete is *requested* — the local registry row is only dropped minutes later, by
@@ -907,6 +1027,10 @@ export function RemoteCrewPanel() {
                     onDelete={(tag, coords) => deleteMutation.mutate({ tag, coords })}
                     onRequestDelete={tag => setConfirmDeleteTag(tag)}
                     onRequestRemove={id => setConfirmRemoveId(id)}
+                    editing={editingId === inst.id}
+                    onEdit={id => setEditingId(id)}
+                    onEditSaved={() => { setEditingId(null); reloadInstances() }}
+                    otherPorts={instances.filter(i => i.id !== inst.id).map(i => i.remote_port)}
                   />
                 ))}
                 {inProgress.length === 0 && instances.length === 0 && (

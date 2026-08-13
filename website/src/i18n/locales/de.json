@@ -5100,7 +5100,11 @@
       "tunnel_connected_token_valid_auto_refresh": "Tunnel verbunden. Token gültig {{valid}}; automatische Aktualisierung {{refresh}}.",
       "tunnel_connecting": "Tunnel wird verbunden…",
       "tunnel_error": "Tunnel-Fehler",
-      "tunnel_state": "Tunnel {{state}}."
+      "tunnel_state": "Tunnel {{state}}.",
+      "n_unread": "{{n}} ungelesen",
+      "switch_crew_active": "Crew wechseln, aktuell {{name}}",
+      "switch_crew_active_unread": "Crew wechseln, aktuell {{name}}, {{n}} ungelesen in anderen",
+      "stopped": "gestoppt"
     },
     "instancesViewport": {
       "connecting": "Wird verbunden…",
@@ -11088,7 +11092,18 @@
         "tier_spec": "{{instanceType}} · {{arch}} · {{vcpu}} vCPU · {{ramGb}} GB RAM · {{diskGb}} GB disk",
         "start": "Start",
         "start_crew": "Start {{name}}",
-        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew."
+        "sign_in_unconfirmed": "We could not confirm the sign-in. The code below may still work — finish it here, then connect the crew.",
+        "more_actions": "Weitere Aktionen für {{name}}",
+        "edit_settings": "Einstellungen bearbeiten",
+        "edit_crew": "{{name}} bearbeiten",
+        "save_changes": "Änderungen speichern",
+        "saving": "Wird gespeichert…",
+        "failed_to_save_crew": "Diese Crew konnte nicht gespeichert werden",
+        "edit_reconnect_note": "Wenn Host, Port oder Verbindungsmethode geändert werden, wird der aktuelle Tunnel geschlossen. Stellen Sie die Verbindung wieder her, wenn Sie bereit sind.",
+        "remove": "Entfernen…",
+        "transport_locked_note": "Kiro Crew ordnet diese Crew ihren AWS-Ressourcen über ihre Verbindungsidentität zu; Verbindungsmethode und Ziel sind hier daher nicht änderbar.",
+        "port_must_be_in_range": "Gib einen Port zwischen 1 und 65535 an.",
+        "ttl_must_be_hours_or_minutes": "Gib eine Laufzeit wie 20h oder 30m an."
       },
       "webhooksPanel": {
         "inbound_webhooks": "Eingehende Webhooks",

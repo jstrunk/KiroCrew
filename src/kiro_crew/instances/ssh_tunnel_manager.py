@@ -53,7 +53,7 @@ import signal
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import aiohttp
 
@@ -103,6 +103,8 @@ from kiro_crew.instances.validation import (
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 _LOOPBACK = "127.0.0.1"
 # How long to wait for the local forward port to start accepting connections
@@ -806,6 +808,18 @@ class SshTunnelManager:
         # GC'd mid-flight; cancelled on shutdown).
         self._recover_attempts: dict[str, int] = {}
         self._recovery_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Same tasks, indexed by instance: a reconfiguration must cancel the
+        # recovery in flight for ITS instance only, and a recovery that
+        # captured the pre-edit record cannot be allowed to reinstall it.
+        self._recovery_by_instance: dict[str, set[asyncio.Task]] = {}  # type: ignore[type-arg]
+        # Instances whose coordinates are being rewritten right now. Self-heal
+        # reads the record before it takes the lock, so cancelling the recoveries
+        # in flight is not enough on its own: a tunnel exiting mid-edit schedules
+        # a FRESH recovery that would read the pre-edit record. This barrier is
+        # set before the first await of a reconfiguration and cleared after the
+        # write, and recovery refuses to run for an instance named in it — which
+        # closes the window instead of racing it with a retry loop.
+        self._reconfiguring: set[str] = set()
         # Proactive token refresh: per-instance refresh task + the mint timestamp
         # / ttl so the TTL-remaining can be surfaced (Stage 6).
         self._refresh_tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
@@ -1103,10 +1117,18 @@ class SshTunnelManager:
             self._last_error.pop(instance_id, None)
             return tunnel.status
 
-    async def disconnect(self, instance_id: str) -> bool:
+    async def disconnect(self, instance_id: str, *, keep_intent: bool = False) -> bool:
         """Tear down *instance_id*'s tunnel, drop its token, clear its port hint.
 
         Returns whether a live tunnel existed.
+
+        ``keep_intent`` distinguishes a RECONFIGURATION from a user disconnect.
+        ``was_connected`` records that the user wants this instance connected, so
+        only an explicit disconnect may clear it; a caller tearing a tunnel down
+        in order to rebuild it (an edit that changes the host or port) passes
+        ``keep_intent=True`` and leaves that flag alone. Restoring the flag
+        afterwards instead would race a real disconnect arriving mid-edit and
+        silently revive the instance the user just turned off.
 
         The persisted ``local_port`` is reset to the unallocated sentinel here —
         symmetric with :meth:`connect` setting it — so a disconnected instance
@@ -1117,29 +1139,118 @@ class SshTunnelManager:
         behind by an unclean prior exit can still be cleared by a disconnect.
         """
         async with self._lock:
-            tunnel = self._tunnels.pop(instance_id, None)
-            self._tokens.pop(instance_id, None)
-            self._recover_attempts.pop(instance_id, None)
-            self._last_error.pop(instance_id, None)
-            self._cancel_token_refresh(instance_id)
-            if tunnel is not None:
-                await tunnel.stop()
-            # Clear the lazy-reconnect hint AND the recorded local port together
-            # (one atomic write). local_port must return to the unallocated
-            # sentinel so the now-free port is not treated as reserved forever.
-            # _persist_hint runs the read-modify-rewrite off the loop and does
-            # not return — even if this handler is cancelled (e.g. aiohttp
-            # aborting at shutdown) — until the write completes: the in-memory
-            # teardown above is already done, so abandoning the persisted reset
-            # would leave was_connected=True plus a stale local_port, reviving
-            # an instance the user disconnected and pinning the freed port.
-            await self._persist_hint(
-                self._registry.update,
-                instance_id,
-                was_connected=False,
-                local_port=_UNALLOCATED_PORT,
-            )
-            return tunnel is not None
+            return await self._teardown_locked(instance_id, keep_intent=keep_intent)
+
+    async def _teardown_locked(self, instance_id: str, *, keep_intent: bool) -> bool:
+        """The body of :meth:`disconnect`, for callers already holding the lock.
+
+        Reconfiguration needs the teardown and the coordinate rewrite to happen
+        inside ONE critical section, so it cannot call the public method without
+        deadlocking on our own non-reentrant lock.
+        """
+        tunnel = self._tunnels.pop(instance_id, None)
+        self._tokens.pop(instance_id, None)
+        self._recover_attempts.pop(instance_id, None)
+        self._last_error.pop(instance_id, None)
+        self._cancel_token_refresh(instance_id)
+        if tunnel is not None:
+            await tunnel.stop()
+        # Clear the lazy-reconnect hint AND the recorded local port together
+        # (one atomic write). local_port must return to the unallocated
+        # sentinel so the now-free port is not treated as reserved forever.
+        # _persist_hint runs the read-modify-rewrite off the loop and does
+        # not return — even if this handler is cancelled (e.g. aiohttp
+        # aborting at shutdown) — until the write completes: the in-memory
+        # teardown above is already done, so abandoning the persisted reset
+        # would leave was_connected=True plus a stale local_port, reviving
+        # an instance the user disconnected and pinning the freed port.
+        hints: dict[str, object] = {"local_port": _UNALLOCATED_PORT}
+        if not keep_intent:
+            hints["was_connected"] = False
+        await self._persist_hint(self._registry.update, instance_id, **hints)
+        return tunnel is not None
+
+    def _track_recovery(self, instance_id: str, task: asyncio.Task) -> None:  # type: ignore[type-arg]
+        """Retain a background task so it is not GC'd, indexed by instance."""
+        self._recovery_tasks.add(task)
+        per = self._recovery_by_instance.setdefault(instance_id, set())
+        per.add(task)
+
+        def _done(t: asyncio.Task) -> None:  # type: ignore[type-arg]
+            self._recovery_tasks.discard(t)
+            bucket = self._recovery_by_instance.get(instance_id)
+            if bucket is not None:
+                bucket.discard(t)
+                if not bucket:
+                    self._recovery_by_instance.pop(instance_id, None)
+
+        task.add_done_callback(_done)
+
+    async def _cancel_recovery(self, instance_id: str) -> None:
+        """Cancel and AWAIT this instance's in-flight recovery.
+
+        Self-heal reads the instance record before it takes the lock, so a
+        recovery already in flight holds the PRE-edit coordinates. Letting it
+        proceed would reinstall a tunnel to the old machine after the edit
+        landed — and because ``connect()`` is idempotent, that tunnel would then
+        be handed out for the new settings. Awaiting the cancellation is the
+        point: returning while the task is still unwinding would leave exactly
+        the race this closes.
+        """
+        tasks = list(self._recovery_by_instance.get(instance_id, ()))
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        # A cancelled recovery is expected to raise CancelledError; anything else
+        # it raises is its own business and already logged by its done-callback.
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def reconfigure(
+        self, instance_id: str, apply: Callable[[], _T]
+    ) -> _T:
+        """Tear the tunnel down and rewrite its coordinates as ONE operation.
+
+        Editing the host/port/transport of a live instance is two steps that must
+        not be observed apart: with the lock released between them, a ``connect``
+        can read the OLD record, and whether its tunnel is already CONNECTED or
+        still CONNECTING when the write lands decides whether any after-the-fact
+        sweep notices it. Holding the lock across both removes the window instead
+        of narrowing it — a racing ``connect`` either completes before this (and
+        is torn down here) or starts after (and reads the new coordinates).
+
+        ``apply`` performs the persistence and returns whatever the caller needs;
+        it runs on a worker thread because the registry write is blocking, so the
+        event loop is not held while the lock is.
+        """
+        # The barrier goes up FIRST, with no await before it, so no recovery can
+        # be scheduled for this instance from here on (see `_reconfiguring`).
+        # Cancellation then runs OUTSIDE the lock, because a recovery task may
+        # itself be waiting for that lock and awaiting it while holding the lock
+        # would deadlock.
+        self._reconfiguring.add(instance_id)
+        try:
+            await self._cancel_recovery(instance_id)
+            return await self._reconfigure_locked(instance_id, apply)
+        finally:
+            self._reconfiguring.discard(instance_id)
+
+    async def _reconfigure_locked(self, instance_id: str, apply: Callable[[], _T]) -> _T:
+        """The locked half of :meth:`reconfigure` (barrier already raised)."""
+        async with self._lock:
+            try:
+                await self._teardown_locked(instance_id, keep_intent=True)
+            except Exception:
+                # A teardown that fails must not block the edit: the record is
+                # what the next connect builds from, and refusing to persist
+                # would strand the caller on coordinates they know are wrong.
+                logger.warning(
+                    "tunnel teardown failed while reconfiguring %s; "
+                    "persisting the new coordinates anyway",
+                    instance_id,
+                    exc_info=True,
+                )
+            return await asyncio.to_thread(apply)
 
     async def shutdown(self) -> None:
         """Tear down all tunnels (gateway shutdown). Leaves registry hints intact
@@ -1173,12 +1284,19 @@ class SshTunnelManager:
         flapping link / bind race can't spin a tight respawn loop — and so direct
         ``_recover`` callers (unit tests) aren't slowed.
         """
+        if instance_id in self._reconfiguring:
+            # Its coordinates are being rewritten; whatever this recovery read
+            # would already be stale. The reconfiguration tears the tunnel down
+            # itself, and the user reconnects against the new record.
+            logger.info(
+                "Skipping self-heal for %s: reconfiguration in progress", instance_id
+            )
+            return
         delay = _recover_backoff_secs(
             self._recover_attempts.get(instance_id, 0) + 1, self._recover_backoff_max
         )
         task = asyncio.create_task(self._recover_after(instance_id, delay))
-        self._recovery_tasks.add(task)
-        task.add_done_callback(self._recovery_tasks.discard)
+        self._track_recovery(instance_id, task)
         task.add_done_callback(
             lambda t: (
                 logger.error("Self-heal task crashed: %s", t.exception())
@@ -1191,6 +1309,10 @@ class SshTunnelManager:
         """Sleep *delay* (backoff) then run the 2-tier self-heal."""
         if delay > 0:
             await asyncio.sleep(delay)
+        if instance_id in self._reconfiguring:
+            # Scheduled just before the barrier went up, or the barrier rose
+            # during the backoff: either way this attempt holds stale coordinates.
+            return
         await self._recover(instance_id)
 
     async def _rebuild(self, inst: Instance, params: _TransportParams, local_port: int) -> bool:
@@ -1406,8 +1528,7 @@ class SshTunnelManager:
     def _schedule_diagnosis(self, instance_id: str) -> None:
         """Fire-and-forget a diagnosis run (tracked so it isn't GC'd)."""
         task = asyncio.create_task(self.diagnose(instance_id))
-        self._recovery_tasks.add(task)
-        task.add_done_callback(self._recovery_tasks.discard)
+        self._track_recovery(instance_id, task)
         task.add_done_callback(
             lambda t: (
                 logger.error("Diagnosis task crashed for %s: %s", instance_id, t.exception())
