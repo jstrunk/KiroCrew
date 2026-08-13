@@ -47,16 +47,19 @@ provider.
 
 | Value | Agent | Status |
 |-------|-------|--------|
-| `""` (default) | kiro-cli | the only supported value |
-| `kas` | kiro-agent (KAS) | plumbed, **not yet usable** |
+| `""` (default) | kiro-cli | the only selectable value |
+| `kas` | kiro-agent (KAS) | wired, **still under test** |
 
-**Leave this unset.** The KAS backend's spawn and session plumbing is in place,
-but Kiro Crew does not yet send your configured agent to KAS, so every session
-would fail to activate it. Setting `kas` is refused at startup with that reason
-rather than failing on your first message.
+**Leave this unset.** The KAS backend is now complete enough to run a session —
+your configured agent is sent to KAS on each new session, because KAS has no
+equivalent of kiro-cli's `--agent` flag — but it is not offered yet. It depends on
+kiro-cli for credentials as well as for the agent server, and a host whose Kiro
+token is not in KAS's default cache location cannot authenticate. Setting `kas`
+degrades to the default with that reason in the log rather than failing on your
+first message.
 
-An unrecognized value logs a warning and falls back to the default backend, so a
-typo costs you a line in the log rather than a gateway that will not start.
+An unrecognized value degrades the same way, so a typo costs you a line in the
+log rather than a gateway that will not start.
 
 ## Key Settings
 

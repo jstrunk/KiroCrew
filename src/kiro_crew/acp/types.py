@@ -110,13 +110,40 @@ ACP_BACKENDS_KNOWN = frozenset(
     }
 )
 # What an operator may actually persist in ``agent.acp_backend``, which is a
-# narrower question than what the code understands. KAS is plumbed and tested but
-# cannot serve a session yet: production names an agent on every session, KAS
-# advertises only its own built-in modes, and Crew's agent reaches it through
-# ``_meta.kiro.customAgents`` on ``session/new`` — not wired up yet. Config
-# resolution degrades an unselectable value to the default so the refusal lands
-# at startup with a reason instead of on the operator's first message.
+# narrower question than what the code understands: the claude backend is a
+# dormant seam with no public registration glue, so it stays out, and KAS is
+# still under test.
+#
+# KAS's remaining gap is no longer the agent wiring — Crew now names AND defines
+# the configured agent on ``session/new`` (``acp.kas_agent``). What keeps it out
+# of this set is that the backend has not been exercised widely enough to offer:
+# notably it depends on kiro-cli for credentials as well as for the server, and a
+# host whose token is not in KAS's default cache location cannot authenticate.
+# Config resolution degrades an unselectable value to the default so the refusal
+# lands at startup with a reason instead of on the operator's first message.
 ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO})
+
+#: Opt-in that adds KAS to the selectable set for a single process, so the
+#: backend can be exercised end to end while it stays hidden from ordinary
+#: installs. Read at call time, never persisted — there is deliberately no config
+#: key, because a config key IS the exposure this gate exists to avoid.
+ENV_KAS_PREVIEW = "KIROCREW_KAS_PREVIEW"
+
+
+def selectable_backends() -> frozenset[str]:
+    """Backends an operator may select in this process.
+
+    A function rather than a constant because the preview gate is an environment
+    variable: a module-level snapshot would bake in whatever was set at import
+    time, which for a long-lived gateway is the wrong answer and for tests is an
+    ordering dependency.
+    """
+    import os
+
+    if os.environ.get(ENV_KAS_PREVIEW, "").strip():
+        return ACP_BACKENDS_SELECTABLE | {ACP_BACKEND_KAS}
+    return ACP_BACKENDS_SELECTABLE
+
 
 # ── Provider labels ──
 # The backend identity key persisted in the session map. It indexes three

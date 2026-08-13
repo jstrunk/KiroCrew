@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from kiro_crew import platform_compat
+from kiro_crew.acp import kas_auth
 from kiro_crew.acp._dispatch import (
     build_session_new_params,
     parse_session_modes,
@@ -40,6 +41,7 @@ from kiro_crew.acp.client import (
     _KiroExecutableTrustError,
     _resolve_kiro_bin_for_spawn,
 )
+from kiro_crew.acp.kas_agent import load_client_custom_agent
 from kiro_crew.acp.kas_assets import (
     KasAssetsMissing,
     build_kas_argv,
@@ -91,6 +93,12 @@ from kiro_crew.session_pid import (
 from kiro_crew.validation import MODEL_ID_RE
 
 logger = logging.getLogger(__name__)
+
+#: Reply code when Kiro Crew implements a method but cannot fulfil it this time (a
+#: failed token acquisition). Deliberately not -32601: method-not-found would tell
+#: the agent the capability is absent and stop it asking again, turning a transient
+#: credential problem into a permanently unauthenticated session.
+_JSONRPC_INTERNAL_ERROR = -32603
 
 __all__ = [
     "AcpRuntime",
@@ -557,6 +565,10 @@ class AcpRuntime:
 
         # Demux routing
         self._pending_requests: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        # Strong refs for the fire-and-forget KAS auth-callback tasks. Without
+        # them a task can be garbage-collected mid-flight, and an unretrieved
+        # exception on one makes crash_guard log a spurious ASYNCIO UNHANDLED.
+        self._kas_auth_tasks: set[asyncio.Task[None]] = set()
         # Maps req_id → sessionId for responses that should be routed to a session queue
         # (e.g. session/prompt response signals turn completion and must reach the session)
         self._routed_requests: dict[int, str] = {}
@@ -1208,6 +1220,24 @@ class AcpRuntime:
 
                 # Route notifications by sessionId
                 session_id = (msg.params or {}).get("sessionId")
+
+                # KAS's auth callback carries NO sessionId and arrives DURING
+                # session/new — before any session queue exists to route it to. It
+                # must be answered on this loop: the session-handle reader that
+                # serves other inbound requests only starts once create_session
+                # returns, so deferring would deadlock (KAS waits for a token,
+                # create_session waits for the sessionId).
+                if msg.is_method(kas_auth.GET_ACCESS_TOKEN_METHOD) and msg.id is not None:
+                    # Not awaited inline: the subcommand can take an OIDC round
+                    # trip, and blocking this loop would stall every other
+                    # session's frames behind it. RETAINED in a set — an
+                    # unreferenced task whose exception is never retrieved makes
+                    # crash_guard write a spurious ASYNCIO UNHANDLED record.
+                    task = asyncio.create_task(self._answer_kas_access_token(msg))
+                    self._kas_auth_tasks.add(task)
+                    task.add_done_callback(self._kas_auth_tasks.discard)
+                    continue
+
                 if session_id:
                     # A frame tagged with a sessionId belongs to exactly one
                     # session. Route to it if registered; otherwise DROP it.
@@ -1521,9 +1551,17 @@ class AcpRuntime:
             mcp_servers = await asyncio.to_thread(
                 pooled_session_servers, self._mcp_gateway_overlay, agent or self._agent
             )
+        # KAS has no --agent flag, so the agent's definition travels here. Read
+        # off the loop (filesystem + JSON) alongside the overlay lookup above.
+        kas_agent: dict[str, Any] | None = None
+        if self._acp_backend == ACP_BACKEND_KAS:
+            kas_agent = await asyncio.to_thread(
+                load_client_custom_agent, agent or self._agent
+            )
         params = build_session_new_params(
             cwd if cwd else self._work_dir,
             mcp_servers=mcp_servers,
+            kas_agent=kas_agent,
         )
 
         self._session_inits_in_flight += 1
@@ -1737,6 +1775,66 @@ class AcpRuntime:
         return handle
 
     # ── Internal Helpers ──
+
+    async def _reply_kas_auth(
+        self, request_id: str | int, *, result: dict[str, Any] | None, message: str = ""
+    ) -> None:
+        """Answer the auth callback, tolerating a runtime that died meanwhile.
+
+        The token fetch can take up to 30s, so the process may be gone by the time
+        there is something to send. ``send_response``/``send_error`` raise
+        ``AcpRuntimeDead`` then, and this runs in a fire-and-forget task — an
+        exception escaping it would make ``crash_guard`` record a spurious
+        ASYNCIO UNHANDLED entry, the same false-crash noise other spawn paths
+        already guard against. A dead runtime needs no reply: KAS died with it.
+        """
+        try:
+            if result is not None:
+                await self.send_response(request_id, result)
+            else:
+                await self.send_error(request_id, _JSONRPC_INTERNAL_ERROR, message)
+        except (AcpRuntimeDead, BrokenPipeError, ConnectionResetError) as exc:
+            logger.debug("KAS auth: runtime gone before the reply landed (%s)", exc)
+
+    async def _answer_kas_access_token(self, msg: JsonRpcMessage) -> None:
+        """Serve KAS's ``_kiro/auth/getAccessToken`` by asking kiro-cli.
+
+        KAS blocks on this request, so it always gets an answer: a token, or a
+        JSON-RPC error carrying one user-facing sentence. ``-32603`` rather than
+        ``-32601`` — method-not-found would tell KAS the capability is absent and
+        stop it asking again, turning a transient credential problem into a
+        permanently unauthenticated session.
+
+        Kiro Crew stays a pipe: kiro-cli owns the refresh token and the
+        cross-process refresh lock, and only short-lived access tokens pass here.
+        """
+        if msg.id is None:
+            return
+        try:
+            kiro_bin = await _resolve_kiro_bin_for_spawn()
+        except _KiroExecutableTrustError as exc:
+            logger.error("KAS auth: kiro-cli is untrusted: %s", exc)
+            kiro_bin = ""
+        if not kiro_bin:
+            # A KAS session does not otherwise need kiro-cli at prompt time, so
+            # this is reachable on a host with the extracted server but no CLI.
+            logger.error("KAS auth: kiro-cli unavailable for token acquisition")
+            await self._reply_kas_auth(
+                msg.id, result=None, message=kas_auth.AUTH_ERROR_USER_FACING
+            )
+            return
+        try:
+            result = await kas_auth.fetch_access_token(kiro_bin)
+        except kas_auth.KasTokenError as exc:
+            await self._reply_kas_auth(msg.id, result=None, message=str(exc))
+            return
+        except Exception:
+            logger.warning("KAS auth: token acquisition failed", exc_info=True)
+            await self._reply_kas_auth(
+                msg.id, result=None, message=kas_auth.AUTH_ERROR_USER_FACING
+            )
+            return
+        await self._reply_kas_auth(msg.id, result=result)
 
     async def _send_and_await(
         self, method: str, params: dict[str, Any], timeout: float = _REQUEST_TIMEOUT

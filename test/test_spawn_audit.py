@@ -136,6 +136,17 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 # category breakdown and follow-up hardening candidates.
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
+        # Kiro credential acquisition for a KAS session. Nothing about this spawn
+        # is agent-influenced: the argv is the module constant
+        # ``("chat", "_", "get-kas-token")`` with no interpolation, no shell, no
+        # cwd, and the binary comes from ``_resolve_kiro_bin_for_spawn`` (the same
+        # trust-checked resolution the kiro-cli backend spawn uses) rather than
+        # bare PATH. Deliberately NOT routed through the sandbox chokepoint: the
+        # subcommand's whole job is to read the user's credential store and take a
+        # cross-process refresh lock, both of which the sandbox exists to hide —
+        # routing it would break auth rather than harden it, and the agent cannot
+        # reach the token because only the shaped response crosses back.
+        "acp/kas_auth.py::fetch_access_token",
         "acp/runtime.py::_get_rss_mb",
         # _get_rss_tree_mb is deliberately NOT listed: its own spawn moved into
         # _ps_process_table below, so an entry for it would be stale and would

@@ -215,14 +215,42 @@ class TestConfigRoundTrip:
     def test_kas_is_not_selectable_yet(self, tmp_path):
         """Degraded at the boundary, so the refusal is a log line at startup.
 
-        KAS cannot serve a session until Crew sends the configured agent over
-        ``session/new``; letting the value through would instead fail on the
-        operator's first message.
+        The agent wiring KAS was waiting on now exists (``acp.kas_agent`` sends
+        the configured agent on ``session/new``), but the backend stays hidden
+        while it is under test — it needs kiro-cli for credentials as well as for
+        the server. ``KIROCREW_KAS_PREVIEW`` opts a single process in.
         """
         cfg = _load_agent_config({"acp_backend": ACP_BACKEND_KAS}, tmp_path)
         assert cfg.agent.acp_backend == ACP_BACKEND_KIRO
         provider = cfg.create_provider_factory()(session_key="test:rt", agent="")
         assert provider.is_kiro_backend is True
+
+    def test_preview_env_makes_kas_selectable(self, tmp_path, monkeypatch):
+        """The gate must reach config resolution, not just the set.
+
+        Resolution calls ``selectable_backends()`` per invocation rather than
+        reading a module constant, so this also pins that the answer is not
+        cached at import time.
+        """
+        from kiro_crew.acp.types import ENV_KAS_PREVIEW
+
+        monkeypatch.setenv(ENV_KAS_PREVIEW, "1")
+
+        cfg = _load_agent_config({"acp_backend": ACP_BACKEND_KAS}, tmp_path)
+
+        assert cfg.agent.acp_backend == ACP_BACKEND_KAS
+        provider = cfg.create_provider_factory()(session_key="test:rt", agent="")
+        assert provider.is_kas_backend is True
+
+    def test_preview_env_does_not_admit_an_unknown_backend(self, tmp_path, monkeypatch):
+        """The gate opens KAS specifically, not validation in general."""
+        from kiro_crew.acp.types import ENV_KAS_PREVIEW
+
+        monkeypatch.setenv(ENV_KAS_PREVIEW, "1")
+
+        cfg = _load_agent_config({"acp_backend": "kass"}, tmp_path)
+
+        assert cfg.agent.acp_backend == ACP_BACKEND_KIRO
 
     @pytest.mark.parametrize("bad", ["kiro-cli", "KAS", "claude_code", 7, None, []])
     def test_unselectable_values_degrade_to_the_default(self, bad, tmp_path):

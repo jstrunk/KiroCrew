@@ -142,12 +142,28 @@ def resolve_kas_entry() -> tuple[Path, Path]:
     )
 
 
-def build_kas_argv(node: Path, server_script: Path) -> list[str]:
-    """argv for a KAS stdio session.
+#: Host-mediated auth. KAS asks this process for an access token over ACP
+#: (``_kiro/auth/getAccessToken``) instead of reading a token file, and
+#: ``acp.kas_auth`` answers by shelling out to kiro-cli.
+#:
+#: Pointing KAS at a file cannot work in general: credential resolution is
+#: stateful logic living in kiro-cli — a cross-process refresh lock, a priority
+#: order across cached identities, and OIDC refresh on expiry. A file read
+#: reproduces none of that, and the default cache location holds only one of those
+#: identities, so on a host signed in another way KAS's own file provider
+#: correctly finds nothing.
+#:
+#: ``KIRO_API_KEY`` still outranks this flag inside KAS, so an operator with an
+#: API key keeps that path and never reaches the callback.
+KAS_AUTH_ARG = "--auth=acp-callback"
 
-    ``--auth`` is deliberately absent: without it KAS selects its file auth
-    provider and reads/refreshes the token itself, so Kiro Crew never handles a
-    credential. Passing ``--auth=acp-callback`` would force this process to
-    implement ``_kiro/auth/getAccessToken`` instead.
-    """
-    return [str(node), *KAS_NODE_FLAGS, str(server_script), KAS_TRANSPORT_ARG]
+
+def build_kas_argv(node: Path, server_script: Path) -> list[str]:
+    """argv for a KAS stdio session."""
+    return [
+        str(node),
+        *KAS_NODE_FLAGS,
+        str(server_script),
+        KAS_TRANSPORT_ARG,
+        KAS_AUTH_ARG,
+    ]

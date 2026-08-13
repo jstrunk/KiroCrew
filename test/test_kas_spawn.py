@@ -121,19 +121,23 @@ class TestArgv:
     def test_shape(self, tmp_path):
         argv = build_kas_argv(tmp_path / "node", tmp_path / "acp-server.js")
         assert argv[0].endswith("node")
-        assert argv[-1] == KAS_TRANSPORT_ARG
+        assert KAS_TRANSPORT_ARG in argv
         for flag in KAS_NODE_FLAGS:
             assert flag in argv
 
-    def test_no_auth_flag_is_passed(self, tmp_path):
-        """Omitting --auth is what keeps token handling out of this codebase.
+    def test_auth_is_host_mediated(self, tmp_path):
+        """KAS must ask this host for a token rather than read a file.
 
-        With no --auth, KAS selects its file auth provider and reads/refreshes
-        the token itself. Passing --auth=acp-callback would instead force this
-        process to implement ``_kiro/auth/getAccessToken``.
+        A token file cannot work in general: credential resolution is stateful
+        logic in kiro-cli (cross-process refresh lock, priority order across
+        cached identities, OIDC refresh on expiry), and the default cache location
+        holds only one of those identities — so on a host signed in another way
+        KAS's file provider correctly finds nothing. ``acp.kas_auth`` answers the
+        callback by shelling out to kiro-cli, which keeps resolution in one place.
         """
         argv = build_kas_argv(tmp_path / "node", tmp_path / "acp-server.js")
-        assert not any(a.startswith("--auth") for a in argv)
+        assert "--auth=acp-callback" in argv
+        assert not any(a.startswith("--token-path") for a in argv)
 
     def test_no_agent_flag_is_passed(self, tmp_path):
         argv = build_kas_argv(tmp_path / "node", tmp_path / "acp-server.js")

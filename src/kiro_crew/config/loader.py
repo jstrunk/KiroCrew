@@ -1089,8 +1089,15 @@ class AgentConfig:
         metadata=_meta(
             "ACP Backend",
             "Which ACP agent to drive. Only '' (kiro-cli) is selectable; the "
-            "'kas' plumbing is present but not yet usable.",
-            enum=[""],
+            "'kas' backend is wired but still under test.",
+            # This enum is the JSON-Schema domain, and validate_config_data
+            # REMOVES a value outside it before the loader ever sees the key. So
+            # 'kas' has to be listed or the preview opt-in could never take
+            # effect — the value would be stripped, not degraded. Selectability is
+            # enforced separately by acp.types.selectable_backends(), which is
+            # what actually keeps KAS off ordinary installs. No settings surface
+            # reads this field, so listing it here exposes nothing in the UI.
+            enum=["", "kas"],
         ),
     )
     default_agent: str = field(
@@ -3671,10 +3678,15 @@ def _normalize_acp_backend(value: object) -> str:
     from kiro_crew.acp.types import (
         ACP_BACKEND_KIRO,
         ACP_BACKENDS_KNOWN,
-        ACP_BACKENDS_SELECTABLE,
+        selectable_backends,
     )
 
-    if isinstance(value, str) and value in ACP_BACKENDS_SELECTABLE:
+    # Resolved per call, not from a module constant: the preview gate is an env
+    # var, so a snapshot taken at import time would be stale for a gateway and
+    # order-dependent for tests.
+    selectable = selectable_backends()
+
+    if isinstance(value, str) and value in selectable:
         return value
     if value not in (None, ""):
         known_but_unusable = isinstance(value, str) and value in ACP_BACKENDS_KNOWN
@@ -3683,7 +3695,7 @@ def _normalize_acp_backend(value: object) -> str:
             "Selectable values: %s",
             value,
             "not usable yet" if known_but_unusable else "unknown",
-            ", ".join(repr(b) for b in sorted(ACP_BACKENDS_SELECTABLE)),
+            ", ".join(repr(b) for b in sorted(selectable)),
         )
     return ACP_BACKEND_KIRO
 
