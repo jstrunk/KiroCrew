@@ -66,12 +66,40 @@ function initialTab(): Tab {
  * deterministically — apps shipping hero art first, then verified publishers,
  * then name.
  */
-/** One published spotlight, as it arrives from the registry endpoint. */
+/**
+ * One published featured section, as it arrives from the registry endpoint.
+ *
+ * `type` is the discriminator the card branches on. An `app` section always
+ * carries exactly one ref; a `collection` carries two or more plus the title
+ * that explains why they share a card. Both spell the refs as a list so
+ * resolution is one code path regardless of type.
+ */
 type EditorialSection = {
+  type: 'app' | 'collection'
   appRefs: string[]
   title?: string
   blurb?: string
   artwork?: EditorialArtwork
+}
+
+/** A collection below this has lost members; see the drop in `featuredSections`. */
+const MIN_COLLECTION_APPS = 2
+
+/**
+ * Which app in a featured card has an action in flight, or null.
+ *
+ * `actionLoading` is a single `"<name>:<action>"` slot, so only one app can be
+ * busy at a time. Resolving it to a name lets each row disable its OWN control
+ * instead of the card disabling all of them — pressing Get on one member of a
+ * collection must not freeze the others.
+ *
+ * App names cannot contain a colon (the registry pattern is lowercase segments
+ * joined by hyphens), so splitting on the first one is unambiguous.
+ */
+export function featuredBusyName(actionLoading: string | null, apps: RegistryApp[]): string | null {
+  if (!actionLoading) return null
+  const name = actionLoading.slice(0, actionLoading.indexOf(':'))
+  return apps.some(a => a.name === name) ? name : null
 }
 
 export function pickFeatured(apps: RegistryApp[]): RegistryApp[] {
@@ -148,17 +176,28 @@ export default function AppsPage() {
         ? res.editorialSections.flatMap((raw: unknown) => {
             if (!raw || typeof raw !== 'object') return []
             const s = raw as Record<string, unknown>
+            // An unrecognised type is skipped, not coerced: the document's
+            // contract is that a client renders what it knows and ignores the
+            // rest, which is what lets a new shape publish ahead of support.
+            if (s.type !== 'app' && s.type !== 'collection') return []
             const refs = Array.isArray(s.appRefs)
               ? s.appRefs.filter((n): n is string => typeof n === 'string' && !!n)
               : []
             if (!refs.length) return []
+            const title = typeof s.title === 'string' ? s.title : undefined
+            // A collection is nothing without its theme, so one that arrives
+            // without a title is dropped rather than rendered anonymously.
+            if (s.type === 'collection' && !title) return []
             const art = s.artwork
             const artwork = art && typeof art === 'object' && typeof (art as EditorialArtwork).url === 'string'
               ? (art as EditorialArtwork)
               : undefined
             return [{
+              type: s.type,
               appRefs: refs,
-              title: typeof s.title === 'string' ? s.title : undefined,
+              // An `app` section is headed by the app's own name; a published
+              // title there means the document meant `collection`.
+              title: s.type === 'collection' ? title : undefined,
               blurb: typeof s.blurb === 'string' ? s.blurb : undefined,
               artwork,
             }]
@@ -238,23 +277,29 @@ export default function AppsPage() {
   const [spotlight, ...secondary] = featured
 
   /**
-   * Editorial spotlights, resolved against the apps this client can actually
-   * show. A reference that resolves to nothing is dropped, and a section left
-   * with no resolvable app is dropped whole rather than rendered as an empty
-   * hero — the registry is the source of truth for what exists, so editorial can
-   * never conjure an app by naming one.
+   * Editorial featured sections, resolved against the apps this client can
+   * actually show. A reference that resolves to nothing is dropped — the
+   * registry is the source of truth for what exists, so editorial can never
+   * conjure an app by naming one.
+   *
+   * A collection that falls below two resolvable apps is dropped whole rather
+   * than demoted to a single-app card: the title states why several apps belong
+   * together, and showing one survivor under that theme would claim something
+   * the curator did not write.
    *
    * Empty means "fall back to `pickFeatured`", which is what Discover did before
    * the editorial document had a layout. That is also today's live state:
-   * `sections` is published empty, so this ships as a no-op.
+   * `sections` is published empty, so the derived pick is what ships -- rendered
+   * by the same card, so the layout change reaches users before any curated
+   * section does.
    */
-  const editorialSpotlights = useMemo(() => {
+  const featuredSections = useMemo(() => {
     const byName = new Map(browseApps.map(a => [a.name, a]))
     return (registryData?.editorialSections || []).flatMap(section => {
       const resolved = section.appRefs.map(n => byName.get(n)).filter((a): a is RegistryApp => !!a)
-      if (!resolved.length) return []
-      const [hero, ...rest] = resolved
-      return [{ ...section, hero, rest }]
+      const floor = section.type === 'collection' ? MIN_COLLECTION_APPS : 1
+      if (resolved.length < floor) return []
+      return [{ ...section, apps: resolved }]
     })
   }, [registryData, browseApps])
 
@@ -696,32 +741,34 @@ export default function AppsPage() {
           ) : (
             <>
               {/* A published layout replaces the derived one entirely: mixing a
-                  curator's spotlights with `featured`-flag picks would show the
+                  curator's cards with `featured`-flag picks would show the
                   same app twice and give the curator no way to say "only these". */}
-              {showEditorial && editorialSpotlights.length > 0 ? (
-                editorialSpotlights.map(section => (
+              {showEditorial && featuredSections.length > 0 ? (
+                featuredSections.map(section => (
                   <FeaturedSpotlight
-                    key={`${section.hero.name}:${section.title || ''}`}
-                    app={section.hero}
-                    apps={section.rest}
+                    key={`${section.type}:${section.title || section.apps[0].name}`}
+                    type={section.type}
+                    apps={section.apps}
                     title={section.title}
                     blurb={section.blurb}
                     artwork={section.artwork}
-                    busy={actionLoading === `${section.hero.name}:enable`}
-                    onOpen={e => openDetail(section.hero.name, e)}
-                    onGet={() => getApp(section.hero.name)}
-                    onEnable={() => enableApp(section.hero.name)}
+                    busyName={
+                      featuredBusyName(actionLoading, section.apps)
+                    }
+                    onGet={name => getApp(name)}
+                    onEnable={name => enableApp(name)}
                     onOpenApp={(name, e) => openDetail(name, e)}
                   />
                 ))
               ) : showEditorial && spotlight && (
                 <>
                   <FeaturedSpotlight
-                    app={spotlight}
-                    busy={actionLoading === `${spotlight.name}:enable`}
-                    onOpen={e => openDetail(spotlight.name, e)}
-                    onGet={() => getApp(spotlight.name)}
-                    onEnable={() => enableApp(spotlight.name)}
+                    type="app"
+                    apps={[spotlight]}
+                    busyName={featuredBusyName(actionLoading, [spotlight])}
+                    onGet={name => getApp(name)}
+                    onEnable={name => enableApp(name)}
+                    onOpenApp={(name, e) => openDetail(name, e)}
                   />
                   {secondary.length > 0 && (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 mb-6">

@@ -61,10 +61,17 @@ FAILURE_TTL = 60
 #: The schema's own ceiling. A document above it is malformed, not merely large,
 #: and the cap is applied here so a bad document cannot make the rail unbounded.
 MAX_CATEGORIES = 30
-#: Same reasoning for the layout: `sections` is capped at 40 by the schema and
-#: `appRefs` at 20 per section, so a document cannot make Discover unbounded.
+#: Same reasoning for the layout: `sections` is capped at 40 by the schema and a
+#: collection's `appRefs` at 6, so a document cannot make Discover unbounded.
+#: The 6 is small on purpose -- every member of a collection is rendered, with no
+#: detail page to hold an overflow, so the schema refuses more than the card can
+#: draw rather than letting the client truncate a published list silently.
 MAX_SECTIONS = 40
-MAX_APP_REFS = 20
+MAX_APP_REFS = 6
+#: A one-app collection is an `app` section wearing a costume, so the schema
+#: refuses it. Kept here too because this reader also sees documents that never
+#: passed that gate -- a stale cache, or a hand-edited file.
+MIN_COLLECTION_APPS = 2
 
 _FAILED_KEY = "_fetchFailedAt"
 
@@ -190,39 +197,82 @@ def _artwork(raw: Any) -> dict[str, str] | None:
     return out
 
 
-def _spotlight(raw: dict[str, Any]) -> dict[str, Any] | None:
-    """Project one spotlight section, or None when it carries nothing usable.
+def _text(raw: dict[str, Any], key: str, limit: int) -> str | None:
+    """Return a trimmed, capped string field, or None when it carries nothing."""
+    value = raw.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:limit]
+    return None
 
-    `appRefs` is a list even for one app, so this reads the same either way. A
-    reference the client cannot resolve is dropped by the CALLER, which owns the
-    app list; a spotlight left with no resolvable app is dropped whole rather
-    than rendered as an empty hero.
+
+def _app_section(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Project an `app` section -- one featured app -- or None.
+
+    Carries no title: the app's own name is the heading, so a published `title`
+    is a document that means `collection` and is ignored rather than honoured.
     """
-    refs = raw.get("appRefs")
-    if not isinstance(refs, list):
-        return None
-    names = [r.strip() for r in refs if isinstance(r, str) and r.strip()]
-    if not names:
+    ref = raw.get("appRef")
+    if not isinstance(ref, str) or not ref.strip():
         return None
 
-    out: dict[str, Any] = {"type": "spotlight", "appRefs": names[:MAX_APP_REFS]}
-    for key, limit in (("title", 60), ("blurb", 200)):
-        value = raw.get(key)
-        if isinstance(value, str) and value.strip():
-            out[key] = value.strip()[:limit]
+    out: dict[str, Any] = {"type": "app", "appRefs": [ref.strip()]}
+    if blurb := _text(raw, "blurb", 200):
+        out["blurb"] = blurb
     if art := _artwork(raw.get("artwork")):
         out["artwork"] = art
     return out
 
 
-def load_sections(fetcher: Any = None) -> list[dict[str, Any]]:
-    """Return the published spotlight sections, or ``[]`` for none.
+def _collection_section(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Project a `collection` section -- several apps under a theme -- or None.
 
-    Only `spotlight` is projected today. An unknown `type` is SKIPPED rather than
-    refused -- that is the document's own stated contract, and it is what lets a
-    curator publish a new shape before every client can render it. `rail` and
-    `banner` are known types with no surface yet; skipping them is the same
-    mechanism, not a special case.
+    The title is load-bearing rather than decorative: it is the only thing that
+    explains why unrelated apps share a card, so a collection without one is
+    dropped instead of rendered as an anonymous pile. The publish gate refuses
+    that document, which makes this the defence against a hand-edited or
+    truncated one.
+
+    Fewer than two resolvable refs is also dropped rather than demoted to an
+    `app` card: a two-app collection that lost one member is a curation problem,
+    and silently showing the survivor under the group's theme would state
+    something the curator did not.
+    """
+    refs = raw.get("appRefs")
+    if not isinstance(refs, list):
+        return None
+    names = [r.strip() for r in refs if isinstance(r, str) and r.strip()]
+    # Preserve the curator's order while dropping a repeat; the publish gate
+    # rejects duplicates, so this only fires on a document that bypassed it.
+    unique = list(dict.fromkeys(names))[:MAX_APP_REFS]
+    if len(unique) < MIN_COLLECTION_APPS:
+        return None
+
+    title = _text(raw, "title", 60)
+    if not title:
+        return None
+
+    out: dict[str, Any] = {"type": "collection", "appRefs": unique, "title": title}
+    if blurb := _text(raw, "blurb", 200):
+        out["blurb"] = blurb
+    if art := _artwork(raw.get("artwork")):
+        out["artwork"] = art
+    return out
+
+
+_SECTION_READERS = {"app": _app_section, "collection": _collection_section}
+
+
+def load_sections(fetcher: Any = None) -> list[dict[str, Any]]:
+    """Return the published featured sections, or ``[]`` for none.
+
+    Two types are projected: `app` (one featured app) and `collection` (several
+    under a curator's theme). An unknown `type` is SKIPPED rather than refused --
+    that is the document's own stated contract, and it is what lets a curator
+    publish a new shape before every client can render it.
+
+    Both project `appRefs` as a list so the caller resolves references one way
+    regardless of type; `type` is what the renderer branches on, and an `app`
+    section always carries exactly one.
 
     Empty is always a safe answer: Discover falls back to picking featured apps
     out of the registry, which is what it did before this module existed.
@@ -237,9 +287,18 @@ def load_sections(fetcher: Any = None) -> list[dict[str, Any]]:
 
     out: list[dict[str, Any]] = []
     for item in raw[:MAX_SECTIONS]:
-        if not isinstance(item, dict) or item.get("type") != "spotlight":
+        if not isinstance(item, dict):
             continue
-        if projected := _spotlight(item):
+        # A non-string `type` is skipped by the same path as an unknown one: the
+        # document is malformed either way, and neither may cost the other
+        # sections their render.
+        kind = item.get("type")
+        if not isinstance(kind, str):
+            continue
+        reader = _SECTION_READERS.get(kind)
+        if reader is None:
+            continue
+        if projected := reader(item):
             out.append(projected)
     return out
 
