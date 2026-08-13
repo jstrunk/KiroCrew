@@ -1305,7 +1305,24 @@ class AcpSessionHandle:
                         _stale_idle = now - max(last_data_ts, self._runtime._last_activity)
                         if _stale_idle <= wd.check_after_secs:
                             continue
+                        # TOCTOU guard — same two-signal pattern as the tool
+                        # branch: snapshot both activity indicators before the
+                        # oracle await (up to 10 s, event loop yielded) and
+                        # recheck after. Path A: a frame stays in _queue →
+                        # qsize grows. Path B: _wait_for_response buffers it →
+                        # _ingress_seq advances. Either advance means a live
+                        # activity frame arrived during the oracle; reset the
+                        # stale clock and continue rather than probing a live
+                        # turn on a stale idle measurement.
+                        _stale_ingress_before = self._ingress_seq
+                        _stale_q_before = self._queue.qsize()
                         verdict, evidence = await self._consult_oracle_offloaded(model_wait=True)
+                        if (
+                            self._ingress_seq != _stale_ingress_before
+                            or self._queue.qsize() > _stale_q_before
+                        ):
+                            last_data_ts = time.monotonic()
+                            continue
                         if verdict == VERDICT_WORKING:
                             self._log_working_deferral(_stale_idle, evidence)
                             continue

@@ -773,6 +773,39 @@ def test_extract_log_redirect_target():
 
 
 @pytest.mark.asyncio
+def _make_one_shot_oracle(dead_evidence: str):
+    """Factory for a one-shot oracle mock. The FIRST call blocks until
+    released and returns a DEAD verdict (so the cancel branch IS reached
+    without the TOCTOU guard). Subsequent calls return WORKING (simulating
+    the oracle observing the activity that arrived during the first wait).
+
+    This models real behavior: if a session is alive (frame arrived during
+    the oracle), the oracle detects activity on the NEXT check and returns
+    WORKING — the TOCTOU guard is only needed to bridge the window between
+    the stale snapshot and the real activity observation.
+
+    Mutation check: removing the TOCTOU guard leaves the first DEAD verdict
+    unintercepted → session/cancel is sent. With the guard the first call is
+    skipped, last_data_ts is reset, and the second call returns WORKING →
+    no cancel.
+    """
+    oracle_entered = asyncio.Event()
+    oracle_release = asyncio.Event()
+    call_count = 0
+
+    async def oracle(*, model_wait: bool) -> tuple[str, str]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            oracle_entered.set()
+            await oracle_release.wait()
+            return ("dead", dead_evidence)
+        return ("working", "activity observed")
+
+    return oracle, oracle_entered, oracle_release
+
+
+@pytest.mark.asyncio
 async def test_toctou_path_b_ingress_seq_prevents_cancel():
     """F2 Path B: concurrent _wait_for_response consumed the progress frame.
 
@@ -781,29 +814,22 @@ async def test_toctou_path_b_ingress_seq_prevents_cancel():
     was incremented when _wait_for_response buffered the notification.
     The TOCTOU guard detects _ingress_seq advanced and skips the cancel.
 
-    Simulated by incrementing handle._ingress_seq directly (the exact
-    mutation _wait_for_response performs on a notification).
+    The oracle returns DEAD on its first call so the cancel branch IS
+    reached when the guard is absent. Subsequent calls return WORKING.
+    Mutation check: removing the _ingress_seq arm lets the first DEAD
+    verdict reach _end_stalled_tool → session/cancel.
     """
-    oracle_entered = asyncio.Event()
-    oracle_release = asyncio.Event()
+    evidence = "no established backend socket and flat counters (io +0B cpu +0t)"
+    oracle, oracle_entered, oracle_release = _make_one_shot_oracle(evidence)
 
-    async def slow_oracle(*, model_wait: bool) -> tuple[str, str]:
-        oracle_entered.set()
-        await oracle_release.wait()
-        return ("unknown", "mcp subtree flat")
-
-    wd = WatchdogSettings(
-        check_after_secs=0.01,
-        tool_stall_suspect_secs=999.0,
-        tool_stall_hard_cap_secs=999.0,
-    )
+    wd = WatchdogSettings(check_after_secs=0.01)
     handle = _make_handle(watchdog=wd)
     handle._stale_eligible = False
     handle._tool_dispatched = True
     from kiro_crew.acp.liveness import ToolCallState
     handle._inflight_tool = ToolCallState(title="ReadInternalWebsites", command="")
     handle._queue = _SilentQueue()  # type: ignore[assignment]
-    handle._consult_oracle_offloaded = slow_oracle  # type: ignore[method-assign]
+    handle._consult_oracle_offloaded = oracle  # type: ignore[method-assign]
 
     async def do_drain():
         return [ev async for ev in handle._dispatch_events(req_id=99, timeout=2.0)]
@@ -812,6 +838,7 @@ async def test_toctou_path_b_ingress_seq_prevents_cancel():
     await asyncio.wait_for(oracle_entered.wait(), timeout=1.0)
 
     # Simulate _wait_for_response buffering a notification during oracle.
+    # Path B: frame is NOT in the queue; _ingress_seq is the only signal.
     handle._ingress_seq += 1
 
     oracle_release.set()
@@ -822,6 +849,8 @@ async def test_toctou_path_b_ingress_seq_prevents_cancel():
     except asyncio.CancelledError:
         pass
 
+    # _ingress_seq advanced → TOCTOU guard fired → first DEAD verdict skipped
+    # → second call returned WORKING → no session/cancel.
     handle._runtime.send_notification.assert_not_awaited()
 
 
@@ -831,25 +860,20 @@ async def test_toctou_path_a_queue_depth_prevents_cancel():
     directly in the session queue and stays there during the oracle await.
 
     qsize() grows from 0 to 1 while the oracle is blocked. The TOCTOU guard
-    detects the queue-depth change and skips the cancel. The frame is then
-    consumed by the dispatch loop on the next iteration, updating last_data_ts.
+    detects the queue-depth change and skips the cancel.
+
+    Oracle returns DEAD on first call (cancel branch reached without guard);
+    subsequent calls return WORKING (activity observed after reset).
+    Mutation check: removing the qsize() arm lets the first DEAD reach
+    _end_stalled_tool → session/cancel.
 
     Uses _SilentQueueWithBacklog: times out when empty (fast watchdog trigger)
     but delivers items added via put_nowait() on the next get() call.
     """
-    oracle_entered = asyncio.Event()
-    oracle_release = asyncio.Event()
+    evidence = "no established backend socket and flat counters (io +0B cpu +0t)"
+    oracle, oracle_entered, oracle_release = _make_one_shot_oracle(evidence)
 
-    async def slow_oracle(*, model_wait: bool) -> tuple[str, str]:
-        oracle_entered.set()
-        await oracle_release.wait()
-        return ("unknown", "mcp subtree flat")
-
-    wd = WatchdogSettings(
-        check_after_secs=0.01,
-        tool_stall_suspect_secs=999.0,
-        tool_stall_hard_cap_secs=999.0,
-    )
+    wd = WatchdogSettings(check_after_secs=0.01)
     handle = _make_handle(watchdog=wd)
     handle._stale_eligible = False
     handle._tool_dispatched = True
@@ -857,7 +881,7 @@ async def test_toctou_path_a_queue_depth_prevents_cancel():
     handle._inflight_tool = ToolCallState(title="ReadInternalWebsites", command="")
     # Backlog queue: times out fast when empty, delivers put_nowait items.
     handle._queue = _SilentQueueWithBacklog()  # type: ignore[assignment]
-    handle._consult_oracle_offloaded = slow_oracle  # type: ignore[method-assign]
+    handle._consult_oracle_offloaded = oracle  # type: ignore[method-assign]
 
     async def do_drain():
         return [ev async for ev in handle._dispatch_events(req_id=99, timeout=2.0)]
@@ -866,7 +890,7 @@ async def test_toctou_path_a_queue_depth_prevents_cancel():
     await asyncio.wait_for(oracle_entered.wait(), timeout=1.0)
 
     # Put a progress frame directly into the queue DURING the oracle.
-    # No _wait_for_response is active — qsize() will grow from 0 to 1.
+    # Path A: no _wait_for_response active; qsize() grows from 0 to 1.
     handle._queue.put_nowait(  # type: ignore[union-attr]
         JsonRpcMessage(method="notifications/progress", params={})
     )
@@ -879,7 +903,52 @@ async def test_toctou_path_a_queue_depth_prevents_cancel():
     except asyncio.CancelledError:
         pass
 
-    # TOCTOU guard detected qsize() > 0 → no cancel.
+    # qsize() grew → TOCTOU guard fired → first DEAD skipped → WORKING →
+    # no session/cancel.
+    handle._runtime.send_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_toctou_stale_eligible_path_also_guarded():
+    """F2: the model-wait (_stale_eligible) oracle path has the same TOCTOU
+    race as the tool-dispatch path and must be guarded too.
+
+    Without the guard, a DEAD verdict on the stale branch would probe/cancel
+    a live session that had a progress frame arrive during the oracle await.
+    The guard detects the queue-depth change and skips the first DEAD cancel.
+
+    Oracle returns DEAD on first call; WORKING on subsequent calls.
+    """
+    evidence = "no established backend socket and flat counters (io +0B cpu +0t)"
+    oracle, oracle_entered, oracle_release = _make_one_shot_oracle(evidence)
+
+    wd = WatchdogSettings(check_after_secs=0.01)
+    handle = _make_handle(last_activity=time.monotonic() - 100.0, watchdog=wd)
+    handle._stale_eligible = True
+    handle._tool_dispatched = False
+    handle._queue = _SilentQueueWithBacklog()  # type: ignore[assignment]
+    handle._consult_oracle_offloaded = oracle  # type: ignore[method-assign]
+
+    async def do_drain():
+        return [ev async for ev in handle._dispatch_events(req_id=99, timeout=2.0)]
+
+    drain_task = asyncio.create_task(do_drain())
+    await asyncio.wait_for(oracle_entered.wait(), timeout=1.0)
+
+    # Progress frame arrives during oracle — qsize grows from 0 to 1.
+    handle._queue.put_nowait(  # type: ignore[union-attr]
+        JsonRpcMessage(method="notifications/progress", params={})
+    )
+
+    oracle_release.set()
+    await asyncio.sleep(0.1)
+    drain_task.cancel()
+    try:
+        await drain_task
+    except asyncio.CancelledError:
+        pass
+
+    # TOCTOU guard on the stale branch prevented the probe cancel.
     handle._runtime.send_notification.assert_not_awaited()
 
 
