@@ -307,8 +307,6 @@ class AcpSessionHandle:
         # dispatch time/shell flag) — the oracle's attribution key. Cleared on
         # EVENT_TOOL_RESULT alongside _tool_dispatched.
         self._inflight_tool: ToolCallState | None = None
-        # Last monotonic ts a WORKING-verdict deferral was logged (rate limit).
-        self._working_logged_ts = 0.0
         # Terminal compaction status captured by compact() while draining its
         # own prompt turn (kiro-cli may emit _kiro.dev/compaction/status
         # BEFORE end_turn). wait_for_compaction() consumes it first so the
@@ -329,6 +327,22 @@ class AcpSessionHandle:
         self._stale_probe = False
         self._tool_dispatched = False
         self._last_stop_reason = ""
+        # Monotonically increasing count of NOTIFICATION frames delivered to this
+        # session by the shared queue. Incremented in _wait_for_response whenever
+        # it consumes a notification (not a response) from the queue while
+        # buffering for a concurrent command call. The TOCTOU guard in
+        # _dispatch_events snapshots this before the oracle await and compares
+        # after: an advance means a real activity frame arrived while the oracle
+        # was executing (even if _wait_for_response had consumed it from the
+        # queue in the meantime). Pure queue-depth checks cannot see frames that
+        # are temporarily held in a concurrent consumer's buffer list.
+        self._ingress_seq: int = 0
+        # Last monotonic ts a WORKING-verdict deferral was logged (rate limit).
+        # Initialized to -inf so the first deferral is always logged regardless
+        # of host uptime (0.0 would suppress the first log on hosts < 10 min old
+        # because now - 0.0 < _WORKING_LOG_INTERVAL_SECS while monotonic is low).
+        # pylint: disable-next=invalid-unary-operand-type
+        self._working_logged_ts: float = float("-inf")
         # toolCallId -> redacted input string, written by the shared parser so a
         # later tool result can recover its originating input (mirrors AcpClient).
         self._tool_call_inputs: dict[str, str] = {}
@@ -455,7 +469,7 @@ class AcpSessionHandle:
         self._tool_dispatched = False
         self._inflight_tool = None
         self._oracle.reset()
-        self._working_logged_ts = 0.0
+        self._working_logged_ts = float("-inf")  # ensure first deferral always logs
         self._tool_call_inputs.clear()
         self._tool_call_is_shell.clear()
         self._tool_call_raw_params.clear()
@@ -1129,6 +1143,13 @@ class AcpSessionHandle:
                         _raise_acp_error(msg.error, self._advertised_model_ids())
                     return msg
                 # Not our response — buffer (do not drop) for re-injection.
+                # If this is a notification (not a response), advance the
+                # ingress sequence: the TOCTOU guard in _dispatch_events
+                # snapshots it before the oracle await and compares after, so
+                # activity frames consumed by this concurrent waiter are still
+                # detected regardless of queue depth at the time of the check.
+                if msg.method is not None:
+                    self._ingress_seq += 1
                 buffered.append(msg)
             raise AcpTimeoutError(f"Timeout waiting for response to request {req_id}")
         finally:
@@ -1213,20 +1234,24 @@ class AcpSessionHandle:
                         _tool_idle = now - last_data_ts
                         if _tool_idle <= wd.check_after_secs:
                             continue
-                        # F2 — TOCTOU guard: snapshot queue depth before
-                        # awaiting the oracle (which runs in an executor for
-                        # up to 10 s, yielding the event loop). A progress or
-                        # tool-result frame arriving in the queue during that
-                        # window means a real activity burst just occurred;
-                        # acting on the stale pre-oracle idle snapshot would
-                        # be a spurious cancel. Recheck after the oracle and
-                        # reset the stall clock if the queue grew.
-                        _q_depth_before = self._queue.qsize()
+                        # F2 — TOCTOU guard: snapshot the per-handle ingress
+                        # sequence BEFORE awaiting the oracle (up to 10 s in an
+                        # executor, yielding the event loop). If a progress or
+                        # tool-result frame arrives DURING the oracle and is
+                        # consumed by a concurrent _wait_for_response call, the
+                        # queue depth would be unchanged at oracle return even
+                        # though real activity occurred. Using _ingress_seq (which
+                        # _wait_for_response increments when it buffers a
+                        # notification) solves this: the advance is visible
+                        # regardless of which consumer holds the frame at the
+                        # time of the check.
+                        _ingress_before = self._ingress_seq
                         verdict, evidence = await self._consult_oracle_offloaded(model_wait=False)
-                        # TOCTOU recheck: if a frame arrived while the oracle
-                        # was running, treat it as fresh activity, reset the
-                        # stall clock, and let the loop consume it normally.
-                        if self._queue.qsize() > _q_depth_before:
+                        # TOCTOU recheck: if _ingress_seq advanced, a new
+                        # notification arrived while the oracle was running.
+                        # Treat it as fresh activity, reset the stall clock,
+                        # and let the next loop iteration consume it normally.
+                        if self._ingress_seq != _ingress_before:
                             last_data_ts = time.monotonic()
                             continue
                         if verdict == VERDICT_WORKING:
@@ -1262,7 +1287,8 @@ class AcpSessionHandle:
                         if not _acting:
                             continue  # UNKNOWN, within budget — keep waiting
                         self._emit_watchdog_metric(
-                            "cancel", verdict, evidence, _tool_idle, narrowed=_narrowed
+                            "cancel", verdict, evidence, _tool_idle,
+                            window="narrowed" if _narrowed else "standard",
                         )
                         async for ev in self._end_stalled_tool(verdict, evidence, _tool_idle):
                             yield ev
@@ -1296,10 +1322,17 @@ class AcpSessionHandle:
                         # turn-complete branch (auto-recovery, never "cancelled by
                         # user"), and an unacked cancel confirms the wedge via the
                         # unresponsive-cancel branch at the loop top.
-                        # ``narrowed`` here = the extended established_flat window
-                        # governed the decision (not the ordinary stale window).
+                        # ``window`` = "extended" when the established_flat
+                        # model-wait probe window (model_silent_probe_secs, 900s)
+                        # governed the decision instead of the ordinary stale
+                        # window (stale_window_secs, 300s). The established_flat
+                        # case is an EXTENSION for model-wait (silence of a
+                        # non-streamed think), not a narrowing as on the tool
+                        # branch — emitting "extended" lets dashboards distinguish
+                        # the two cases correctly.
                         self._emit_watchdog_metric(
-                            "probe", verdict, evidence, _stale_idle, narrowed=_flat_wait
+                            "probe", verdict, evidence, _stale_idle,
+                            window="extended" if _flat_wait else "standard",
                         )
                         logger.warning(
                             "Stale turn on session %s (idle %.0fs, verdict=%s: %s) — "
@@ -1578,7 +1611,8 @@ class AcpSessionHandle:
         self._emit_watchdog_metric("deferral", VERDICT_WORKING, evidence, idle)
 
     def _emit_watchdog_metric(
-        self, action: str, verdict: str, evidence: str, idle: float, *, narrowed: bool = False
+        self, action: str, verdict: str, evidence: str, idle: float, *,
+        window: str = "standard",
     ) -> None:
         """Emit kirocrew.watchdog.action + kirocrew.watchdog.idle_secs (best-effort).
 
@@ -1587,8 +1621,11 @@ class AcpSessionHandle:
         ``probe`` (the non-lethal session/cancel stale probe), and ``cancel``
         (tool-stall recovery via _end_stalled_tool). Attrs are all closed
         enums (metrics/schema.py cardinality rule): the free-form evidence is
-        bucketed by :func:`_watchdog_evidence_class`; ``window`` says whether
-        the established_flat narrowing chose the effective window;
+        bucketed by :func:`_watchdog_evidence_class`; ``window`` is one of:
+        "standard" (default), "narrowed" (tool-branch established_flat reduces
+        the 3h suspect window to the model-silent budget), or "extended"
+        (model-wait established_flat extends the 300s stale window to the
+        model-silent probe window for a non-streamed server-side think).
         ``agent_override`` is the per-agent-override BOOLEAN from the settings
         snapshot — deliberately NOT the agent name (per-agent joins happen via
         the always-on token row store, not OTel attrs). Failures never reach
@@ -1606,7 +1643,7 @@ class AcpSessionHandle:
                 "action": action,
                 "verdict": verdict,
                 "evidence_class": _watchdog_evidence_class(evidence),
-                "window": "narrowed" if narrowed else "standard",
+                "window": window,
                 "agent_override": bool(self._watchdog.agent_override),
             }
             rec = get_recorder()

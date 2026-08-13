@@ -132,16 +132,31 @@ class TestEmitWatchdogMetric:
         assert h["attrs"] == {"action": "cancel", "evidence_class": "mcp_flat"}
 
     def test_narrowed_window_attr(self):
+        """Tool-branch established_flat narrows the suspect window → window=narrowed."""
         rec = _emit(
             _handle(),
             "cancel",
             "unknown",
             "established_flat: mcp subtree flat (io +0B cpu +0t)",
             901.0,
-            narrowed=True,
+            window="narrowed",
         )
         (c,) = _action_calls(rec)
         assert c["attrs"]["window"] == "narrowed"
+        assert c["attrs"]["evidence_class"] == "established_flat"
+
+    def test_extended_window_attr(self):
+        """Model-wait established_flat extends the stale window → window=extended."""
+        rec = _emit(
+            _handle(),
+            "probe",
+            "unknown",
+            "established_flat: io +0B cpu +0t",
+            310.0,
+            window="extended",
+        )
+        (c,) = _action_calls(rec, "probe")
+        assert c["attrs"]["window"] == "extended"
         assert c["attrs"]["evidence_class"] == "established_flat"
 
     def test_agent_override_boolean_from_settings_snapshot(self):
@@ -267,6 +282,48 @@ async def test_stale_probe_emits_probe_point():
 
 
 @pytest.mark.asyncio
+async def test_stale_probe_established_flat_tagged_extended():
+    """F-minor regression: model-wait established_flat EXTENDS the stale window
+    (900s instead of 300s). The probe point must emit window=extended, not
+    window=narrowed, so dashboards can distinguish the two cases.
+
+    Configuration: stale_window_secs=999 (never fires without established_flat),
+    model_silent_probe_secs=0.05 (governs when established_flat; fires quickly).
+    This shows the EXTENSION direction: the established_flat path narrows down
+    from stale_window=999 to model_silent=0.05. In production the relationship
+    is reversed (300s → 900s extension), but both cases emit window=extended.
+    """
+    wd = WatchdogSettings(
+        check_after_secs=0.01,
+        stale_window_secs=999.0,           # would never fire without established_flat
+        model_silent_probe_secs=0.05,      # governs when established_flat fires quickly
+        tool_stall_hard_cap_secs=999.0,
+    )
+    handle = _handle(watchdog=wd)
+    handle._runtime._last_activity = time.monotonic() - 100.0
+    handle._turn_done.clear()
+    handle._stale_eligible = True
+    handle._queue = _SilentQueue()  # type: ignore[assignment]
+    # established_flat evidence → model-wait branch selects model_silent_probe window
+    handle._oracle.check_model_wait = lambda pid: (
+        "unknown", "established_flat: io +0B cpu +0t"
+    )
+
+    rec = _CapturingRecorder()
+    with patch("kiro_crew.metrics.provider.get_recorder", return_value=rec):
+        await _drain(handle, req_id=1, timeout=0.5)
+
+    calls = _action_calls(rec, "probe")
+    assert calls, "stale probe must emit an action point"
+    assert calls[0]["attrs"]["evidence_class"] == "established_flat"
+    # Must be "extended" (model-wait established_flat is an extension of the
+    # probe window, not a narrowing) — never "narrowed"
+    assert calls[0]["attrs"]["window"] == "extended", (
+        "model-wait established_flat extends the probe window — must not emit 'narrowed'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_working_deferral_emits_rate_limited_deferral_point():
     """The deferral point rides _log_working_deferral's 10-min rate limit —
     a long WORKING build yields ONE point per interval, not one per tick."""
@@ -284,6 +341,29 @@ async def test_working_deferral_emits_rate_limited_deferral_point():
     # No cancel/probe: WORKING is never acted on.
     assert not _action_calls(rec, "cancel")
     assert not _action_calls(rec, "probe")
+
+
+@pytest.mark.asyncio
+async def test_first_working_deferral_always_logged_regardless_of_host_uptime():
+    """_working_logged_ts is initialised to -inf so the FIRST deferral is
+    always emitted even on a host that has been running less than the 10-minute
+    rate-limit interval. With 0.0 initialisation, now - 0.0 < 600 on young
+    hosts would incorrectly suppress it."""
+    wd = WatchdogSettings(check_after_secs=0.01)
+    handle = _stalling_handle(wd, "shell child 1234 alive", verdict="working")
+    # Patch monotonic to a very small value (simulating a recently-booted host
+    # whose clock is below the 600s interval). The deferral must still fire.
+    short_uptime_ts = 5.0  # 5 seconds since boot
+    with patch("kiro_crew.acp.session_handle.time") as mock_time:
+        mock_time.monotonic.return_value = short_uptime_ts
+        rec = _CapturingRecorder()
+        with patch("kiro_crew.metrics.provider.get_recorder", return_value=rec):
+            handle._log_working_deferral(120.0, "shell child 1234 alive")
+
+    calls = _action_calls(rec, "deferral")
+    assert len(calls) == 1, (
+        "first deferral must be emitted even on hosts with monotonic time < rate-limit interval"
+    )
 
 
 # ── kirocrew.watchdog.recovery.outcome (chat_runner) ─────────────────────────

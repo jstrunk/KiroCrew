@@ -171,25 +171,30 @@ def _turn_dp(attrs: dict, count: int = 1) -> dict:
 def test_fault_rate_excludes_watchdog_recovery_outcomes(tmp_path: Path):
     """F4 regression: tool_stall and stale_recover must NOT count toward
     fault_rate even though they are not 'ok'. Only genuine terminal faults
-    (error, timeout) are faults; watchdog recovery outcomes are tracked
-    separately under kirocrew.watchdog.recovery.outcome."""
+    (error, timeout, unknown) are faults; watchdog recovery outcomes are
+    tracked separately under kirocrew.watchdog.recovery.outcome.
+
+    'unknown' IS included because pre-labelling metric shards use it for
+    unclassified non-ok outcomes; excluding it would silently inflate the
+    denominator without matching the numerator on the 14-day lookback."""
     turn = {"name": "kirocrew.turn.duration", "data": {"data_points": [
         _turn_dp({"outcome": "ok"}, count=4),
         _turn_dp({"outcome": "error"}, count=1),      # terminal fault
         _turn_dp({"outcome": "timeout"}, count=1),    # terminal fault
+        _turn_dp({"outcome": "unknown"}, count=1),    # legacy shard — terminal fault
         _turn_dp({"outcome": "tool_stall"}, count=3),     # watchdog recovery — NOT a fault
         _turn_dp({"outcome": "stale_recover"}, count=2),  # watchdog recovery — NOT a fault
     ]}}
     result = _aggregate([_write_shard(tmp_path, [turn])])
 
-    total = 4 + 1 + 1 + 3 + 2  # = 11
-    true_faults = 1 + 1          # error + timeout only
+    total = 4 + 1 + 1 + 1 + 3 + 2  # = 12
+    true_faults = 1 + 1 + 1          # error + timeout + unknown
     expected_rate = round(true_faults / total, 4)
 
     assert result["turn"]["outcome"] == {
-        "ok": 4, "error": 1, "timeout": 1, "tool_stall": 3, "stale_recover": 2,
+        "ok": 4, "error": 1, "timeout": 1, "unknown": 1, "tool_stall": 3, "stale_recover": 2,
     }
-    assert result["turn"]["fault_rate"] == expected_rate  # ≈ 0.1818
+    assert result["turn"]["fault_rate"] == expected_rate  # = 0.25
 
     # Ensure genuine error/timeout STILL count as faults (not accidentally
     # excluded by an overly aggressive allowlist).

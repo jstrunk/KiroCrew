@@ -482,7 +482,11 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     # kirocrew.watchdog.recovery.outcome. Counting them as faults inflated the
     # fault rate and hid the true error population. Use an explicit allowlist so
     # future outcome labels added to _turn_outcome() must actively opt in.
-    _TERMINAL_FAULT_OUTCOMES = frozenset({"error", "timeout", "cancelled"})
+    # "unknown" is included: it covers metric shards written before the explicit
+    # outcome labels were introduced. Excluding it would silently move pre-change
+    # fault counts into the denominator without increasing the numerator, biasing
+    # fault_rate downward on the 14-day lookback window.
+    _TERMINAL_FAULT_OUTCOMES = frozenset({"error", "timeout", "cancelled", "unknown"})
     turn_outcome = turn.outcomes
     turn_total = sum(turn_outcome.values())
     turn_faults = sum(v for k, v in turn_outcome.items() if k in _TERMINAL_FAULT_OUTCOMES)

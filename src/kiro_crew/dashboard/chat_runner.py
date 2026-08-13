@@ -4862,12 +4862,15 @@ async def _run_chat(
                 )
                 _emit_stale("⟳ Recovering a stalled turn…")
             elif slot._stale_recovery_retries >= 3:
-                # Budget exhausted — the terminal outcome of this recovery
-                # cycle (the recovered counterpart is emitted at the budget
-                # reset on a completed turn).
+                # Budget exhausted — terminal outcome for this cycle. Reset
+                # the counter now so a subsequent normal turn (after the user
+                # starts fresh) cannot re-emit "recovered" for this already-
+                # exhausted cycle. The budget-reset block at turn completion
+                # also resets, but it is never reached from this early return.
                 _emit_recovery_outcome(
                     "stale_recover", "exhausted", slot._stale_recovery_retries
                 )
+                slot._stale_recovery_retries = 0
                 _emit_stale("Session stuck — please start a new chat.")
             else:
                 # depth>0 (nested turn) with budget remaining: reset the session
@@ -4914,7 +4917,11 @@ async def _run_chat(
                 _emit_stall("⟳ Tool appeared stalled — recovering…")
             elif slot._tool_stall_retries >= 3:
                 # Budget exhausted — mirrors the stale_recover branch above.
+                # Reset the counter now (before the early return) so a
+                # subsequent normal turn cannot double-emit "recovered" for
+                # this already-exhausted cycle.
                 _emit_recovery_outcome("tool_stall", "exhausted", slot._tool_stall_retries)
+                slot._tool_stall_retries = 0
                 _emit_stall("Session stuck — please start a new chat.")
             else:
                 _emit_stall("⟳ Tool appeared stalled — please retry.")

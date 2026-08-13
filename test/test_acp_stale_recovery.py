@@ -783,8 +783,7 @@ async def test_toctou_progress_during_oracle_prevents_cancel():
     handle._tool_dispatched = True
     from kiro_crew.acp.liveness import ToolCallState
     handle._inflight_tool = ToolCallState(title="ReadInternalWebsites", command="")
-    # _SilentQueue always timeouts so the watchdog branch fires after the
-    # first tick (well before the 1s wait below); qsize() returns 0.
+    # _SilentQueue always times out so the watchdog branch fires quickly.
     handle._queue = _SilentQueue()  # type: ignore[assignment]
     # Replace offloaded oracle with the controlled mock
     handle._consult_oracle_offloaded = slow_oracle  # type: ignore[method-assign]
@@ -797,17 +796,18 @@ async def test_toctou_progress_during_oracle_prevents_cancel():
     # Wait for the oracle to enter (watchdog has fired, oracle is executing)
     await asyncio.wait_for(oracle_entered.wait(), timeout=1.0)
 
-    # Simulate a progress frame arriving WHILE the oracle is suspended:
-    # swap in a real queue that already holds the frame so qsize() > 0 when
-    # the TOCTOU guard checks after oracle return.
-    real_queue: asyncio.Queue = asyncio.Queue()
-    real_queue.put_nowait(JsonRpcMessage(method="notifications/progress", params={}))
-    handle._queue = real_queue  # type: ignore[assignment]
+    # Simulate a progress frame arriving WHILE the oracle is suspended by
+    # advancing _ingress_seq directly. This mirrors what _wait_for_response
+    # does when it consumes a notification from the queue — the sequence is
+    # the observable regardless of which consumer holds the frame at any
+    # instant (queue-depth checks fail when the frame is in a consumer's
+    # buffer list rather than the queue itself).
+    handle._ingress_seq += 1
 
     # Release the oracle — it returns UNKNOWN
     oracle_release.set()
 
-    # Give the loop a moment to apply the TOCTOU guard and consume the frame
+    # Give the loop a moment to apply the TOCTOU guard
     await asyncio.sleep(0.1)
 
     # Cancel the drain (would otherwise run until the 2 s timeout)
