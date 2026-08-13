@@ -8,8 +8,9 @@ open before touching that subsystem: see
 
 ## What this is
 
-Kiro Crew is an open-source personal AI agent: chat from Slack, a web dashboard, or
-the CLI; run multi-step tasks unattended; schedule cron jobs; keep memory across
+Kiro Crew is an open-source personal AI agent: chat from the web dashboard, the
+CLI, or a messaging channel like Slack and Discord; run multi-step tasks
+unattended; schedule cron jobs; keep memory across
 sessions. It drives an LLM through the KiroACP provider (the ACP adapter running
 `kiro-cli` over ACP JSON-RPC) plus MCP tools.
 
@@ -35,6 +36,7 @@ in the **same commit** when you change what it documents.
 | `computer_use/` | [computer-use](docs/system-specs/modules/computer-use.md) |
 | `acp/`, kiro-cli transport, providers | [acp-client](docs/system-specs/modules/acp-client.md) + [providers](docs/system-specs/modules/providers.md) |
 | sessions, slots, session keys, PIDs | [session](docs/system-specs/modules/session.md) + [history](docs/system-specs/modules/history.md) |
+| session summaries, the chat summary panel, intent extraction | [session-summary](docs/system-specs/modules/session-summary.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
@@ -222,7 +224,7 @@ fail on 3.12 and pass on 3.10 at the same commit.
 | Comments | Explain **behavior and rationale (the why)**: invariants, edge cases, units, non-obvious constraints. NOT a task log: no PR/CR numbers, review-round markers, incident dates, milestone tags, or commit SHAs. No "previously/used to/we now" narration, state current behavior in present tense. Don't restate what the code plainly does. `_vendor/` and pragmas are exempt. |
 | Icons | **Never use emojis in the UI.** Use `lucide-react` with `className="lucide-inline"`. |
 | Product name | The product is **Kiro Crew**: two words, a space, capital `K`. Identifiers keep the spelling their own system gave them (the `kirodotdev/KiroCrew` repo slug, `KiroCrew.dmg` artifacts, the `KiroCrew Nightly` OS identifier, the `kirocrew` CLI, `KIROCREW_*` env vars, `kiro_crew` imports). CI-gates the lines a change adds; run `BRAND_BASE_REF=origin/main python3 scripts/check_brand_name.py` before pushing. |
-| User-facing strings | The dashboard is translated into 11 languages. **Never hardcode a user-facing English string, and never format a date, number, or sort order without naming a locale.** Both are CI-gated. Backend-owned strings have no catalog path yet, so a new non-2xx JSON body MUST carry a machine-readable `code` field. |
+| User-facing strings | The dashboard is translated into 12 languages. **Never hardcode a user-facing English string, and never format a date, number, or sort order without naming a locale.** Both are CI-gated. Backend-owned strings have no catalog path yet, so a new non-2xx JSON body MUST carry a machine-readable `code` field. |
 
 ## Cross-platform: route POSIX calls through `platform_compat`
 

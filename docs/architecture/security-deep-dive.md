@@ -91,11 +91,13 @@ credential directories by bind-mount (Linux user + mount namespaces) or file-rea
 denial (macOS Seatbelt), and scrubbing credential-bearing environment variables
 on the way in. The parent gateway process is unaffected.
 
-**`agent.sandbox` defaults to `"off"`, and the only other selectable value is
-`"auto"`** (`config/loader.py`, `AgentConfig.sandbox`, `enum=["auto", "off"]`;
+**`agent.sandbox` defaults to `"auto"`, engaging OS-level isolation
+(namespace on Linux, sandbox-exec on macOS).** The only alternative value is
+`"off"` (`config/loader.py`, `AgentConfig.sandbox`, `enum=["auto", "off"]`;
 the same two-value enum gates the dashboard config editor in
-`dashboard/handlers/core.py`). `"off"` is not "no isolation": it defers isolation
-to `kiro-cli`'s own internal agent sandbox, which cannot nest inside Kiro Crew's
+`dashboard/handlers/core.py`). `"off"` skips Kiro Crew's own sandbox but still
+delegates to `kiro-cli`'s internal agent sandbox on macOS when it is enabled,
+which cannot nest inside Kiro Crew's
 Seatbelt wrap (the macOS kernel returns EPERM even under an allow-all outer
 profile), so exactly one layer can own isolation per spawn. Setting `"auto"`
 re-enables Kiro Crew's own sandbox.
@@ -416,7 +418,11 @@ enterprise policy can deny it via the `yolo_duration` scope's `permanent` member
 which downgrades it to the ordinary ad-hoc duration.
 
 Every lifecycle transition (`activate`, `renew`, `expired`, `deactivate`) is
-SEL-audited, and fleet-visibility endpoints expose the live state
+SEL-audited. The transitions that create or extend auto-approval authority
+(`activate`, `activate_scoped`, `renew`) audit **fail-closed**: the SEL event is
+written before the grant is committed, and if the write fails the grant (or the
+extension) is refused — auto-approval authority never exists without an audit
+record. Fleet-visibility endpoints expose the live state
 (`/api/status` reports `yolo_active` / `yolo_expires_at`;
 `/api/admin/compliance/yolo-status` carries the full override status).
 

@@ -36,7 +36,6 @@ platform where the transport is newest, and would do it while CI stayed green.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import sys
@@ -83,9 +82,20 @@ def _init_frame(req_id: int) -> str:
 
 
 async def _spawn_stub(
-    *, socket_path: Path, server: str, agent: str, work_dir: Path, home: Path
+    *,
+    socket_path: Path,
+    server: str,
+    agent: str,
+    work_dir: Path,
+    home: Path,
+    poolable: bool = True,
 ) -> asyncio.subprocess.Process:
-    """Launch a REAL stub process, exactly as the rewriter's overlay would."""
+    """Launch a REAL stub process, exactly as the rewriter's overlay would.
+
+    ``poolable`` mirrors the flag the rewriter passes: set, the backend may be
+    shared with other connections carrying the same PoolKey; unset, this
+    connection gets its own.
+    """
     return await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -98,6 +108,7 @@ async def _spawn_stub(
         "--socket", str(socket_path),
         "--sandbox-mode", "off",
         "--approval-mode", "auto",
+        *(["--poolable"] if poolable else []),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -268,33 +279,117 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
             daemon.cancel()
 
 
+@pytest.mark.asyncio
+async def test_real_stubs_without_poolable_get_their_own_backend(
+    tmp_path: Path, short_sock_dir
+) -> None:
+    """The decoupling assertion: a stub exists either way, sharing does not.
+
+    3 real stubs, one identical PoolKey, none declared poolable -> 3 MCP server
+    processes. Two things have to hold at once, and only asserting both
+    distinguishes a real decoupling from either failure mode:
+
+    * 3 backends, not 1 -- opting out of pooling really means opting out. One
+      backend here would be the silent cross-session sharing the PoolKey has no
+      dimension to prevent.
+    * no stub degraded to per-session exec -- the stub IS in the path, which is
+      what gives the connection an address for an MCP Apps callback. 3 backends
+      with 3 fallbacks would be the old behaviour wearing this test's result.
+    """
+    endpoint_root = short_sock_dir
+    sock = endpoint_root / "gw.sock"
+    work_dir = tmp_path / "ws"
+    work_dir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    launch_log = tmp_path / "launches.txt"
+
+    def _resolver(_key: object) -> tuple[str, list[str], dict[str, str], str]:
+        return (sys.executable, [str(_FAKE_SERVER), str(launch_log)], {}, str(work_dir))
+
+    stop = asyncio.Event()
+    daemon = asyncio.create_task(
+        gw.run_gatewayd(
+            socket_path=sock,
+            # Deliberately smaller than the number of private backends: they are
+            # outside this budget, so a cap of 1 must not throttle or reject
+            # them. A shared-budget implementation fails here.
+            max_backends=1,
+            idle_timeout_secs=300,
+            stop_event=stop,
+            target_resolver=_resolver,
+            prewarm_count=0,
+        )
+    )
+    procs: list[asyncio.subprocess.Process] = []
+    try:
+        for _ in range(100):
+            if transport.endpoint_exists(sock):
+                break
+            await asyncio.sleep(0.05)
+        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+
+        for i in range(3):
+            proc = await _spawn_stub(
+                socket_path=sock, server="fake", agent="probe",
+                work_dir=work_dir, home=home, poolable=False,
+            )
+            procs.append(proc)
+            reply = await _drive_initialize(proc, req_id=i + 1)
+            assert "result" in reply, f"stub {i} got no initialize result: {reply}"
+
+        assert _launch_count(launch_log) == 3, (
+            f"3 non-poolable stubs sharing one PoolKey produced "
+            f"{_launch_count(launch_log)} backends, expected 3 — they were "
+            "collapsed onto a shared backend, which is the silent cross-session "
+            "sharing this path exists to avoid."
+        )
+
+        fallback = home / "logs" / "stub_fallback.jsonl"
+        assert not fallback.exists(), (
+            "a non-poolable stub degraded to per-session exec instead of going "
+            f"through the gateway, so it has no callback address: "
+            f"{fallback.read_text()}"
+        )
+    finally:
+        await _reap(procs)
+        stop.set()
+        try:
+            await asyncio.wait_for(daemon, timeout=30)
+        except asyncio.TimeoutError:  # pragma: no cover - daemon shutdown hang
+            daemon.cancel()
+
+
 def _windows_collect_ignore() -> list[str]:
-    """Extract ``collect_ignore`` from conftest's SOURCE, not its runtime state.
+    """Read the Windows exclusion list from its DATA FILE, not conftest's runtime state.
 
     Importing conftest and reading the attribute looks equivalent and is not:
     the list is assigned inside ``if platform_compat.IS_WINDOWS:``, so on the
     Linux matrix -- the only place this guard runs -- the attribute does not
     exist at all and ``getattr(..., [])`` silently yields an empty set. Every
     membership assertion against it then passes vacuously, which is precisely
-    the class of false pass this guard exists to prevent. Reading the literal
-    out of the source is platform-independent.
+    the class of false pass this guard exists to prevent. Reading the file is
+    platform-independent.
+
+    The names used to be string literals inside conftest and were extracted by
+    parsing its AST. They now live in ``windows-collect-ignore.txt`` because a
+    second reader needs them: naming a file explicitly on the pytest command
+    line bypasses ``collect_ignore``, so the CI reduced-scope selector
+    (``scripts/ci-surface-tests.py``) has to apply the same exclusion itself.
+    Reading that file keeps this guard pointed at the real source of truth --
+    an AST walk over conftest now finds no literals and would go blind.
     """
-    tree = ast.parse(Path(__file__).with_name("conftest.py").read_text(encoding="utf-8"))
-    found: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(
-            isinstance(t, ast.Name) and t.id == "collect_ignore" for t in node.targets
-        ):
-            continue
-        if isinstance(node.value, (ast.List, ast.Tuple)):
-            found += [
-                el.value for el in node.value.elts
-                if isinstance(el, ast.Constant) and isinstance(el.value, str)
-            ]
+    listfile = Path(__file__).with_name("windows-collect-ignore.txt")
+    found = [
+        name
+        for name in (
+            ln.split("#", 1)[0].strip()
+            for ln in listfile.read_text(encoding="utf-8").splitlines()
+        )
+        if name
+    ]
     assert found, (
-        "could not find any collect_ignore string literals in conftest.py — this "
+        f"could not read any excluded filenames from {listfile.name} — this "
         "guard has gone blind and would pass no matter what was excluded"
     )
     return found

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew import platform_compat
 from kiro_crew.mcp_discovery import (
     SCOPE_CC_GLOBAL,
     SCOPE_KIRO_GLOBAL,
@@ -100,6 +101,34 @@ class TestMcpServerInfo:
         """If both url and command are set, treat as local (command takes precedence)."""
         info = McpServerInfo(name="x", command="cmd", url="http://localhost")
         assert info.is_remote is False
+
+    def test_remote_oauth_hints_surface_unredacted(self) -> None:
+        info = McpServerInfo(
+            name="github",
+            url="https://api.githubcopilot.com/mcp/",
+            scopes=["read:user", "read:org"],
+            client_id="Iv1.public-identifier",
+        )
+        d = info.to_dict()
+        assert d["scopes"] == ["read:user", "read:org"]
+        assert d["clientId"] == "Iv1.public-identifier"
+
+    def test_oauth_hints_default_empty_and_are_omitted(self) -> None:
+        info = McpServerInfo(name="x", url="https://mcp.example.com")
+        assert info.scopes == []
+        assert info.client_id == ""
+        d = info.to_dict()
+        assert "scopes" not in d
+        assert "clientId" not in d
+
+    def test_oauth_hints_omitted_on_stdio_rows(self) -> None:
+        """to_dict gates them behind url, so a stdio row never advertises them."""
+        info = McpServerInfo(
+            name="x", command="cmd", scopes=["read"], client_id="public-id"
+        )
+        d = info.to_dict()
+        assert "scopes" not in d
+        assert "clientId" not in d
 
 
 class TestListServers:
@@ -598,6 +627,241 @@ class TestDiscoverNew:
         assert new[0].name == "brand-new"
         assert new[0].source == "discovered"
 
+    def test_discover_new_remote_preserves_url_and_headers(self, tmp_path, monkeypatch) -> None:
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        (agent_dir / "defaults.json").write_text(json.dumps({"mcpServers": {}}))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        headers = {"Authorization": "Bearer sync-secret", "X-Tenant": "acme"}
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "remote": {
+                            "url": "https://mcp.example.com/v1",
+                            "headers": headers,
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        result = discover_servers_to_sync()
+
+        assert len(result) == 1
+        assert result[0].name == "remote"
+        assert result[0].is_remote is True
+        assert result[0].command == ""
+        assert result[0].url == "https://mcp.example.com/v1"
+        assert result[0].headers == headers
+
+    def test_discover_flags_existing_remote_url_change(self, tmp_path, monkeypatch) -> None:
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        headers = {"Authorization": "Bearer sync-secret"}
+        cfg = {
+            "mcpServers": {
+                "remote": {"url": "https://mcp.example.com/v1", "headers": headers}
+            }
+        }
+        (agent_dir / "defaults.json").write_text(json.dumps(cfg))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "remote": {
+                            "url": "https://mcp.example.com/v2",
+                            "headers": headers,
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        result = discover_servers_to_sync()
+
+        assert len(result) == 1
+        assert result[0].url == "https://mcp.example.com/v2"
+
+    def test_discover_flags_existing_remote_headers_change(self, tmp_path, monkeypatch) -> None:
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        cfg = {
+            "mcpServers": {
+                "remote": {
+                    "url": "https://mcp.example.com/v1",
+                    "headers": {"Authorization": "Bearer old"},
+                }
+            }
+        }
+        (agent_dir / "defaults.json").write_text(json.dumps(cfg))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "remote": {
+                            "url": "https://mcp.example.com/v1",
+                            "headers": {"Authorization": "Bearer new"},
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        result = discover_servers_to_sync()
+
+        assert len(result) == 1
+        assert result[0].headers == {"Authorization": "Bearer new"}
+
+    def test_discover_new_remote_preserves_scopes_and_client_id(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        (agent_dir / "defaults.json").write_text(json.dumps({"mcpServers": {}}))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "remote": {
+                            "url": "https://mcp.example.com/v1",
+                            "scopes": ["read:user", "read:org"],
+                            "clientId": "public-client-id",
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        result = discover_servers_to_sync()
+
+        assert len(result) == 1
+        assert result[0].scopes == ["read:user", "read:org"]
+        assert result[0].client_id == "public-client-id"
+
+    def test_discover_flags_existing_remote_scopes_change(self, tmp_path, monkeypatch) -> None:
+        """A Connect that widens or narrows scopes must re-sync, not be ignored."""
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        cfg = {
+            "mcpServers": {
+                "remote": {"url": "https://mcp.example.com/v1", "scopes": ["read"]}
+            }
+        }
+        (agent_dir / "defaults.json").write_text(json.dumps(cfg))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "remote": {
+                            "url": "https://mcp.example.com/v1",
+                            "scopes": ["read", "write"],
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        result = discover_servers_to_sync()
+
+        assert len(result) == 1
+        assert result[0].scopes == ["read", "write"]
+
+    def test_discover_flags_existing_remote_client_id_change(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        cfg = {
+            "mcpServers": {
+                "remote": {"url": "https://mcp.example.com/v1", "clientId": "old-id"}
+            }
+        }
+        (agent_dir / "defaults.json").write_text(json.dumps(cfg))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "remote": {"url": "https://mcp.example.com/v1", "clientId": "new-id"}
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        result = discover_servers_to_sync()
+
+        assert len(result) == 1
+        assert result[0].client_id == "new-id"
+
+    def test_discover_no_resync_when_oauth_hints_match(self, tmp_path, monkeypatch) -> None:
+        """Equal hints must not churn: an unchanged entry stays out of the sync set."""
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        entry = {
+            "url": "https://mcp.example.com/v1",
+            "scopes": ["read"],
+            "clientId": "public-client-id",
+        }
+        (agent_dir / "defaults.json").write_text(json.dumps({"mcpServers": {"remote": entry}}))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        mcp_json.write_text(json.dumps({"mcpServers": {"remote": entry}}))
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        assert discover_servers_to_sync() == []
+
+    @pytest.mark.parametrize(
+        "spec_extra,expected_scopes,expected_client_id",
+        [
+            ({"scopes": "read"}, [], ""),
+            # A partially-valid list degrades to NO scopes, never to its
+            # well-formed subset: truncating it would propagate a request the
+            # file never made, and would disagree with the emit path, which
+            # omits the field entirely on any malformed member.
+            ({"scopes": ["read", 7]}, [], ""),
+            ({"scopes": ["read", "  "]}, [], ""),
+            ({"scopes": None}, [], ""),
+            ({"clientId": 42}, [], ""),
+            ({"clientId": "   "}, [], ""),
+            ({"clientId": None}, [], ""),
+        ],
+    )
+    def test_discover_degrades_malformed_oauth_hints(
+        self, tmp_path, monkeypatch, spec_extra, expected_scopes, expected_client_id
+    ) -> None:
+        """Hand-edited mcp.json must not propagate a bad shape into the agent config."""
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        (agent_dir / "defaults.json").write_text(json.dumps({"mcpServers": {}}))
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        mcp_json = tmp_path / "mcp.json"
+        spec = {"url": "https://mcp.example.com/v1", **spec_extra}
+        mcp_json.write_text(json.dumps({"mcpServers": {"remote": spec}}))
+        monkeypatch.setattr("kiro_crew.mcp_discovery._MCP_JSON_PATHS", (mcp_json,))
+
+        result = discover_servers_to_sync()
+
+        assert len(result) == 1
+        assert result[0].scopes == expected_scopes
+        assert result[0].client_id == expected_client_id
+
     def test_discover_none_when_all_known(self, tmp_path, monkeypatch) -> None:
         agent_dir = tmp_path / "agents"
         agent_dir.mkdir()
@@ -750,6 +1014,90 @@ class TestCommandsDiverged:
         from kiro_crew.mcp_discovery import _commands_diverged
 
         assert _commands_diverged("old-server", "new-server") is True
+
+    def test_distinct_absolute_paths_sharing_a_basename_diverge(self) -> None:
+        """Two different binaries with the same file name are NOT the same server."""
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        assert _commands_diverged("/opt/a/bin/srv", "/opt/b/bin/srv") is True
+
+    def test_relative_path_does_not_match_unrelated_rooted_path(self) -> None:
+        """A CWD-relative path names a specific file, not a PATH lookup.
+
+        ``bin/srv`` resolves against the working directory, so it is not the bare
+        name that ``PATH`` lookup turned into ``/usr/bin/srv`` — treating it as
+        one would silently skip syncing a genuinely changed command.
+        """
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        assert _commands_diverged("bin/srv", "/usr/bin/srv") is True
+        assert _commands_diverged("./srv", "/usr/bin/srv") is True
+        assert _commands_diverged("/usr/bin/srv", "bin/srv") is True
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_WINDOWS,
+        reason="Windows-only: PATHEXT suffixes are only stripped there.",
+    )
+    def test_differing_pathext_suffixes_diverge(self) -> None:
+        """``foo.bat`` and ``foo.cmd`` are different files, not two spellings of one.
+
+        Only the ``shutil.which``-resolved (rooted) side may shed its suffix;
+        folding it off both sides would collapse distinct executables.
+        """
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        assert _commands_diverged("foo.bat", r"C:\x\foo.cmd") is True
+        assert _commands_diverged("myserver.js", r"C:\x\myserver.exe") is True
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_WINDOWS,
+        reason="Windows-only: PATHEXT suffixing and case/separator-insensitive paths.",
+    )
+    def test_pathext_resolved_command_does_not_diverge(self, monkeypatch) -> None:
+        """A bare name matches the ``shutil.which`` result that carries a PATHEXT suffix.
+
+        ``agent._resolve_command`` resolves ``npx`` to ``...\\npx.CMD`` because
+        ``shutil.which`` spells the extension as ``PATHEXT`` does. Treating that as
+        divergence would re-sync and reset every session on every startup.
+        """
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        assert _commands_diverged("npx", r"C:\Program Files\nodejs\npx.CMD") is False
+        assert _commands_diverged(r"C:\tools\my-server.exe", "my-server") is False
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_WINDOWS,
+        reason="Windows-only: paths are case-insensitive and accept either separator.",
+    )
+    def test_separator_and_case_variants_do_not_diverge(self) -> None:
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        assert _commands_diverged(r"C:\tools\srv.exe", "C:/Tools/SRV.exe") is False
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_WINDOWS,
+        reason="Windows-only: a driveless root is not ntpath.isabs but still names a path.",
+    )
+    def test_driveless_rooted_path_matches_bare_name(self) -> None:
+        """A POSIX-shaped ``mcp.json`` copied onto Windows still resolves by basename.
+
+        ``ntpath.isabs('/usr/bin/srv')`` is False (no drive), so a rooted-path check
+        alone would read the whole string as a bare command name.
+        """
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        assert _commands_diverged("srv", "/usr/bin/srv") is False
+        assert _commands_diverged(r"\tools\srv", "srv") is False
+
+    @pytest.mark.skipif(
+        platform_compat.IS_WINDOWS,
+        reason="POSIX-only: filenames are case-sensitive there, unlike Windows.",
+    )
+    def test_case_differing_commands_diverge_on_posix(self) -> None:
+        from kiro_crew.mcp_discovery import _commands_diverged
+
+        assert _commands_diverged("Server", "/usr/bin/server") is True
 
 
 class TestSyncToAgentConfig:
@@ -2663,3 +3011,288 @@ class TestWindowsTeardownOffLoop:
                     f"kill_process_tree called on the loop: {line.strip()}"
                 )
         assert "asyncio.to_thread(" in src
+
+
+class TestProbeSandboxUnavailable:
+    """A probe that could not RUN must not be reported as a broken server.
+
+    kiro-cli launches MCP servers from the agent config without going through
+    this probe, so on a host with no sandbox backend (any Windows host, macOS
+    >= 26) the servers work while the probe cannot spawn them. Reporting that as
+    an ordinary server fault renders every row red with "0 tools" and sends the
+    user debugging a server that is fine.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sandbox_refusal_is_reported_as_a_probe_limitation(self, monkeypatch) -> None:
+        import kiro_crew.mcp_discovery as md
+        from kiro_crew.sandbox import SandboxUnavailableError
+
+        monkeypatch.setattr(md, "_probe_sandbox_warned", set())
+
+        def _refuse(*args, **kwargs):
+            raise SandboxUnavailableError(
+                "Sandbox backend unavailable and allow_unsandboxed_exec is not set.",
+                kind="no_backend",
+                detail="not Linux",
+            )
+
+        # A THIRD-PARTY server: managed ones never reach the spawn path at all
+        # (their tools are read in-process), so they cannot exercise this branch.
+        server = McpServerInfo(name="playwright-mcp", command="node")
+        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse), patch(
+            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"
+        ):
+            result = await probe_server(server)
+
+        # Machine-readable prefix so a presentation layer can tell this apart from
+        # a genuine handshake failure without parsing prose.
+        assert result.error.startswith("mcp_probe_sandbox_unavailable:"), result.error
+        assert "server itself may be fine" in result.error, result.error
+        assert "sandbox_allow_unsandboxed_exec" in result.error, result.error
+
+    @pytest.mark.asyncio
+    async def test_a_managed_server_is_still_spawned_when_the_sandbox_works(self) -> None:
+        """The spawn is the only thing that proves the server can START.
+
+        `_fix_stale_managed_command` exists because the managed invocation does go
+        stale ("command not found: kirocrew; the built-in cron/core tools then never
+        load"), and the probe was the one surface that caught it. Short-circuiting
+        on the server name would report `ok` for a managed server that cannot run —
+        silently changing what `ok` means in the shared `_cache_probe` store.
+        """
+        spawned: dict[str, bool] = {}
+
+        def _wrap(argv, **kwargs):
+            spawned["yes"] = True
+            raise RuntimeError("stop at the wrap")
+
+        server = McpServerInfo(name="kirocrew-core", command="kirocrew", args=["mcp-core"])
+        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _wrap), patch(
+            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/kirocrew"
+        ):
+            await probe_server(server)
+
+        assert spawned.get("yes") is True, "a working sandbox must still be used"
+
+    @pytest.mark.asyncio
+    async def test_a_managed_server_falls_back_to_its_declaration_with_no_backend(
+        self, monkeypatch
+    ) -> None:
+        """No backend: serve the declared list rather than an error.
+
+        This is what removes the opt-in for a read-only listing. The import runs
+        package code in the gateway process, which is only acceptable BECAUSE the
+        sandbox could not confine anything on this host anyway — hence fallback,
+        never primary.
+        """
+        import kiro_crew.mcp_discovery as md
+        from kiro_crew.sandbox import SandboxUnavailableError
+
+        monkeypatch.setattr(md, "_managed_in_process_warned", set())
+
+        def _refuse(*args, **kwargs):
+            raise SandboxUnavailableError("no backend", kind="no_backend", detail="not Linux")
+
+        for name, expect_tools in (("kirocrew-core", True), ("kirocrew-cron", True)):
+            server = McpServerInfo(name=name, command="kirocrew", args=["mcp-x"])
+            with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse), patch(
+                "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/kirocrew"
+            ):
+                result = await probe_server(server)
+
+            assert result.status == "ok", (name, result.error)
+            assert bool(result.tools) is expect_tools, (name, len(result.tools))
+
+    @pytest.mark.asyncio
+    async def test_a_third_party_server_gets_no_declaration_fallback(self) -> None:
+        """Only OUR OWN servers have a declaration to read; a third-party one keeps
+        the honest probe-limitation error."""
+        from kiro_crew.sandbox import SandboxUnavailableError
+
+        def _refuse(*args, **kwargs):
+            raise SandboxUnavailableError("no backend", kind="no_backend", detail="not Linux")
+
+        server = McpServerInfo(name="playwright-mcp", command="node")
+        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _refuse), patch(
+            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"
+        ):
+            result = await probe_server(server)
+
+        assert result.status == "error"
+        assert result.error.startswith("mcp_probe_sandbox_unavailable:"), result.error
+
+    @pytest.mark.asyncio
+    async def test_the_remedy_paragraph_is_logged_once_per_server(
+        self, monkeypatch, caplog
+    ) -> None:
+        """The cause is the HOST, so it recurs every cycle for every server.
+
+        Unbounded, a four-server config logged four identical multi-line remedy
+        paragraphs per discovery cycle, forever.
+        """
+        import logging
+
+        import kiro_crew.mcp_discovery as md
+
+        monkeypatch.setattr(md, "_probe_sandbox_warned", set())
+        with caplog.at_level(logging.WARNING, logger=md.logger.name):
+            md._warn_probe_sandbox_unavailable_once("kirocrew-core")
+            md._warn_probe_sandbox_unavailable_once("kirocrew-core")
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+        assert "probe skipped" in warnings[0].getMessage()
+
+
+class TestFirstPartyManagedArgv:
+    """The probe passes ``first_party_fixed_argv`` ONLY for a self-derived argv.
+
+    The flag buys an unconfined spawn on a backend-less host (issue #1563
+    carve-out), so it must key on the INVOCATION this package derives for its
+    own managed servers — never on the server name alone, which an mcp.json
+    scope could pair with user-config command text.
+    """
+
+    _INVOCATION = ("/opt/kirocrew/bin/kirocrew", ["mcp-core"])
+
+    def _patch_invocation(self, monkeypatch) -> None:
+        import kiro_crew.mcp_discovery as md
+
+        monkeypatch.setattr(
+            md, "_resolved_managed_invocation", {"kirocrew-core": self._INVOCATION}
+        )
+        # Default install: the package-derived managed env is empty.
+        monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: {})
+
+    def test_self_derived_managed_argv_is_first_party(self, monkeypatch) -> None:
+        import kiro_crew.mcp_discovery as md
+
+        self._patch_invocation(monkeypatch)
+        assert md._is_first_party_managed_argv(
+            "kirocrew-core", self._INVOCATION[0], list(self._INVOCATION[1]), {}
+        )
+
+    def test_customized_command_under_a_managed_name_is_not(self, monkeypatch) -> None:
+        """A managed NAME with user-config command text (the mcp.json-sourced
+        case, which ``_fix_stale_managed_command`` never re-resolves) must keep
+        the full fail-close + opt-in behavior."""
+        import kiro_crew.mcp_discovery as md
+
+        self._patch_invocation(monkeypatch)
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core", "/home/user/evil-shim", list(self._INVOCATION[1]), {}
+        )
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core", self._INVOCATION[0], ["mcp-core", "--extra"], {}
+        )
+
+    def test_spec_env_under_a_managed_name_is_not_first_party(self, monkeypatch) -> None:
+        """Env is an execution vector for the SAME argv (``LD_PRELOAD`` decides
+        what code runs), and ``probe_server`` merges the spec's env into the
+        child environment — so any key this package did not derive disqualifies
+        the spec from the unconfined carve-out."""
+        import kiro_crew.mcp_discovery as md
+
+        self._patch_invocation(monkeypatch)
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core",
+            self._INVOCATION[0],
+            list(self._INVOCATION[1]),
+            {"LD_PRELOAD": "/tmp/evil.so"},
+        )
+
+    def test_the_package_derived_home_pin_still_matches(self, monkeypatch) -> None:
+        """Under an override home the managed spec legitimately carries exactly
+        the ``KIROCREW_HOME`` pin this package derived — that must still count
+        as first-party, and any EXTRA key alongside it must not."""
+        import kiro_crew.mcp_discovery as md
+
+        self._patch_invocation(monkeypatch)
+        pin = {"KIROCREW_HOME": "/data/override-home"}
+        monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: dict(pin))
+        assert md._is_first_party_managed_argv(
+            "kirocrew-core", self._INVOCATION[0], list(self._INVOCATION[1]), dict(pin)
+        )
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core",
+            self._INVOCATION[0],
+            list(self._INVOCATION[1]),
+            {**pin, "LD_PRELOAD": "/tmp/evil.so"},
+        )
+        # A spec MISSING the derived pin is also not the derived invocation.
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core", self._INVOCATION[0], list(self._INVOCATION[1]), {}
+        )
+
+    def test_the_interpreter_fallback_is_never_first_party(self, monkeypatch) -> None:
+        """`python -m kiro_crew` prepends the child's CWD to sys.path (3.10 has
+        no -P), so a planted `kiro_crew/` tree in an untrusted cwd would shadow
+        the install — only a resolved console-script binary qualifies."""
+        import sys
+
+        import kiro_crew.mcp_discovery as md
+
+        fallback = (sys.executable, ["-m", "kiro_crew", "mcp-core"])
+        monkeypatch.setattr(md, "_resolved_managed_invocation", {"kirocrew-core": fallback})
+        monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: {})
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core", fallback[0], list(fallback[1]), {}
+        )
+
+    def test_third_party_server_is_never_first_party(self, monkeypatch) -> None:
+        import kiro_crew.mcp_discovery as md
+
+        self._patch_invocation(monkeypatch)
+        assert not md._is_first_party_managed_argv("playwright-mcp", "node", [], {})
+
+    def test_resolution_failure_fails_toward_not_first_party(self, monkeypatch) -> None:
+        import kiro_crew.mcp_discovery as md
+
+        monkeypatch.setattr(md, "_resolved_managed_invocation", {})
+
+        def _boom(subcommand):
+            raise RuntimeError("no install")
+
+        monkeypatch.setattr("kiro_crew.agent._kirocrew_mcp_invocation", _boom)
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core", self._INVOCATION[0], list(self._INVOCATION[1]), {}
+        )
+
+    @pytest.mark.asyncio
+    async def test_probe_passes_the_flag_for_a_self_derived_managed_server(
+        self, monkeypatch
+    ) -> None:
+        self._patch_invocation(monkeypatch)
+        seen: dict[str, bool] = {}
+
+        def _capture(argv, **kwargs):
+            seen["flag"] = kwargs.get("first_party_fixed_argv", False)
+            raise RuntimeError("stop at the wrap")
+
+        server = McpServerInfo(
+            name="kirocrew-core", command=self._INVOCATION[0], args=list(self._INVOCATION[1])
+        )
+        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _capture), patch(
+            "kiro_crew.mcp_discovery.shutil.which", return_value=self._INVOCATION[0]
+        ):
+            await probe_server(server)
+
+        assert seen["flag"] is True
+
+    @pytest.mark.asyncio
+    async def test_probe_passes_false_for_a_third_party_server(self, monkeypatch) -> None:
+        self._patch_invocation(monkeypatch)
+        seen: dict[str, bool] = {}
+
+        def _capture(argv, **kwargs):
+            seen["flag"] = kwargs.get("first_party_fixed_argv", True)
+            raise RuntimeError("stop at the wrap")
+
+        server = McpServerInfo(name="playwright-mcp", command="node")
+        with patch("kiro_crew.mcp_discovery.sandboxed_spawn_argv", _capture), patch(
+            "kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/node"
+        ):
+            await probe_server(server)
+
+        assert seen["flag"] is False

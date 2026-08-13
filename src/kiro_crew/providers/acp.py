@@ -30,6 +30,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
+from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.effort import (
     EFFORT_LEVELS,
     effort_settings_key,
@@ -300,6 +301,34 @@ class AcpProvider(LLMProvider):
     def client(self) -> AcpClient:
         """Expose underlying client for backward compat (e.g. is_ready check)."""
         return self._client
+
+    @property
+    def served_model(self) -> str:
+        """Model id the live session resolved (public — see LLMProvider).
+
+        Only BACKEND-RESOLVED ids count — the canary in chat_runner must
+        never probe a model the backend didn't actually serve. The two client
+        shapes store that differently, so resolve per shape:
+
+        - ``AcpSessionProvider`` (kiro path after startup): its public
+          ``served_model`` delegates to the handle, which prefers the
+          explicit ``set_model`` assignment and falls back to the
+          ``session/new|load`` response's ``currentModelId`` — so a session
+          on the backend-selected DEFAULT model is still readable.
+        - Raw ``AcpClient`` (claude backend / pre-startup): ``_model`` is the
+          REQUESTED id (defaults to the ``"auto"`` sentinel) and is
+          deliberately NOT consulted; only ``_resolved_model_id``, which the
+          backend reported, counts.
+
+        The ``"auto"`` sentinel is filtered to ``""`` (= unknown/inconclusive)
+        on both paths.
+        """
+        client = self._client
+        if isinstance(client, AcpSessionProvider):
+            model = str(client.served_model or "").strip()
+        else:
+            model = str(getattr(client, "_resolved_model_id", "") or "").strip()
+        return "" if model == DEFAULT_MODEL else model
 
     @property
     def cwd(self) -> str:
@@ -1057,6 +1086,9 @@ class AcpProvider(LLMProvider):
     def context_usage_pct(self) -> float:
         return self._client.last_prompt_stats.context_pct
 
+    def context_usage_unknown(self) -> bool:
+        return self._client.last_prompt_stats.context_pct_unknown
+
     def context_window_tokens(self) -> int:
         return self._client.last_prompt_stats.context_window_tokens
 
@@ -1138,7 +1170,7 @@ class AcpProvider(LLMProvider):
         """True when the inner client supports mid-turn steer."""
         return bool(getattr(self._client, "supports_steer", False))
 
-    async def wait_for_compaction(self, timeout: float = 120.0) -> dict:
+    async def wait_for_compaction(self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS) -> dict:
         """Wait for compaction completed/failed after stream ends.
 
         Consumes the result compact() captured mid-turn if there is one

@@ -12,9 +12,13 @@ import SkillBrowserModal from '../../components/SkillBrowserModal'
 import DiffBlock from '../../components/DiffBlock'
 import { useProvider } from '../../providers'
 import type { Skill } from '../../types'
+import SkillContextBudget from './SkillContextBudget'
+
+import { Trans } from 'react-i18next'
 
 import { fmtBytes, fmtCompact } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
+import { SettingRef } from '../../components/settingRef/SettingRef'
 const EMPTY_FORM: SkillFormData = { name: '', category: '', description: '', triggers: '', tags: '', always: false, body: '' }
 
 /** Humanize a kebab/snake-case skill name for display. */
@@ -45,6 +49,7 @@ function sourceLabel(source: Skill['source']): string | null {
 export default function SkillsTab() {
   const provider = useProvider()
   const queryClient = useQueryClient()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [creating, setCreating] = useState(false)
   const [formData, setFormData] = useState<SkillFormData>(EMPTY_FORM)
   const [skillFilter, setSkillFilter] = useState('')
@@ -52,6 +57,18 @@ export default function SkillsTab() {
   const [detailEditing, setDetailEditing] = useState(false)
   // Multi-provider skill browser drawer (Add Skill button).
   const [skillBrowserOpen, setSkillBrowserOpen] = useState(false)
+
+  // Deep-linkable view param: ?view=budget swaps to the control plane.
+  // Entering the budget view PUSHES a history entry so browser Back returns to
+  // Skills; leaving via the in-app affordance replaces (pops back cleanly).
+  const viewBudget = searchParams.get('view') === 'budget'
+  const showBudget = () => setSearchParams(prev => { const next = new URLSearchParams(prev); next.set('view', 'budget'); return next })
+  const hideBudget = () => setSearchParams(prev => { const next = new URLSearchParams(prev); next.delete('view'); return next }, { replace: true })
+
+  // Light prefetch removed: the Design reviewer correctly noted that firing the
+  // budget endpoint on every Skills-tab mount contradicts the PR's own
+  // justification that Context Budget is a deliberate, user-initiated path.
+  // The doorway label is now static; the data is fetched when the user opens it.
 
   const { data: skills = [], isLoading, isFetching, refetch } = useQuery<Skill[]>({
     queryKey: ['skills'],
@@ -192,6 +209,9 @@ export default function SkillsTab() {
     </Card>
   </>)
 
+  // Control plane: full-page budget view, deep-linkable via ?view=budget.
+  if (viewBudget) return <SkillContextBudget onBack={hideBudget} />
+
   return (<>
     <PendingSkillsPanel />
     {/* Create Skill Modal */}
@@ -202,7 +222,8 @@ export default function SkillsTab() {
       <SkillForm data={formData} onChange={setFormData} />
     </Modal>
 
-    <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2 flex items-center gap-2">{i18nT('pages.overview.skillsTab.skills_count', { count: skills.length })} <InfoTip text={i18nT('pages.overview.skillsTab.skills_tip')} /> <span className="ml-auto flex items-center gap-2"><Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn><Btn primary onClick={() => { setFormData(EMPTY_FORM); setCreating(true) }}>{i18nT('pages.overview.skillsTab.create_new_skill')}</Btn></span></h4>
+    <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2 flex items-center gap-2">{i18nT('pages.overview.skillsTab.skills_count', { count: skills.length })} <InfoTip text={i18nT('pages.overview.skillsTab.skills_tip')} /> <span className="ml-auto flex items-center gap-2"><Btn onClick={showBudget} className="text-accent border-accent/30 bg-accent/5 hover:bg-accent/10">{i18nT('pages.overview.skillsTab.budget_doorway_static')}</Btn><Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn><Btn primary onClick={() => { setFormData(EMPTY_FORM); setCreating(true) }}>{i18nT('pages.overview.skillsTab.create_new_skill')}</Btn></span></h4>
+    <p className="text-[12px] text-muted mb-2"><Trans i18nKey="pages.overview.skillsTab.auto_create_hint" components={{ settingRef: <SettingRef configKey="skills.auto_create_from_sessions" /> }} /></p>
     <Card>
       <div className="flex items-center gap-2 mb-3">
         <div className="relative max-w-[480px] flex-1">
@@ -562,6 +583,14 @@ function PendingSkillsPanel() {
       qc.invalidateQueries({ queryKey: ['skills-pending'] })
     },
   })
+  const dismissAll = useMutation({
+    mutationFn: () => api.dismissAllPendingSkills(pending.map(p => p.slug)),
+    onSuccess: () => {
+      setReviewSlug(null)
+      qc.removeQueries({ queryKey: ['skills-pending-detail'] })
+      qc.invalidateQueries({ queryKey: ['skills-pending'] })
+    },
+  })
   // Only claim a deep-linked candidate is gone once the queue has actually been
   // read -- `pending` is [] while the first fetch is in flight, which would
   // otherwise flash the notice on every deep link.
@@ -579,7 +608,13 @@ function PendingSkillsPanel() {
         <h4 className="text-sm font-semibold text-text-strong mb-2 flex items-center gap-2">
           {i18nT('pages.overview.skillsTab.pending_review_count', { count: pending.length })}
           <InfoTip text={i18nT('pages.overview.skillsTab.auto_generated_skill_candidates_awaiting_your_ap')} />
+          <Btn danger className="ml-auto text-[11px]" onClick={() => { if (confirm(i18nT('pages.overview.skillsTab.dismiss_all_confirm', { count: pending.length }))) dismissAll.mutate() }}>{i18nT('pages.overview.skillsTab.dismiss_all')}</Btn>
         </h4>
+      )}
+      {pending.length > 0 && (
+        <p className="text-[11px] text-muted mb-2">
+          <Trans i18nKey="pages.overview.skillsTab.approval_required_hint" components={{ settingRef: <SettingRef configKey="skills.approval_required" /> }} />
+        </p>
       )}
       {reviewMissing && (
         <div className="mb-2 text-[11px] p-2 rounded bg-bg-elevated border border-border text-muted">

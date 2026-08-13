@@ -24,6 +24,11 @@ import time
 import urllib.request
 from typing import Any
 
+# Stdlib-only leaf (it imports urllib.request and nothing else), so this
+# top-level import does not pull the gateway into this stdio proxy -- the same
+# constraint that makes _internal_secret() reach for the config.paths leaf.
+from kiro_crew.loopback_http import loopback_urlopen
+
 try:
     from PIL import Image
     _HAS_PIL = True
@@ -239,9 +244,24 @@ _NATIVE_OPS: dict[str, str] = {
 # failures clear it, so closing the panel restores full Playwright behaviour.
 _native_panel_seen = False
 
-# Error text from the Electron side meaning "no view/panel to drive" rather than
-# "not allowed to drive it". An absent panel is a transport gap; a deny is not.
-_NATIVE_ABSENT_MARKERS = ("no-browser-view", "no native browser panel", "no-native-panel")
+# Error text from the Electron side meaning "fall back to Playwright" rather than
+# "this operation is forbidden".
+#
+# An absent panel is a transport gap; a deny is not, and a deny must stay fatal --
+# falling back would re-run the op on Playwright's page and turn a refusal into an
+# allow by another route (see test_refusal_returns_an_mcp_error_and_does_not_fall_back).
+#
+# Keep this list to genuine ABSENCE. An earlier revision of the native-default work
+# added an authorization-shaped reason here (`agent-act-consent-required`) to cover a
+# per-session consent model that no longer exists; nothing emitted it once that model
+# was removed, leaving a dead branch that pre-authorized a future consent-shaped deny
+# to degrade into a silent mirror fallback. Authorization now lives entirely in
+# Browser Mode, so a deny reaching this proxy is always final.
+_NATIVE_ABSENT_MARKERS = (
+    "no-browser-view",
+    "no native browser panel",
+    "no-native-panel",
+)
 
 
 def _names_absent_panel(detail: str) -> bool:
@@ -329,7 +349,7 @@ def _post_frame_to_gateway(img_bytes: bytes, fmt: str, source: str = "agent") ->
                 headers=headers,
                 method="POST",
             )
-            resp = urllib.request.urlopen(req, timeout=2)
+            resp = loopback_urlopen(req, timeout=2)
             try:
                 _record_subscriber_count(resp.read())
             finally:
@@ -371,7 +391,7 @@ def _post_pump_audit() -> bool:
             headers=headers,
             method="POST",
         )
-        resp = urllib.request.urlopen(req, timeout=2)
+        resp = loopback_urlopen(req, timeout=2)
         try:
             status = resp.getcode()
         finally:
@@ -804,6 +824,17 @@ def _try_native_tool_call(msg: dict[str, Any]) -> dict[str, Any] | None:
     """
     if msg.get("method") != "tools/call":
         return None
+    # Extension mode is an explicit user choice: the operator turned on
+    # ``extension_mode`` in Settings so Playwright drives their OWN running,
+    # logged-in browser via the Playwright extension + token. Native routing must
+    # NEVER override that deliberate choice -- so we yield here and let the call
+    # fall through to Playwright (which, in extension mode, acts on the user's own
+    # browser). This is WHY the guard lives in the routing path and not only in the
+    # frame-send path: suppressing the dashboard mirror is not enough; if native
+    # routing captured the op the user's browser would be silently hijacked even
+    # though no native op ever reached them.
+    if _EXTENSION_MODE:
+        return None
     global _native_panel_seen
     params = msg.get("params") or {}
     name = params.get("name") or ""
@@ -811,15 +842,17 @@ def _try_native_tool_call(msg: dict[str, Any]) -> dict[str, Any] | None:
         # Not a browser tool (e.g. tools/list plumbing) -- never our concern.
         return None
 
+    # The frozen-env key is correct for per-session spawns but EMPTY for a
+    # warm-pool worker (pre-spawned before a slot is assigned, so
+    # KIROCREW_SESSION_KEY was never set). We do NOT bail on an empty key here:
+    # the command POST also carries this proxy's ``host_pid``, from which the
+    # GATEWAY resolves the AUTHORITATIVE session key by walking our process
+    # ancestry to the kiro-cli worker and verifying its signed session_pid
+    # sidecar -- the same mechanism the frame path already uses to make the live
+    # mirror work under the warm pool. When no native panel is registered for the
+    # resolved session the gateway answers 503 and we fall back to Playwright
+    # below, so attempting the POST costs nothing on a remote/non-Electron host.
     session_key = _SESSION_KEY
-    if not session_key:
-        # A warm-pool worker never had KIROCREW_SESSION_KEY frozen in, so we
-        # cannot say which panel to drive and native routing is INACTIVE for this
-        # session. Fall everything back to Playwright -- with nothing going
-        # native there is no split brain to guard against. (The frame path
-        # resolves the key from the session_pid sidecar via the gateway; doing
-        # the same here is a follow-up.)
-        return None
 
     op = _NATIVE_OPS.get(name)
     if op is None:
@@ -849,7 +882,12 @@ def _try_native_tool_call(msg: dict[str, Any]) -> dict[str, Any] | None:
         # fall back and silently mis-target on Playwright.
         return _native_error(msg.get("id"), arg_error)
 
-    body = json.dumps({"session_key": session_key, "op": op, "args": args}).encode()
+    # ``host_pid`` lets the gateway resolve the authoritative session key when
+    # ``session_key`` is empty (warm pool); ``session_key`` stays as the fallback
+    # for per-session spawns. Same pair the frame ingress accepts.
+    body = json.dumps(
+        {"session_key": session_key, "host_pid": os.getpid(), "op": op, "args": args}
+    ).encode()
     req = urllib.request.Request(
         _gateway_command_url(),
         data=body,
@@ -858,7 +896,7 @@ def _try_native_tool_call(msg: dict[str, Any]) -> dict[str, Any] | None:
     )
     try:
         # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (http://127.0.0.1 + the fixed /api/browser/command path from _gateway_command_url); only the port varies, from KIROCREW_PORT local config, never user/agent/request input, so no file:// or arbitrary-read is reachable  # noqa: E501
-        with urllib.request.urlopen(req, timeout=_NATIVE_CALL_TIMEOUT_S) as resp:
+        with loopback_urlopen(req, timeout=_NATIVE_CALL_TIMEOUT_S) as resp:
             payload = json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         # The gateway ANSWERED with a status. Only "there is no panel to drive"
@@ -975,7 +1013,27 @@ def _drain_pending_with_error() -> None:
     _PENDING_REQUESTS.clear()
 
 
-def _resolve_playwright_cmd() -> str | None:
+# The PUBLIC npm registry. ``@playwright/mcp`` is public, but a user's ambient
+# ``.npmrc`` may point the DEFAULT registry at a private mirror (corporate proxy,
+# AWS CodeArtifact) whose auth token expires — so a bare ``npx @playwright/mcp``
+# 401s on this public package. When we launch via npx we pin this registry (argv
+# ``--registry`` + ``npm_config_registry`` in the child env) so the on-demand
+# fetch never routes through a private/stale-token default. npm and npx honor both
+# forms identically on macOS, Linux, and Windows.
+PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org/"
+
+
+def _is_npx_launcher(cmd: str) -> bool:
+    """True when ``cmd`` resolves to npx (``npx`` on POSIX, ``npx.CMD`` on Windows).
+
+    Extension-insensitive: the resolved launcher is ``npx.CMD`` on Windows and
+    bare ``npx`` on POSIX. Matching on the extension-stripped basename keeps the
+    registry-pin and ``@playwright/mcp`` argv logic identical across platforms.
+    """
+    return os.path.splitext(os.path.basename(cmd))[0].lower() == "npx"
+
+
+def _resolve_playwright_cmd(search_path: str | None = None) -> str | None:
     """Find the public ``@playwright/mcp`` CLI, resolving via PATH/npx.
 
     Resolution order:
@@ -984,6 +1042,14 @@ def _resolve_playwright_cmd() -> str | None:
       3. ``npx`` — the public ``@playwright/mcp`` package is launched via
          ``npx @playwright/mcp`` when no standalone binary is installed.
 
+    ``search_path`` overrides the PATH ``shutil.which`` searches. The proxy (a
+    standalone CLI process) passes ``None`` and searches its own inherited PATH.
+    The setup path passes a Node-AUGMENTED PATH so a version-manager /
+    ``ensure-node.sh`` toolchain the gateway daemon did not inherit is still
+    found — without it, a daemon that bootstrapped Node via the ``node-bin-dir``
+    marker (which is NOT written into ``os.environ["PATH"]``) would resolve
+    ``ensure_node()`` yet see no ``npx`` here and wrongly conclude no launcher.
+
     Returns ``None`` when no launcher is resolvable (e.g. Node/npm absent),
     so callers can fail gracefully rather than spawning a missing binary.
     """
@@ -991,14 +1057,14 @@ def _resolve_playwright_cmd() -> str | None:
     if override:
         return override
     for binary in ("mcp-server-playwright", "playwright-mcp"):
-        found = shutil.which(binary)
+        found = shutil.which(binary, path=search_path)
         if found:
             return found
     # Return the RESOLVED path, never the bare name: on Windows npx ships only
     # as ``npx.CMD`` and CreateProcess does not apply PATHEXT, so spawning the
     # literal "npx" raises FileNotFoundError even though PATHEXT-aware
     # shutil.which found it.
-    npx = shutil.which("npx")
+    npx = shutil.which("npx", path=search_path)
     if npx:
         return npx
     return None
@@ -1006,6 +1072,104 @@ def _resolve_playwright_cmd() -> str | None:
 
 def run_proxy(args: list[str]) -> None:
     """Main proxy loop."""
+    # Augment PATH with the Node toolchain dirs BEFORE resolving, and export it to
+    # every child. The gateway spawns this proxy with its own inherited PATH, which
+    # on a marker-bootstrapped host (Node installed by ensure-node.sh, recorded in
+    # the node-bin-dir marker, NOT written into os.environ["PATH"]) lacks npx. Setup
+    # resolves the launcher on exactly this augmented PATH, so without matching it
+    # here setup would detect npx and skip priming while the runtime proxy then
+    # can't find npx to launch — the "setup and runtime resolve from different
+    # PATHs" split. Aligning them is what keeps enable and launch consistent.
+    from kiro_crew.env import node_augmented_path
+
+    os.environ["PATH"] = node_augmented_path(os.environ.get("PATH", ""))
+
+    # Self-heal a stale config BEFORE handing it to @playwright/mcp: a
+    # contextOptions.storageState pointing at a missing file makes Playwright
+    # raise ENOENT at context creation, breaking every browser_* call (#2491).
+    # This spawn is the config's load moment — the one place every config-mode
+    # launch passes through — so repairing here (the helper drops the dangling
+    # key and rewrites the file to disk) closes the trap for configs written
+    # before the #2209 generation-time fix or whose storage-state file was
+    # later removed. No-config (extension-mode) launches skip this entirely.
+    # Both argv shapes @playwright/mcp accepts are matched: ``--config <path>``
+    # and ``--config=<path>``.
+    config_arg: str | None = None
+    for i, arg in enumerate(args):
+        if arg == "--config" and i + 1 < len(args):
+            config_arg = args[i + 1]
+            break
+        if arg.startswith("--config="):
+            config_arg = arg.split("=", 1)[1]
+            break
+    if config_arg:
+        # circular import: browser.setup imports from THIS module at its
+        # top level, so import at call time (once per proxy spawn, not hot).
+        from kiro_crew.browser.setup import repair_playwright_config
+
+        repair_playwright_config(config_arg)
+
+    # Runtime compatibility probe: on Linux with CUPS <2.5, the default
+    # Chromium revision crashes at load time (hard ippValidateAttributes dep).
+    # Inject --executable-path pointing at a compatible older revision when:
+    #   (a) the user hasn't already specified --executable-path,
+    #   (b) the effective browser is Chromium (checked via CLI flags AND config).
+    # This is the sole compatibility seam — the config stays declarative
+    # (channel: chromium) and this per-spawn probe self-heals without persisting
+    # stale paths. (#2894)
+    if not any(a == "--executable-path" or a.startswith("--executable-path=")
+               for a in args):
+        _should_probe = True
+        # Skip when the CLI explicitly selects a non-Chromium browser or
+        # extension mode — injecting a Chromium binary into a Firefox/WebKit
+        # launch would crash. Recognizes both --flag value and --flag=value.
+        _cli_browser: str | None = None
+        for _i, _a in enumerate(args):
+            if _a == "--browser" and _i + 1 < len(args):
+                _cli_browser = args[_i + 1]
+            elif _a.startswith("--browser="):
+                _cli_browser = _a.split("=", 1)[1]
+            elif _a == "--executable-path" or _a.startswith("--executable-path="):
+                _should_probe = False
+            elif _a == "--extension":
+                _should_probe = False
+        if _cli_browser and _cli_browser not in ("chrome", "chromium"):
+            _should_probe = False
+        _has_cli_browser = _cli_browser is not None
+        # Check the config's browserName when no CLI --browser override is
+        # present. Guard: refuse sensitive paths before reading (mirrors the
+        # guard in repair_playwright_config above, but applied independently
+        # so a refused repair does not leak into this read path).
+        if _should_probe and config_arg and not _has_cli_browser:
+            try:
+                from kiro_crew.security import is_sensitive_path
+
+                if is_sensitive_path(config_arg):
+                    pass  # Skip config read; probe anyway (Chromium default).
+                else:
+                    _cfg = json.loads(
+                        open(config_arg, encoding="utf-8").read()
+                    )
+                    _engine = _cfg.get("browser", {}).get(
+                        "browserName", "chromium"
+                    )
+                    if _engine != "chromium":
+                        _should_probe = False
+            except Exception:
+                pass  # Unreadable config — probe anyway (fail-safe).
+        if _should_probe:
+            try:
+                # Circular import: browser.setup imports from THIS module at
+                # top level, so the import is deferred to call time (once per
+                # proxy spawn, not hot).
+                from kiro_crew.browser.setup import _find_compatible_chromium
+
+                compat = _find_compatible_chromium()
+                if compat:
+                    args = ["--executable-path", compat] + args
+            except Exception:
+                pass  # Probe failure is non-fatal; fall through to default.
+
     playwright_cmd = _resolve_playwright_cmd()
     if playwright_cmd is None:
         error_resp = {
@@ -1022,12 +1186,36 @@ def run_proxy(args: list[str]) -> None:
         }
         _write_message(sys.stdout.buffer, error_resp)
         sys.exit(1)
+    spawn_env = dict(os.environ)
     if playwright_cmd.endswith(".js"):
         cmd = ["node", playwright_cmd] + args
-    elif os.path.splitext(os.path.basename(playwright_cmd))[0].lower() == "npx":
-        # Extension-insensitive: the resolved launcher is ``npx.CMD`` on Windows
-        # and bare ``npx`` on POSIX; both must still get the @playwright/mcp arg.
-        cmd = [playwright_cmd, "@playwright/mcp"] + args
+    elif _is_npx_launcher(playwright_cmd):
+        # npx fetches the package on first use. ``--yes`` suppresses the install
+        # prompt (an npx flag, so it precedes the package spec). Launch the EXACT
+        # version the enable-time prime recorded, falling back to ``@latest`` when
+        # none is pinned: a pinned version resolves from the warm cache with no
+        # registry round-trip (so an offline launch works) and can't drift past the
+        # browser revision provisioned at enable time. The PUBLIC-registry pin rides
+        # ONLY on ``npm_config_registry`` in the child env — not an argv flag: npx
+        # option support varies by version and any flag after the package spec is
+        # forwarded to @playwright/mcp instead, whereas the env var is honored by
+        # npm/npx on every version and OS. This is what stops a private/stale-token
+        # default ``.npmrc`` from 401-ing this public package.
+        # circular import: browser.setup imports PUBLIC_NPM_REGISTRY / _is_npx_launcher
+        # / _resolve_playwright_cmd from THIS module at its top level, so importing it
+        # at module scope here would be a cycle. Deferred to call time (this runs once
+        # per proxy spawn, not hot) — same reason config.paths is imported lazily above.
+        from kiro_crew.browser.setup import get_pinned_playwright_version
+
+        pinned = get_pinned_playwright_version()
+        spec = f"@playwright/mcp@{pinned}" if pinned else "@playwright/mcp@latest"
+        cmd = [playwright_cmd, "--yes", spec] + args
+        spawn_env["npm_config_registry"] = PUBLIC_NPM_REGISTRY
+        # prefer-offline: when the pinned version is already in the npx cache, launch
+        # it WITHOUT a registry round-trip (so an offline host still starts); npx only
+        # reaches the network when the version is genuinely absent. npm config, so it
+        # rides the env var cross-platform like the registry pin above.
+        spawn_env["npm_config_prefer_offline"] = "true"
     else:
         cmd = [playwright_cmd] + args
 
@@ -1037,7 +1225,7 @@ def run_proxy(args: list[str]) -> None:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
-            env=os.environ,
+            env=spawn_env,
         )
     except (OSError, FileNotFoundError) as exc:
         error_resp = {

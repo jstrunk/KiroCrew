@@ -137,7 +137,17 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
-        "acp/runtime.py::_get_rss_tree_mb",
+        # _get_rss_tree_mb is deliberately NOT listed: its own spawn moved into
+        # _ps_process_table below, so an entry for it would be stale and would
+        # mask a future regression that put a spawn back inline.
+        #
+        # Whole-machine process-table snapshot behind _get_rss_tree_mb's macOS
+        # branch, extracted so N pids share ONE walk. Same trust profile as
+        # _get_rss_mb above: one fixed argv (`ps -Ao pid=,ppid=,rss=`) with a 2s
+        # timeout, no shell, no cwd, and no arguments at all — nothing here is
+        # agent-influenced, and the binary is resolved through
+        # platform_compat.trusted_system_bin (a vetted absolute path), not PATH.
+        "acp/runtime.py::_ps_process_table",
         # Console-entry self-heal for stale editable installs: ONE fixed
         # `python -m pip install -e <repo>` argv, no shell. The repo path is
         # derived from the module's own __file__ (never user/agent input) and
@@ -155,19 +165,47 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # every mocked-git test passed.
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::_git",
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::setUp",
-        # Syntax-checks the auth recipe the SOPs hand to an agent, via `bash -n` on the
-        # extracted code block. Fixed argv, no shell, input piped on stdin and never
-        # executed. The snippet contains `${URL%%\?*}`, whose backslash is easy to
-        # mangle when editing markdown, and a recipe that will not parse sends the cron
-        # agent back to improvising — which is the failure this whole test exists for.
-        "apps/builtins/ops_mission_control/tests/test_config_routes.py"
-        "::test_the_auth_recipe_is_runnable_shell",
         # Diagnostics support-bundle version probe: fixed argv
         # ``["kiro-cli", "--version"]`` with a 5s timeout, no shell, no cwd, and
         # no agent-influenced args — it only stamps the collected kiro-cli
         # version into versions.txt. The binary name is a module constant; a
         # resource ceiling / sandbox adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
+        # Tailnet origin derivation + forwarded-peer whois (RFC:
+        # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
+        # "status", "--json"]`` or ``["<tailscale>", "whois", "--json",
+        # <validated tailnet address>]`` — with a 3s timeout,
+        # no shell and no cwd. The binary is resolved from a vetted absolute
+        # allowlist (``_CLI_CANDIDATE_PATHS``) and NOT from ``PATH`` — a ``PATH``
+        # lookup made the executable itself agent-selectable even though the
+        # arguments never were, since ``~/.local/bin`` is both on ``PATH`` and
+        # agent-writable. The child also gets ``sandbox.scrub_env()`` rather than
+        # the inherited environment. Deliberately NOT routed through
+        # ``sandboxed_spawn_argv``: this is a read-only query of the local daemon
+        # on the dashboard's startup path, and the module's load-bearing property
+        # is that *nothing raises* so the gateway still boots on a host with no
+        # Tailscale. Routing it would make dashboard startup depend on sandbox
+        # availability, which is exactly the failure that property rules out.
+        "dashboard/tailnet.py::_run_json_detail",
+        # Tailnet publish/withdraw (same RFC): three fixed argv shapes —
+        # ``serve status --json``, ``serve --bg --https=443 http://127.0.0.1:<port>``
+        # and ``serve --https 443 off``. The only interpolated value is the
+        # dashboard's own port, read from config and rendered as an int. Same
+        # hardening as the read path and for the same reasons: the binary comes
+        # from ``_cli_path``'s vetted absolute allowlist and never from ``PATH``,
+        # and the child gets ``sandbox.scrub_env()`` instead of the gateway's
+        # environment — both shared with ``tailnet.py`` by import rather than
+        # copied, so the two cannot drift apart.
+        #
+        # Deliberately NOT routed through ``sandboxed_spawn_argv``: the whole
+        # purpose of the call is to mutate the LOCAL Tailscale daemon's serve
+        # configuration through its unix socket, which is precisely the ambient
+        # authority a sandbox exists to remove. A routed call would either fail
+        # or need the socket handed back in, which is the sandbox in name only.
+        # This is an operator-initiated action, gated on the
+        # ``capabilities.tailnet_origin`` ceiling at the enforcement call, and
+        # never reached from a tool dispatch path.
+        "dashboard/tailnet_serve.py::_run",
         "apps/backend.py::_proc_start_time",
         "apps/backend.py::_resolve_nvm_path",
         "apps/backend.py::stop_app_backend",
@@ -179,31 +217,237 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # scrubbed that capability would break the feature it is guarding. Gated
         # behind KIROCREW_DEBUG and reachable only from the CLI.
         "cli_perf.py::_sample_out_of_process",
-        # gh-CLI open-PR enumeration: fixed `gh api` list-argv (no shell=True);
-        # owner/repo are validated to ^[A-Za-z0-9._-]+$ by adapters.parse_repo_url
-        # and only fill the API path (bounded to api.github.com). NOT sandboxed
-        # because gh needs the host's own authenticated credentials.
-        "apps/builtins/code_review_sage/sage_lib/pipeline.py::list_open_prs",
-        # Issue Radar GitHub access — same rationale as list_open_prs above.
-        # ALL gh calls funnel through ONE chokepoint, _gh_run: a fixed `gh api`
-        # list-argv (never shell=True). gh supplies the host's OWN authenticated
-        # token, so it CANNOT be sandbox-routed (the sandbox would hide
-        # ~/.config/gh + the keychain, breaking auth). As defense-in-depth WITHIN
-        # this benign classification, _gh_run resolves a trusted canonical `gh`
-        # (never a shim on the agent-writable front of PATH) and passes a MINIMAL
-        # env (PATH/HOME/XDG + gh's own auth/network vars), so unrelated secrets
-        # (AWS/Slack/SSH) never reach the child. The only agent-reachable inputs:
-        #   • owner/repo — validated to ^[A-Za-z0-9._-]+$ + a github.com host
-        #     allowlist by github_client.parse_github_repo_url at /connect, and
-        #     read routes additionally gate on store.is_repo_connected, so only
-        #     an already-validated pair ever reaches the argv;
-        #   • the issue number — coerced via int() before it reaches the path;
-        #   • write bodies (label names / state reasons) — sent as a JSON stdin
-        #     body (--input -), never argv; the DELETE label name is URL-encoded
-        #     into the path.
-        # The jq filters are hardcoded module constants, and `gh api` is bounded
-        # to api.github.com, so no binary/cwd/host is agent-selected.
-        "apps/builtins/issue_radar/backend/github_client.py::_gh_run",
+        # The SINGLE shared gh spawn chokepoint (github_runner.run_gh), serving
+        # Issue Radar (`_gh_run`), Code Review Sage (`run_gh_json`,
+        # `current_login`, `pipeline.list_open_prs`), and any future gh caller.
+        # A fixed `gh api`-style LIST argv (never shell=True): owner/repo
+        # segments are charset-validated (^[A-Za-z0-9._-]+$) plus a github.com
+        # host allowlist by parse_github_repo_url / adapters.parse_repo_ref
+        # before they ever reach the argv; issue numbers are int()-coerced;
+        # write bodies travel as JSON stdin (--input -), never argv; jq filters
+        # are hardcoded module constants. NOT sandbox-routed because gh needs
+        # the host's OWN authenticated session (~/.config/gh + the keychain),
+        # which the sandbox would hide, breaking auth. As defense-in-depth
+        # WITHIN this benign classification, run_gh refuses a non-absolute
+        # argv[0] (binding callers to the validated resolve_gh path, never a
+        # shim on the agent-writable front of PATH), passes a MINIMAL env
+        # (safe-key base + gh's own auth/network/TLS vars — no AWS/Slack/SSH
+        # secrets), and emits an SEL audit event on success/failure/timeout.
+        "github_runner.py::run_gh",
+        # TEST-ONLY: spawns `sys.executable -c <literal>` to prove the candidate
+        # read-modify-write lock holds across PROCESSES, which is what review
+        # workers actually are. A single-process test cannot observe the loss it
+        # covers. Fixed argv, no shell=True, no model-derived input -- the only
+        # variables are a tmpdir path and a loop index.
+        "apps/builtins/code_review_sage/tests/test_learning.py::test_concurrent_processes_both_land",
+        # auto-improvement: fixed `git`/`gh`/`ruff` argv against the OPERATOR-chosen
+        # repository. Same class as code_reviewer/git.py and issue_radar's gh/glab
+        # spawns: the repo is selected by the operator through the Connect endpoint,
+        # and `clone`/`target_url` are deliberately EXCLUDED from the config PUT
+        # allowlist precisely so the agent cannot retarget them. No shell=True, no
+        # argv[0] from model output. The agent's own edits happen inside a throwaway
+        # worktree of a push-disabled clone, which is where its blast radius is
+        # contained; these calls are the harness around it, not the agent's hands.
+        "apps/builtins/auto_improvement/backend/clone_setup.py::_disable_push",
+        "apps/builtins/auto_improvement/backend/clone_setup.py::_gh_prefers_ssh",
+        "apps/builtins/auto_improvement/backend/clone_setup.py::_ok",
+        "apps/builtins/auto_improvement/backend/clone_setup.py::_run",
+        "apps/builtins/auto_improvement/backend/clone_setup.py::list_clone_branches",
+        "apps/builtins/auto_improvement/backend/clone_setup.py::setup_safe_clone",
+        # NOT subprocess spawns: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``), used here only to drive the async
+        # ``SessionAgentRunner._approve`` coroutine from a synchronous test. No child
+        # process is created — the test's provider is a local stub with no argv at all.
+        # Same classification as the ``asyncio.run`` sites above
+        # (cli_commands.py::_cleanup_app_crons_from_scheduler, cli_doctor.py::_doctor).
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_approval_is_logged_then_granted",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_audit_failure_denies_instead_of_approving",
+        # A FIXED argv of `[sys.executable, "-c", <literal>]` — the interpreter running the
+        # test plus a constant source string with no interpolation, so neither the command
+        # nor its args are agent-influenced. The child only imports a module and prints
+        # whether a second module ended up in `sys.modules`; a clean interpreter is the
+        # point, since measuring "does the boot path pull the profile tree?" inside the test
+        # session would read whatever pytest already imported.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_importing_the_backend_does_not_pull_the_profile_tree",
+        "apps/builtins/auto_improvement/backend/commit.py::_git",
+        # `git apply --index` on the QUEUED diff, literal argv against the configured clone.
+        # Was keyed to `commit_finding` until the checkout+apply block was extracted here so
+        # the draft-PR route could reuse it (the detector keys by the ENCLOSING function).
+        "apps/builtins/auto_improvement/backend/commit.py::materialize_queued_diff",
+        "apps/builtins/auto_improvement/backend/deps.py::_gh_authenticated",
+        "apps/builtins/auto_improvement/backend/deps.py::install_deps",
+        "apps/builtins/auto_improvement/backend/pr_watchers.py::_gh",
+        "apps/builtins/auto_improvement/backend/pr_watchers.py::_git",
+        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_gh_prefers_ssh",
+        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_git",
+        # Fixed `git rev-parse --verify` argv (shell=False) against the OPERATOR-chosen
+        # clone, asking whether the operator's `scopeDiffBase` resolves. The ref comes from
+        # config (`_CONFIG_WRITABLE`), not from the agent, and it is passed as one argv
+        # element — same class as the clone_setup git spawns above.
+        # Its test's fixture: literal `git init/add/commit` against a tmp_path repo.
+        "apps/builtins/auto_improvement/tests/test_suite_scope.py::_repo",
+        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::draft",
+        # Spine git plumbing: fixed argv (worktree add/remove, diff, rev-parse, status,
+        # commit, push) against paths the SPINE derives — a worktree root it created and
+        # a branch the operator authorized. The agent never supplies a path or a flag
+        # here; it only edits FILES inside the worktree, and executing those files is
+        # routed separately (profiles/github_repo/profile.py::_run).
+        "apps/builtins/auto_improvement/spine/agent_discovery.py::_git",
+        "apps/builtins/auto_improvement/spine/driver.py::_apply",
+        "apps/builtins/auto_improvement/spine/driver.py::_stage_winner",
+        "apps/builtins/auto_improvement/spine/driver.py::_git",
+        "apps/builtins/auto_improvement/spine/driver.py::_push_with_rebase",
+        "apps/builtins/auto_improvement/spine/gate.py::_changed_paths",
+        "apps/builtins/auto_improvement/spine/gate.py::_changed_status_paths",
+        "apps/builtins/auto_improvement/spine/gate.py::_head_sha",
+        # `git show <base_sha>:<path>` via the hardened `_git_argv` builder — read-only, literal
+        # argv over the ORIGINAL worktree, same class as the three gate helpers above. It was
+        # always a subprocess spawn; a cleanup that replaced a function-local `import subprocess
+        # as _sp` alias with the module-level `subprocess` is what made the AST scanner finally
+        # SEE it (the alias hid it). Not agent-influenced: `base_sha` is a resolved sha and `p`
+        # is a repo-relative path from the diff.
+        "apps/builtins/auto_improvement/spine/gate.py::_stage_test_only_base",
+        "apps/builtins/auto_improvement/spine/proposer.py::_capture_diff",
+        "apps/builtins/auto_improvement/spine/proposer.py::_git",
+        # The agent runner spawns the CLAUDE CLI itself (argv[0] from a module constant,
+        # never from model output). ``run`` IS now routed through
+        # ``sandboxed_spawn_argv`` — it launches an agent with
+        # ``--dangerously-skip-permissions``, so hiding the operator's credential dirs
+        # while keeping the worktree visible is exactly the right layer, and review of
+        # the auto-improvement PR asked for it. These two remain listed because the
+        # detector attributes the spawn to the enclosing prompt-authoring helpers as
+        # well, and those do not spawn anything themselves.
+        "apps/builtins/auto_improvement/spine/agent_runner.py::author_bug_fix",
+        "apps/builtins/auto_improvement/spine/agent_runner.py::author_perf_fix",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr ``run``
+        # on base ``asyncio``) in ``SessionAgentRunner.run``, which drives the in-process
+        # provider and creates no child at all. Same classification as the other
+        # ``asyncio.run`` sites above. The key is ``::run`` because this module has TWO
+        # ``run`` methods and the detector keys by name — which is exactly why the REAL
+        # spawn lives in the uniquely-named ``_spawn_sandboxed_agent`` (routed through
+        # ``sandboxed_spawn_argv``), so it can never be masked by this entry.
+        "apps/builtins/auto_improvement/spine/agent_runner.py::run",
+        # Test harnesses: fixed `git init/add/commit` argv against pytest tmp_path
+        # fixtures. Nothing agent-influenced, and these are tests rather than shipped
+        # code — same basis as the ops-mission-control ledger-sync test entries.
+        "apps/builtins/auto_improvement/tests/test_agent_discovery_focus.py::_git",
+        "apps/builtins/auto_improvement/tests/test_github_profile.py::test_push_disabled_reads_the_sentinel",
+        "apps/builtins/auto_improvement/tests/test_perf_track_propose.py::_git",
+        "apps/builtins/auto_improvement/tests/test_pr_watchers.py::_git",
+        # Same basis: a fixed `git init/config/add/commit` argv against a tmp_path, building
+        # a repo that holds a real binary blob to prove host-side `git` decodes its output
+        # leniently (D-142) — a strict decode killed the watcher on any repo with a PNG.
+        "apps/builtins/auto_improvement/tests/test_pr_watchers.py::_repo_with_binary",
+        # Same basis: a fixed `git init` + `git diff no-such-branch..HEAD` against a
+        # tmp_path, asserting that a failed diff really does exit non-zero with empty
+        # stdout — the premise the direct-push credential gate's guard rests on.
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
+        "::test_a_failed_git_diff_really_does_exit_nonzero_with_empty_stdout",
+        # Same basis: a fixed bare-repo + clone + push against a tmp_path, proving the
+        # push-disabled clone cannot reach the remote by NAME or by its fetch url.
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
+        "::test_both_urls_are_neutralized_and_neither_push_route_works",
+        # Same basis: the POSITIVE half — a trusted publisher holding the config-carried
+        # url still lands its one generated ref against a tmp_path bare repo.
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
+        "::test_a_recipe_holding_the_config_url_can_still_push",
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
+        "::test_without_the_config_url_the_neutralized_clone_degrades_to_the_queue",
+        # Same basis: a fixed `git init/add/commit` against a tmp_path, asserting a diff
+        # that cannot apply is refused BEFORE the pipeline drafts.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_diff_that_does_not_apply_never_reaches_the_pipeline",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr ``run`` on
+        # base ``asyncio``), used to drive the async ``_approve`` coroutine so a REAL SEL
+        # write can be read back off disk. No child process is created.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_real_sel_write_produces_a_readable_event",
+        # Same basis: a fixed `git init --bare` + clone + push against a tmp_path, driving
+        # one-click commit end to end in a clone whose origin is neutralized exactly as
+        # production leaves it. Nothing here is agent-influenced — the argv is literal, the
+        # cwd is the test's own tmp_path, and the "remote" is a local bare repo. This is
+        # the test that proves `commit_finding` can still fetch its base after
+        # `_disable_push`; the bug it pins was invisible to every mocked test.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::_git",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py" "::_upstream_and_clone",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_stale_local_ref_is_not_used_when_a_url_is_configured",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_the_queued_diff_is_committed_and_pushed",
+        # Same basis: a fixed bare-repo + clone against a tmp_path, asserting that a
+        # non-default branch is really checked out inside a push-disabled clone (the run
+        # was silently measuring the DEFAULT branch). Literal argv, test-owned cwd.
+        # Only the functions that CONTAIN a spawn are listed: the detector keys by the
+        # enclosing function, so a test that merely calls these helpers is not a spawn
+        # site and the staleness check rejects it as a masking entry.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_remote_only_branch_is_checked_out_without_a_fetch",
+        # Multi-cycle staging test: literal `git` argv against a tmp_path bare repo,
+        # asserting cycle-2's checkout does not orphan cycle-1's kept commit.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_staging_stays_on_the_local_branch_across_cycles",
+        # Its inner `git` helper: literal argv against the tmp_path bare repo above.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::git",
+        # The provisional-commit fail-closed test spawns `git rev-parse HEAD` inline (not
+        # via a helper) to assert HEAD did not move; literal argv against a tmp_path repo.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_failing_commit_returns_false_not_true",
+        # Same basis: `git status --porcelain` inline against a tmp_path repo, asserting a
+        # REJECTED provisional commit left nothing staged for the next candidate to inherit.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_rejected_commit_leaves_no_diff_staged_for_the_next_candidate",
+        # Same basis: literal `git show`/`ls-tree` against a tmp_path bare repo + clone,
+        # asserting a manual draft stages ITS queued diff instead of publishing whatever a
+        # later cycle left at HEAD.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_drafting_an_older_finding_does_not_publish_a_later_one",
+        # Same basis: literal `git rev-parse`/`status` against a tmp_path clone, asserting a
+        # failed draft's rollback restores the branch to the base it was fetched at.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_rollback_restores_the_branch_to_its_fetched_base",
+        # Same basis: literal `git rev-parse` against a tmp_path clone, asserting a REJECTED
+        # push leaves no commit on the branch for the next run to adopt as its baseline.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_failed_push_leaves_no_commit_behind",
+        # Same basis: literal `git clone`/`log`/`show` against a tmp_path bare repo, asserting
+        # two concurrent operator commits never merge into one commit.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_two_concurrent_commits_do_not_merge_into_one",
+        # Its inner `_repo` helper: fixed `git init/clone/commit/push` argv against a tmp_path
+        # bare repo, building the local-vs-remote base case for the credential-scan self-diff.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::_repo",
+        # Same basis: literal `git rev-parse`/`diff`/`reset` against a tmp_path repo, showing a
+        # left-behind provisional commit lands in the NEXT bug PR's range.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_a_chained_head_would_contaminate_the_next_branch",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py" "::_disabled_clone",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::_remote_with_two_branches",
+        # Same basis: a fixed `git init/add/commit` + an uncommitted edit against a tmp_path
+        # repo, proving `_export_is_durable` retains a clone that holds UNCOMMITTED work (an
+        # empty committed diff over a dirty tree is not "no work"). Literal argv, test-owned
+        # cwd, dead origin — nothing agent-influenced. `_run` is the test's inline git helper;
+        # the test function itself also spawns `git init/add/commit` directly.
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::_run",
+        "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
+        "::test_end_to_end_uncommitted_work_survives_teardown",
+        # Same basis: fixed bare-repo + clone + push against a tmp_path, asserting the
+        # CONTENT that reached the remote branch (a committed fix does, a staged one does
+        # not) — the end-to-end property behind the keep/draft ordering invariant.
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py::_repo",
+        # Its inner `git` helper: literal argv against a tmp_path repo, asserting the
+        # driver's direct-push scan RANGE (HEAD~1..HEAD) actually contains the commit.
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py::git",
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
+        "::test_a_committed_fix_reaches_the_pushed_branch",
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
+        "::test_a_merely_staged_fix_would_not_reach_it",
+        "apps/builtins/auto_improvement/tests/test_profile_capture.py::_git",
+        "apps/builtins/auto_improvement/tests/test_runner.py::_git",
+        "apps/builtins/auto_improvement/tests/test_runner.py::_tiny_repo",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``). This is a TEST helper that drives one
         # in-process aiohttp handler coroutine to completion so the PR-action routes
@@ -281,13 +525,39 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # git rev-parse at startup, no agent input, no sandbox needed).
         "apps/builtins/dev_fleet/server.py::_resolve_primary_checkout",
         "apps/builtins/dev_fleet/server.py::worker",
+        # Foreground last-resort restart (Make Live on hosts with no drivable
+        # service manager): a detached `kirocrew restart --port <marker port>`,
+        # fixed argv whose binary is validated (basenamed kirocrew, absolute,
+        # executable) from the gateway's own keystone-fenced run-marker or
+        # shutil.which — never agent input. Deliberately NOT sandboxed for the
+        # same reason as cli_server.py::_spawn_detached_gateway above: the child
+        # must outlive and REPLACE the gateway (kill + respawn + own session),
+        # which a scoped/sandboxed child cannot do.
+        "apps/builtins/dev_fleet/gateway_service.py::default_detached_spawn",
         # (apps/dependencies.py::_run_aim removed — App Kit capability deps now
         # resolve through the CapabilityManager seam, so the resolver spawns no
         # subprocess at all and needs no allowlist entry.)
+        # Browser Mode setup/install path, run only from the dashboard settings
+        # save (off the event loop) or the `kirocrew browse setup` CLI. Fixed
+        # argv of trusted node-toolchain tools resolved via find_node_tool
+        # (npm/npx/node) plus the ``playwright install <engine>`` subcommand,
+        # where ``engine`` is validated against the fixed BROWSER_ENGINES
+        # allowlist before it can reach argv — never free agent input. Mirrors
+        # cli.py::_ensure_node / env.py::_run below, which shell the same
+        # node/ensure-node toolchain and are benign for the same reason.
+        # ``_npx_cache_playwright_roots`` runs the fixed ``npm config get cache``.
+        # ``_chromium_needs_cups_symbol`` runs ``nm -D <binary>`` on a Playwright-
+        # managed Chromium binary to probe symbol binding — fixed argv, no agent
+        # input, read-only inspection of a local file.
+        "browser/setup.py::_chromium_needs_cups_symbol",
+        "browser/setup.py::_npx_cache_playwright_roots",
+        "browser/setup.py::_resolve_playwright_core_cli",
+        "browser/setup.py::_run",
         "cli.py::_consolidate_cmd",
         "cli.py::_ensure_node",
         "cli.py::_node_ok",
         "cli.py::main",
+        "cli_chat.py::_run_chat",
         "cli_chat.py::_tui",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``), here used only to drive the now-async
@@ -297,8 +567,19 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # ``asyncio.run`` sites below (cli_doctor.py::_doctor, workflows
         # server.py::handle_run).
         "cli_commands.py::_cleanup_app_crons_from_scheduler",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``), used to drive the async
+        # ``register_app_crons_with_service`` coroutine from the loop-less CLI
+        # enable path — the exact enable-direction mirror of
+        # ``_cleanup_app_crons_from_scheduler`` above. No child process is
+        # created; the sole input is the operator-typed app name.
+        "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
         "cli_doctor.py::_doctor_mcp_tools",
+        # ``systemctl is-active <unit>`` probes for the memory-pressure
+        # preparedness check: argv is hardcoded (systemd-oomd/earlyoom unit
+        # names), no agent influence, 5s-capped, read-only query.
+        "cli_doctor.py::_detect_userspace_oom_killer",
         # Read-only diagnostic: `loginctl show-user <user> -p Linger --value`,
         # a fixed argv whose only variable is the invoking account name taken
         # from $USER/$LOGNAME (never agent-supplied). Same class as
@@ -309,6 +590,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_server.py::_logs_cmd",
         "cli_server.py::_spawn_detached_gateway",
         "cli_server.py::_update",
+        "cli_server.py::_update_wheel",
         "cli_setup.py::_setup_electron",
         # Cursor Motion overlay renderer: `<this interpreter> -m
         # kiro_crew.computer_use.overlay_proc`, a fixed argv built from
@@ -381,10 +663,21 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "dashboard/handlers/updates.py::_venv_pip_install",
         "dashboard/handlers/updates.py::api_update_apply",
         "dashboard/handlers_system.py::_collect_system_metrics",
+        # Split out of _collect_system_metrics above so the whole-machine process
+        # walk can be cached on its own (much longer) TTL instead of the live
+        # graph's. Identical trust profile to its former enclosing function,
+        # which is still listed: one fixed argv (`ps -eo pid,command`) with a 5s
+        # timeout, no shell, no cwd, no agent-influenced arguments.
+        "dashboard/handlers_system.py::_scan_mcp_processes",
         "dashboard/handlers_system.py::_get_static_system_info",
         "dashboard/port_reclaim.py::_listeners_on_port",
         "env.py::_run",
         "env.py::activate_mise",
+        # Node bootstrap: runs the bundled ``ensure-node.sh`` (a fixed `bash
+        # <script>` argv, script path derived from KIROCREW_PROJECT_DIR / the
+        # module's own location, never agent input) when no node resolves. Same
+        # class as cli.py::_ensure_node, which invokes the identical script.
+        "env.py::ensure_node",
         # Fixed argv (`npm run build`) in the operator's own checkout. The npm
         # binary and project path arrive from the caller: the Dev Fleet sync
         # resolves npm via its trusted-bin allowlist and the path from the
@@ -477,7 +770,11 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "session_pid.py::kill_orphan_mcps",
         "slack/gateway.py::_auto_apply_update",
         "slack/gateway.py::_check_missing_deps",
-        "slack/gateway.py::_init_services",
+        # The kiro-cli version probe, extracted from _init_services (issue
+        # #3051). Fixed argv ("kiro-cli --version"), no agent-influenced
+        # input; sandboxing the probe would be circular for the same reason
+        # as the other boot-time self-checks above.
+        "slack/gateway.py::_warn_if_kiro_cli_outdated",
         "testing/harness.py::spawn_feature_gateway",
         # Apple on-device speech (macOS only). None of these takes an agent-authored
         # command: the argv is a fixed toolchain path, the helper Kiro Crew itself
@@ -526,6 +823,105 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "voice_reply.py::stitch_mp3s",
     }
 )
+
+
+# First-party fixed-argv spawn sites: every call site in ``src/kiro_crew`` that
+# passes the ``first_party_fixed_argv`` keyword into the sandbox chokepoint
+# (``sandboxed_spawn_argv`` / ``wrap_argv``). The flag buys an UNCONFINED spawn
+# on a backend-less host (issue #1563 carve-out), so "first-party" must be a
+# reviewed property, not a copy-pasteable kwarg: a new site must be added here
+# WITH a justification proving the full argv is derived inside this package
+# with zero agent/repo/user-config influence. Keyed by
+# ``<relpath>::<enclosing function>``, same discipline as ``BENIGN_SPAWNS``.
+FIRST_PARTY_SPAWNS: frozenset[str] = frozenset(
+    {
+        # The managed-server probe. The flag value is COMPUTED, not literal:
+        # ``_is_first_party_managed_argv`` requires the spec's command+args+env
+        # to EQUAL what this package derives for the managed server
+        # (``agent._kirocrew_mcp_invocation`` + ``agent._managed_mcp_env``, the
+        # single sources of truth the specs are force-re-resolved from) — never
+        # user-config text. Env is compared because the probe merges the spec's
+        # env into the child environment and ``LD_PRELOAD`` changes what code
+        # runs for the same argv. Third-party servers and any customized
+        # managed command/args/env compare unequal, pass False, and keep the
+        # full fail-close + opt-in behavior.
+        "mcp_discovery.py::probe_server",
+    }
+)
+
+_FIRST_PARTY_KWARG = "first_party_fixed_argv"
+
+
+@functools.lru_cache(maxsize=1)
+def _collect_first_party_flag_sites() -> frozenset[str]:
+    """``<relpath>::<func>`` for every call passing the first-party kwarg.
+
+    AST-based rather than a substring scan: it matches any ``ast.Call``
+    carrying a keyword named ``first_party_fixed_argv`` REGARDLESS of the value
+    expression — a site passing a computed bool must be reviewed exactly like
+    one passing a literal ``True`` (the computation is part of the claim).
+    Like the sibling scans in this file, ``**kwargs`` indirection is out of
+    scope (an aliased spawn already hid from the spawn detector once); the
+    PR-review gates cover deliberately obfuscated passes.
+    ``sandbox.py`` is excluded by design: it OWNS the parameter (``wrap_argv``
+    defines it; ``sandboxed_spawn_argv`` threads it through), so its internal
+    forwarding is the mechanism under audit, not a spawn site.
+    """
+    out: set[str] = set()
+    for path in _SRC_ROOT.rglob("*.py"):
+        rel = path.relative_to(_SRC_ROOT).as_posix()
+        if rel == "sandbox.py" or "builtin_skills" in path.relative_to(_SRC_ROOT).parts:
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, str(path))
+        funcs = [
+            n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(kw.arg == _FIRST_PARTY_KWARG for kw in node.keywords):
+                continue
+            enc = "<module>"
+            best = -1
+            for f in funcs:
+                if f.lineno <= node.lineno <= (f.end_lineno or f.lineno) and f.lineno > best:
+                    best = f.lineno
+                    enc = f.name
+            out.add(f"{rel}::{enc}")
+    return frozenset(out)
+
+
+def test_every_first_party_spawn_is_allowlisted():
+    """A new site passing ``first_party_fixed_argv`` must be reviewed here.
+
+    The flag buys an unconfined spawn on a backend-less host, so passing it
+    from an unreviewed site is a sandbox bypass. Add the ``file::function`` key
+    to ``FIRST_PARTY_SPAWNS`` ONLY after confirming the full argv is derived
+    inside this package with zero agent/repo/user-config influence, and record
+    that reasoning in the allowlist comment.
+    """
+    unexpected = _collect_first_party_flag_sites() - FIRST_PARTY_SPAWNS
+    assert not unexpected, (
+        "New site(s) passing first_party_fixed_argv into the sandbox "
+        "chokepoint:\n  "
+        + "\n  ".join(sorted(unexpected))
+        + "\n\nThis flag permits an UNCONFINED spawn on a host with no sandbox "
+        "backend (issue #1563 carve-out). Confirm the full argv is derived "
+        "inside this package with zero agent/repo/user-config influence, then "
+        "add the file::function key to FIRST_PARTY_SPAWNS with a justification."
+    )
+
+
+def test_first_party_allowlist_has_no_stale_entries():
+    """Every FIRST_PARTY_SPAWNS entry must still name a real flag-passing site,
+    so the allowlist cannot silently accumulate dead exemptions that would mask
+    a future regression at the same key."""
+    stale = FIRST_PARTY_SPAWNS - _collect_first_party_flag_sites()
+    assert not stale, (
+        "Stale FIRST_PARTY_SPAWNS entries (no longer a first-party flag site — "
+        "remove them):\n  " + "\n  ".join(sorted(stale))
+    )
 
 
 @functools.lru_cache(maxsize=1)

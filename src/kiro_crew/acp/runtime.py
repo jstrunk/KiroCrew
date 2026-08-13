@@ -20,10 +20,11 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from kiro_crew import platform_compat
 from kiro_crew.acp._dispatch import (
@@ -33,6 +34,8 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import (
     _NOT_LOGGED_IN_RE,
+    OversizeLineUnrecoverable,
+    _drain_oversize_line,
     _get_start_time,
     _KiroExecutableTrustError,
     _resolve_kiro_bin_for_spawn,
@@ -46,6 +49,8 @@ from kiro_crew.acp.session_handle import (
 from kiro_crew.acp.types import (
     ACP_CLIENT_CAPABILITIES,
     METHOD_MCP_OAUTH_REQUEST,
+    METHOD_MCP_SERVER_INIT_FAILURE,
+    METHOD_MCP_SERVER_INITIALIZED,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
     METHOD_SESSION_TERMINATE,
@@ -59,6 +64,7 @@ from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
+from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
     cgroup_scope_argv,
@@ -89,9 +95,27 @@ __all__ = [
 
 # ── AcpRuntime ──
 
+_T = TypeVar("_T")
+
 _STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024  # 10MB
+# How many in-flight request ids to name in the oversize-frame warning. A dropped
+# frame can carry a response, and the caller then fails as an opaque
+# _send_and_await timeout — naming what was in flight at the drop makes that
+# timeout attributable instead of a mystery. Capped so the line stays bounded.
+_DROP_IDS_IN_LOG = 8
 _INIT_TIMEOUT = 30.0
 _REQUEST_TIMEOUT = 30.0
+# Session start (session/new, session/load) gets its own budget because kiro-cli
+# blocks the response while it initializes the session's MCP servers, and a
+# remote server pending OAuth holds that initialization for its FULL 30s
+# authorization wait. _REQUEST_TIMEOUT is also 30s, so sharing it turns session
+# start into a race the client usually loses: kiro-cli creates the session, the
+# client gives up a beat earlier, and the slot dies. This must stay comfortably
+# ABOVE the backend's 30s OAuth wait plus the initialization tail that follows
+# it (observed: remaining servers register within ~1s after the wait; a
+# 71-server agent with no pending OAuth completes in ~14s) — do NOT "tidy" it
+# back down to _REQUEST_TIMEOUT. See issue #2946.
+_SESSION_NEW_TIMEOUT = 90.0
 _INIT_NOTIFICATION_BUFFER_LIMIT = 100
 # Teardown must be snappy: a session is usually terminated on a hot path
 # (background task done, subagent reaped). kiro-cli's terminate handler responds
@@ -294,6 +318,90 @@ def _iter_descendant_pids(pid: int) -> list[int]:
     return order
 
 
+#: A whole-machine process table: ``(children_by_ppid, rss_kib_by_pid)``.
+_ProcessTable = tuple[dict[int, list[int]], dict[int, int]]
+
+#: How long one ``ps -A`` snapshot may be reused.
+#:
+#: This exists because the snapshot is WHOLE-MACHINE while its consumer asks
+#: per-pid. ``session_memory._blocking_sample`` samples every live runtime pid in
+#: one pass, so an uncached snapshot enumerated every process on the host once
+#: PER SESSION — 8 sessions on a host with ~150 MCP processes meant 8 full
+#: process-table walks every 5s, serialized in one worker. Measured cost on a
+#: typical Mac (875 procs): ~33ms per ``ps -Ao``, so 8 walks ≈ 272ms duty cycle
+#: per 5s poll — linear amplification that wastes a thread worker and grows with
+#: session count (macOS only: the Linux branch above uses ``/proc`` directly and
+#: never spawns anything).
+#:
+#: One second is chosen against the two consumers, not arbitrarily: the Sessions
+#: panel polls at 5s and the watchdog's RSS ceiling is a multi-GB threshold
+#: checked on a timer, so neither can tell a 1s-old measurement from a fresh
+#: one — while a sampling pass over N pids completes well inside the window and
+#: therefore pays for exactly one snapshot.
+_PS_TABLE_TTL_S = 1.0
+
+_ps_table_lock = threading.Lock()
+#: ``(monotonic_taken_at, table)``, or None before the first snapshot. A cached
+#: FAILURE is not stored — a transient ``ps`` error must not pin every caller to
+#: the single-pid fallback for a whole second.
+_ps_table_cache: tuple[float, _ProcessTable] | None = None
+
+
+def _reset_ps_table_cache() -> None:
+    """Drop the memoized process table. Test seam: the cache is keyed on wall
+    time only, so a test that fakes ``ps`` output would otherwise inherit the
+    previous test's snapshot."""
+    global _ps_table_cache
+    with _ps_table_lock:
+        _ps_table_cache = None
+
+
+def _ps_process_table() -> _ProcessTable | None:
+    """One ``ps -Ao pid=,ppid=,rss=`` snapshot as a parent map + RSS map.
+
+    Memoized for :data:`_PS_TABLE_TTL_S` so a caller that needs the tree for many
+    pids pays for ONE process-table walk rather than one per pid. Returns None
+    when ``ps`` is unavailable or fails, so callers fall back to a single-pid
+    read instead of reporting a phantom-empty tree.
+
+    The snapshot is taken under the lock rather than merely published under it:
+    concurrent first-callers would otherwise each spawn ``ps`` before any of them
+    stored a result, which is the exact amplification this cache exists to
+    remove.
+    """
+    global _ps_table_cache
+    with _ps_table_lock:
+        cached = _ps_table_cache
+        if cached is not None and (time.monotonic() - cached[0]) < _PS_TABLE_TTL_S:
+            return cached[1]
+        ps_bin = platform_compat.trusted_system_bin("ps")
+        if ps_bin is None:
+            return None
+        try:
+            out = (
+                subprocess.check_output([ps_bin, "-Ao", "pid=,ppid=,rss="], timeout=2)
+                .decode()
+                .strip()
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        children: dict[int, list[int]] = {}
+        rss_kib: dict[int, int] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                cpid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            children.setdefault(ppid, []).append(cpid)
+            rss_kib[cpid] = rss
+        table: _ProcessTable = (children, rss_kib)
+        _ps_table_cache = (time.monotonic(), table)
+        return table
+
+
 def _get_rss_tree_mb(pid: int) -> float | None:
     """Sum RSS (MiB) of *pid* and all its descendants, or None if unavailable.
 
@@ -302,8 +410,15 @@ def _get_rss_tree_mb(pid: int) -> float | None:
     launcher parent (small, stable, blocked in ``waitpid``) while the real
     kiro-cli that accumulates multi-GB RSS is a child. Measuring only
     ``self._pid`` therefore misses the growth entirely, so we sum the whole
-    descendant tree. On macOS (sandbox-exec / no launcher fork) the tree is
-    just the process itself, so the sum equals the single-process RSS.
+    descendant tree.
+
+    On macOS the tree is walked too, and it is NOT redundant: kiro-cli spawns
+    MCP-server / tool children there exactly as it does on Windows (see that
+    branch's note), so measuring only ``pid`` under-reports a session's real
+    footprint and blinds the watchdog's leak ceiling. An earlier version of this
+    docstring claimed the macOS tree "is just the process itself"; it is kept
+    corrected here because that claim is what made the per-pid whole-machine
+    snapshot look free.
     """
     if sys.platform == "linux":
         total = 0.0
@@ -316,56 +431,26 @@ def _get_rss_tree_mb(pid: int) -> float | None:
         return total if found else None
 
     if platform_compat.IS_WINDOWS:
-        # Walk the Toolhelp parent map (the same snapshot descendant tracking
-        # uses) to find the subtree rooted at pid, then sum each process's RSS
-        # via the shim. Windows spawns kiro-cli without a launcher fork, but the
-        # tree still covers any MCP-server / tool children it spawns.
-        try:
-            parent_map = platform_compat._windows_process_parent_map()
-        except Exception:
-            return _get_rss_mb(pid)
-        win_children: dict[int, list[int]] = {}
-        for cpid, ppid in parent_map.items():
-            win_children.setdefault(ppid, []).append(cpid)
-        total_mb = 0.0
-        found = False
-        win_visited: set[int] = set()
-        stack = [pid]
-        while stack:
-            p = stack.pop()
-            if p in win_visited:
-                continue
-            win_visited.add(p)
-            r = _get_rss_mb(p)
-            if r is not None:
-                total_mb += r
-                found = True
-            stack.extend(win_children.get(p, ()))
-        return total_mb if found else None
+        # Windows spawns kiro-cli WITHOUT a launcher fork, but it still spawns
+        # MCP-server / tool children that can leak. Sum the tree via
+        # proc_rss_tree_mb_for_pid, which enumerates descendants through
+        # descendant_termination_handles — the lineage-VALIDATED walk (exact
+        # creation/exit-time edge checks across two snapshots). A raw Toolhelp
+        # parent-map walk is unsafe here: th32ParentProcessID is never cleared
+        # when a parent dies and Windows recycles PIDs, so it would sum unrelated
+        # subtrees rooted at a recycled PID into a kill/health decision. The
+        # validated walk always counts the root, so an unreadable descendant
+        # (another session / higher integrity) narrows the total rather than
+        # producing a phantom-low tree attached to a recycled root.
+        return platform_compat.proc_rss_tree_mb_for_pid(pid)
 
-    # macOS / other: build a ppid map from a single ps snapshot, then sum the
-    # descendant subtree rooted at pid (ps reports RSS in KiB).
-    ps_bin = platform_compat.trusted_system_bin("ps")
-    if ps_bin is None:
+    # macOS / other: sum the descendant subtree rooted at pid off a SHARED
+    # whole-machine snapshot (ps reports RSS in KiB). The snapshot is memoized in
+    # _ps_process_table, so sampling N pids costs one process-table walk, not N.
+    table = _ps_process_table()
+    if table is None:
         return _get_rss_mb(pid)
-    try:
-        out = (
-            subprocess.check_output([ps_bin, "-Ao", "pid=,ppid=,rss="], timeout=2).decode().strip()
-        )
-    except (OSError, subprocess.SubprocessError):
-        return _get_rss_mb(pid)
-    children: dict[int, list[int]] = {}
-    rss_kib: dict[int, int] = {}
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        try:
-            cpid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
-        except ValueError:
-            continue
-        children.setdefault(ppid, []).append(cpid)
-        rss_kib[cpid] = rss
+    children, rss_kib = table
     if pid not in rss_kib:
         return None
     total_kib = 0
@@ -404,6 +489,7 @@ class AcpRuntime:
         max_age_secs: float = _DEFAULT_MAX_AGE_SECS,
         max_rss_mb: float = _DEFAULT_MAX_RSS_MB,
         model: str | None = None,
+        expect_mcp_reports: bool = True,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -428,6 +514,13 @@ class AcpRuntime:
             str(mcp_gateway_settings_mcp_json) if mcp_gateway_settings_mcp_json else None
         )
         self._mcp_gateway_socket = str(mcp_gateway_socket) if mcp_gateway_socket else None
+        # Whether sessions on this runtime should hold drain_init() open for
+        # slow MCP servers (the no-report ceiling). A runtime whose agent is
+        # KNOWN to have zero MCP servers — the kirocrew-lite background runtime,
+        # whose config Kiro Crew itself writes with an empty mcpServers map —
+        # opts out so hot one-liner paths (chat titles, suggestions, STT
+        # endpointing) don't pay a full ceiling wait that can never be armed.
+        self._expect_mcp_reports = expect_mcp_reports
         self._sandbox_cleanup: str | None = None
 
         # Recycling thresholds — see _is_stale(). Long-lived multiplexed
@@ -564,12 +657,46 @@ class AcpRuntime:
 
     # ── Lifecycle ──
 
+    def _discard_sandbox_cleanup(self) -> None:
+        """Unlink and forget the sandbox temp file allocated by ``wrap_argv``.
+
+        Mirrors ``AcpClient._discard_sandbox_cleanup``: once no child will
+        exec the launcher/profile file — spawn failed, was cancelled, or the
+        runtime is shutting down — it must be removed, or each attempt leaks
+        one file into the temp dir for the gateway's lifetime.
+        """
+        if self._sandbox_cleanup:
+            try:
+                os.remove(self._sandbox_cleanup)
+            except OSError:
+                pass
+            self._sandbox_cleanup = None
+
+    async def _to_thread_guarding_sandbox(
+        self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any
+    ) -> _T:
+        """``asyncio.to_thread`` that discards the sandbox file on failure.
+
+        After ``wrap_argv`` has allocated the sandbox temp file, every
+        suspension point before the exec is a leak window: a cancellation
+        unwinds ``spawn`` without reaching the shutdown cleanup, orphaning the
+        file. Route any offload in that window through here so the file is
+        removed before re-raising.
+        """
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except BaseException:
+            self._discard_sandbox_cleanup()
+            raise
+
     async def spawn(self) -> None:
         """Start the kiro-cli acp subprocess and complete protocol handshake."""
         if self._process is not None:
             raise AcpRuntimeError("Runtime already spawned")
 
-        self._work_dir.mkdir(parents=True, exist_ok=True)
+        # Off-loop: mkdir is a blocking syscall and the parent dirs may live on
+        # slow storage; the loop must never wait on the kernel here.
+        await asyncio.to_thread(self._work_dir.mkdir, parents=True, exist_ok=True)
 
         try:
             kiro_bin = await _resolve_kiro_bin_for_spawn()
@@ -613,7 +740,11 @@ class AcpRuntime:
         # tool descendants with pids.max (fork bomb) + memory.max (RSS balloon).
         # No-op + loud warning where cgroup delegation is unavailable. --scope
         # execs into the target, so self._pid below is still the real child.
-        argv = cgroup_scope_argv(argv)
+        # Off-loop: first call probes /proc + /sys and the config read touches
+        # the config dir (mkdir + file read) — blocking syscalls that must not
+        # run on the loop. Guarded: wrap_argv above allocated the sandbox temp
+        # file, so a cancellation here must not orphan it.
+        argv = await self._to_thread_guarding_sandbox(cgroup_scope_argv, argv)
 
         env = {**os.environ}
         if self._extra_env:
@@ -629,11 +760,24 @@ class AcpRuntime:
         env = scrub_agent_denied_env(env)
 
         env["PATH"] = augmented_path(env.get("PATH", ""))
-        resolve_krb5_ccname(env)
+        # Resolve KRB5CCNAME off-loop: it lstat/stats /tmp/krb5cc_<uid>, and a
+        # blocking syscall on the event loop stalls every other task. Guarded:
+        # the sandbox temp file is live, so a cancellation here must not
+        # orphan it.
+        await self._to_thread_guarding_sandbox(resolve_krb5_ccname, env)
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
+        # Memory-aware cap for pytest-xdist's ``-n auto`` (subagent spawn path —
+        # mirrors acp/client.py): xdist sizes auto to the CPU count, ignoring
+        # memory; PYTEST_XDIST_AUTO_NUM_WORKERS bounds ONLY auto resolution.
+        # Respects a pre-set value; see resource_status.inject_xdist_auto_cap.
+        # Off-loop: resolving the cap reads the raw config, and that read
+        # enters config_dir() (mkdir + file IO + JSON parse) — blocking
+        # syscalls that must not run on the loop. Guarded: the sandbox temp
+        # file is live, so a cancellation here must not orphan it.
+        await self._to_thread_guarding_sandbox(inject_xdist_auto_cap, env)
 
         self._process = await create_subprocess_limited(
             *argv,
@@ -698,8 +842,13 @@ class AcpRuntime:
             init_resp = await self._send_and_await(
                 "initialize",
                 {
-                    "clientName": CLIENT_NAME,
-                    "clientVersion": CLIENT_VERSION,
+                    # kiro-cli reads the driving client name from `clientInfo.name`
+                    # (agent/acp/acp_agent.rs: `if let Some(info) = request.client_info`),
+                    # NOT from a flat `clientName` key. Sending it flat left every
+                    # AcpRuntime-driven session (the primary kiro-cli path) unnamed in
+                    # telemetry — bucketed as "(none)" instead of "kirocrew". Nest it to
+                    # match AcpClient and be picked up for acpClientName attribution.
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
                     "protocolVersion": PROTOCOL_VERSION,
                     "clientCapabilities": ACP_CLIENT_CAPABILITIES,
                 },
@@ -812,11 +961,7 @@ class AcpRuntime:
                 except Exception:
                     logger.debug("AcpRuntime: PID untracking failed for %s", pid, exc_info=True)
 
-        if self._sandbox_cleanup:
-            try:
-                os.remove(self._sandbox_cleanup)
-            except OSError:
-                pass
+        self._discard_sandbox_cleanup()
 
     # ── Reader Task (single owner of stdout) ──
 
@@ -886,11 +1031,50 @@ class AcpRuntime:
         try:
             while True:
                 try:
-                    line = await stdout.readline()
-                except (ValueError, asyncio.LimitOverrunError) as exc:
-                    logger.error("stdout buffer overrun: %s", exc)
-                    self._mark_dead(f"stdout overrun: {exc}")
-                    return
+                    line = await stdout.readuntil(b"\n")
+                except asyncio.IncompleteReadError as exc:
+                    # EOF, possibly holding a trailing unterminated line. Keep
+                    # readline()'s old shape: hand the partial to the parser, and
+                    # an empty partial falls through to the exit branch below.
+                    line = exc.partial
+                except asyncio.LimitOverrunError as exc:
+                    # ONE oversize frame must not kill the demux — same invariant
+                    # as the non-dict and non-numeric-id guards below. Tearing
+                    # the runtime down here ends EVERY multiplexed session
+                    # mid-turn, which is what users see as "process exited /
+                    # chat failure" after a single huge tool result.
+                    #
+                    # _drain_oversize_line consumes the whole line THROUGH its
+                    # terminating newline and discards it, so the stream is back
+                    # on a frame boundary and no byte-slice of the oversize line
+                    # ever reaches json.loads. Its budget is per call and needs no
+                    # cross-iteration state, because every call that returns ends
+                    # on a boundary — so a replay of oversize-but-terminated
+                    # frames is survivable frame after frame.
+                    #
+                    # An awaited request whose response was in a dropped frame is
+                    # not orphaned: _send_and_await wraps every future in
+                    # wait_for(timeout=...), so the caller gets a timeout instead
+                    # of hanging. The ids in flight at the drop are logged so that
+                    # timeout is attributable.
+                    try:
+                        dropped = await _drain_oversize_line(stdout, exc)
+                    except asyncio.IncompleteReadError:
+                        self._mark_dead("stdout closed mid-oversize-line")
+                        return
+                    except OversizeLineUnrecoverable as fatal:
+                        logger.error("stdout unrecoverable: %s", fatal)
+                        self._mark_dead(f"stdout overrun: {fatal}")
+                        return
+                    logger.warning(
+                        "dropped an oversize stdout frame (%d bytes); resynced at "
+                        "next frame (in-flight awaited=%s routed=%s): %s",
+                        dropped,
+                        sorted(self._pending_requests)[:_DROP_IDS_IN_LOG],
+                        sorted(self._routed_requests)[:_DROP_IDS_IN_LOG],
+                        exc,
+                    )
+                    continue
 
                 if not line:
                     rc = self._process.returncode if self._process else "?"
@@ -976,12 +1160,19 @@ class AcpRuntime:
                     queue = self._session_queues.get(session_id)
                     if queue is not None:
                         await queue.put(msg)
-                    elif self._session_inits_in_flight and msg.is_method(
-                        METHOD_MCP_OAUTH_REQUEST
+                    elif self._session_inits_in_flight and (
+                        msg.is_method(METHOD_MCP_OAUTH_REQUEST)
+                        or msg.is_method(METHOD_MCP_SERVER_INITIALIZED)
+                        or msg.is_method(METHOD_MCP_SERVER_INIT_FAILURE)
                     ):
-                        # session/new can emit OAuth before its response. The
-                        # response is what gives create_session the id needed to
-                        # register this queue, so retain the frame until then.
+                        # session/new can emit OAuth and MCP registration frames
+                        # before its response. The response is what gives
+                        # create_session the id needed to register this queue,
+                        # so retain the frames until then. Registration frames
+                        # matter beyond logging: drain_init() arms its idle
+                        # shortcut on the first one, so dropping them here would
+                        # make every warm session look report-less and pay the
+                        # full no-report ceiling.
                         self._pending_init_notifications.append(msg)
                     else:
                         # Counted, not logged per frame: this is the measured
@@ -1282,7 +1473,9 @@ class AcpRuntime:
         self._session_inits_in_flight += 1
         session_id = ""
         try:
-            resp = await self._send_and_await(METHOD_SESSION_NEW, params)
+            resp = await self._send_and_await(
+                METHOD_SESSION_NEW, params, timeout=_SESSION_NEW_TIMEOUT
+            )
             session_id = str(resp.get("sessionId") or "")
             if not session_id:
                 raise AcpRuntimeError(f"session/new did not return sessionId: {resp}")
@@ -1307,6 +1500,7 @@ class AcpRuntime:
         # Populate state from session/new response (configOptions, available models)
         handle.store_session_config(resp)
 
+        mode_switched = False
         # Set agent mode if specified. If set_mode raises, no handle is returned
         # to the caller, so terminate the session we just created above —
         # session/new already succeeded so the session exists in kiro-cli; a
@@ -1331,6 +1525,14 @@ class AcpRuntime:
             except Exception:
                 await self.terminate_session(session_id)
                 raise
+            # Whether set_mode actually SWITCHED modes: the servers that
+            # initialized during session/new belong to the mode kiro-cli
+            # started the session on. If the requested agent differs, those
+            # staged registration frames describe the pre-switch roster and
+            # must not arm the drain's idle shortcut while the switched-to
+            # agent's own servers may still be booting.
+            _ids, _current, _adv = parse_session_modes(resp)
+            mode_switched = bool(_current) and agent != _current
         elif agent:
             _ids, _current, _adv = parse_session_modes(resp)
             await self.terminate_session(session_id)
@@ -1344,8 +1546,15 @@ class AcpRuntime:
 
         # Drain MCP-server-init / oauth / config notifications before the first
         # prompt so they don't race into the first turn (parity with
-        # AcpClient._drain_notifications). Best-effort, bounded (~1s).
-        await handle.drain_init()
+        # AcpClient._drain_notifications). Best-effort, bounded: exits shortly
+        # after the servers report, or at the no-report ceiling if none do.
+        # A runtime declared MCP-free skips the ceiling — nothing can arm it.
+        # After a real mode SWITCH, reports staged during session/new describe
+        # the pre-switch roster, so they must not arm the idle shortcut.
+        if self._expect_mcp_reports:
+            await handle.drain_init(ignore_queued_reports=mode_switched)
+        else:
+            await handle.drain_init(no_report_ceiling=0.0)
 
         logger.info("Created session %s on runtime PID %d", session_id, self._pid or 0)
         return handle
@@ -1381,7 +1590,16 @@ class AcpRuntime:
         self._session_inits_in_flight += 1
         loaded_session_id = ""
         try:
-            resp = await self._send_and_await(METHOD_SESSION_LOAD, load_params)
+            # session/load is gated by the SAME MCP (re-)initialization as
+            # session/new — kiro-cli re-initializes the session's servers on
+            # load, and the runtime stages mcp/oauth_request frames while
+            # EITHER request is in flight (the _session_inits_in_flight-keyed
+            # staging in _reader_loop, closed by _finish_session_init; see
+            # docs/system-specs/modules/acp-client.md "loading a session
+            # triggers MCP re-initialization") — so it gets the same budget.
+            resp = await self._send_and_await(
+                METHOD_SESSION_LOAD, load_params, timeout=_SESSION_NEW_TIMEOUT
+            )
 
             # A genuine resume echoes "modes" in the response (same signal AcpClient
             # keys on). Anything else means load did not actually restore state.
@@ -1415,6 +1633,7 @@ class AcpRuntime:
         )
         handle.store_session_config(resp)
 
+        mode_switched = False
         # Activate the agent (mirrors AcpClient step 4 — set_mode applies to a
         # resumed session too, not just fresh ones). If set_mode raises, the
         # caller falls back to create_session() (a fresh sid + its own queue),
@@ -1431,6 +1650,10 @@ class AcpRuntime:
             except Exception:
                 await self.terminate_session(resume_sid)
                 raise
+            # See create_session: after a real mode switch, registration frames
+            # staged during session/load describe the pre-switch roster.
+            _ids, _current, _adv = parse_session_modes(resp)
+            mode_switched = bool(_current) and agent != _current
         elif agent:
             # Guard (A) — see create_session. A resumed session always echoes a
             # `modes` list (checked above), so an absent agent means its config
@@ -1449,8 +1672,12 @@ class AcpRuntime:
         # Drain MCP-init / oauth / config notifications before the first prompt
         # (parity with AcpClient). Transcript-replay frames were already dropped
         # before the queue was registered above, so only genuine init frames
-        # remain to drain here.
-        await handle.drain_init()
+        # remain to drain here. MCP-free runtimes skip the no-report ceiling.
+        # After a real mode SWITCH, staged reports are pre-switch — don't arm.
+        if self._expect_mcp_reports:
+            await handle.drain_init(ignore_queued_reports=mode_switched)
+        else:
+            await handle.drain_init(no_report_ceiling=0.0)
 
         logger.info("Resumed session %s on runtime PID %d", resume_sid, self._pid or 0)
         return handle
@@ -1497,7 +1724,9 @@ class AcpRuntime:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             self._pending_requests.pop(req_id, None)
-            raise AcpRuntimeError(f"Request {method} timed out")
+            # Name the budget: a session-start timeout (90s) must be
+            # distinguishable from a generic control-plane one (30s).
+            raise AcpRuntimeError(f"Request {method} timed out after {timeout:g}s")
 
     async def _drain_stderr(self) -> None:
         """Drain stderr to prevent subprocess blocking."""

@@ -43,7 +43,7 @@ anything that survived a gateway crash. No single mechanism is a single point of
 | Context compaction | `session.py` | Chat sessions | `session.autocompact_pct` | No | Sends `/compact` to kiro-cli to free context window |
 | Background session recycle | `session.py` | Background sessions (cron, subagent) | 70% context usage (`_BG_RECYCLE_PCT`) | No | Recycles the session before context overflow |
 | Watchdog process liveness | `taskrunner.py` | Task runner steps | 2 consecutive dead checks (`_DEAD_THRESHOLD`) at 30s intervals | Yes, part of the watchdog loop | Resets the session to trigger crash recovery |
-| Config bound clamp | `config/loader.py` | Subagent count, turns, timeouts and pool size at load time | `subagent_auto_max` and `max_subagents` to 64 (`SUBAGENT_AUTO_MAX_CEILING`), `subagent_max_turns` 1..200, `chat_turn_timeout_secs` 300..7200, `loop_stall_exit_after_secs` 10..300, `pool_size` 0..10 (`_SECURITY_BOUNDED_FIELDS`) | No | `_clamp_security_bounds` clamps out-of-range ints, logs a WARNING, emits SEL `config_bounds_clamped` (`outcome=clamped`) |
+| Config bound clamp | `config/loader.py` | Subagent count, turns, timeouts and pool size at load time | `subagent_auto_max` and `max_subagents` to 64 (`SUBAGENT_AUTO_MAX_CEILING`), `subagent_max_turns` 1..200, `chat_turn_timeout_secs` 300..7200, `tool_approval_timeout_secs` 30..7200 and cross-field to 60s under the turn ceiling (`APPROVAL_TURN_MARGIN_SECS`), `loop_stall_exit_after_secs` 10..300, `pool_size` 0..10 (`_SECURITY_BOUNDED_FIELDS`) | No | `_clamp_security_bounds` clamps out-of-range ints, logs a WARNING, emits SEL `config_bounds_clamped` (`outcome=clamped`) |
 
 ## Per-workflow coverage matrix
 
@@ -235,6 +235,26 @@ resolved from an absolute path, never a caller-influenced `PATH`, and when no `e
 exists the layer **fails closed**: the locators are not forwarded at all, so the wrapper
 fails loudly rather than handing the child a reachable bus.
 
+## Memory-aware cap for pytest-xdist `-n auto`
+
+pytest-xdist resolves `-n auto` to the CPU count and never looks at memory, so on a
+many-core host a full-suite run inside an agent turn spawns one worker per core at roughly
+1 GB each — and two agent sessions doing it concurrently can exhaust an unswapped host
+before the cgroup scope's per-tree ceiling helps (the scopes are per-spawn-tree, not an
+aggregate). xdist honors the
+[`PYTEST_XDIST_AUTO_NUM_WORKERS`](https://pytest-xdist.readthedocs.io/en/stable/distribution.html)
+environment variable when resolving `auto`, so both agent spawn boundaries
+(`acp/client.py` and `acp/runtime.py`) seed it via
+`resource_status.inject_xdist_auto_cap()`:
+`min(cpu_count, floor(available_gb * 0.5 / 1.0))`, floored at 1, computed from the same
+cgroup-clamped memory probe the advisory `resource_status` tool uses. Half of the
+*currently available* memory, so two sessions sizing themselves at the same instant cannot
+jointly commit more than what was free. This shapes **only** `auto`/`logical` resolution:
+explicit `-n N`, non-xdist runs, and venvs without xdist installed are untouched, and a
+value already present in the environment is never overridden. Configured via
+`resource_limits.xdist_auto_cap`: `-1` (default) auto-computes, `0` disables the injection
+entirely, `N > 0` pins a fixed worker cap.
+
 ## Known gaps
 
 1. **The subagent timeout is not configurable.** `_TIMEOUT_SECS` (30 min) is hardcoded, and
@@ -250,6 +270,15 @@ fails loudly rather than handing the child a reachable bus.
    several spawn trees, and enforcement depends on cgroup v2 delegation being present. The
    load-time config clamp bounds process *counts* (subagent count, turn budget, pool size),
    not memory or CPU.
+
+4. **The xdist auto-cap is snapshotted at session spawn, not at test-run time.** Agent
+   sessions are long-lived: a session spawned while memory was ample carries its generous
+   `PYTEST_XDIST_AUTO_NUM_WORKERS` for its whole lifetime, so a suite launched hours later
+   under pressure still gets the stale cap — and conversely, a session spawned under
+   transient pressure stays throttled after the pressure clears. The "two sessions cannot
+   jointly over-commit" property holds at *spawn* instant only. Refreshing the value at
+   command-execution time (a pre-tool-use boundary rather than process birth) is the
+   planned follow-up.
 
 ## Interaction notes
 

@@ -24,7 +24,7 @@ pull_request
   |-- code-review.yml   "Code Review"  grep rules, woke, Semgrep, PR hygiene, dep audit
   |-- dependency-review.yml            license allowlist
   |-- docker-smoke.yml                 container contract (paths-filtered)
-  |-- claude-review.yml "Opus 5 Review"     line-level, code-only, blocking
+  |-- claude-review.yml "Opus 4.8 Review"     line-level, code-only, blocking
   |-- codex-review.yml  "GPT 5.6 Review"    line-level + PR intent, blocking
   |-- design-review.yml "Design Review"     design shape, advisory
   |-- ux-review.yml     "UX Review"         rendered experience, advisory
@@ -38,8 +38,8 @@ Two structural facts explain most of the rest:
 - **The real merge gate is human approval plus armed auto-merge.** `PR Readiness`
   is the one status worth watching; individual red checks are strong signals a
   human can weigh.
-- **Fork PRs cannot reach a passing readiness state, by construction.** See
-  [Fork PRs](#fork-prs).
+- **A fork PR is aggregated like any other and can reach a passing readiness
+  state**; CodeQL is the one lane it cannot run. See [Fork PRs](#fork-prs).
 
 Out-of-band lanes that never gate a PR:
 
@@ -61,8 +61,22 @@ Out-of-band lanes that never gate a PR:
   balanced by recorded runtime, and opens a PR with the update), `issue-triage.yml`
   (a model picks `type:` / `area:` / `platform:` labels from the repository's own
   live label set, because keyword rules mislabel often enough to be worse than no
-  label), `pr-merge-conflict-label.yml` and `fork-pr-label.yml` (both mirror a fact
-  GitHub does not surface in the `/pulls` list onto a label).
+  label), `issue-summary.yml` (a second, deliberately separate lane posts ONE
+  comment per new issue: the report restated for a maintainer, the information
+  still missing, and the recent issues most likely to be duplicates. Split from
+  triage because publishing prose gives a prompt injection an audience that the
+  label path does not have — so this lane, and only this lane, carries the
+  markdown neutralizer and the candidate-pool intersection that stop an issue
+  body from minting a `#N` reference or a mention. It gets no checkout on
+  purpose; grounded, file-level investigation is Issue Radar's Investigate
+  button, not a CI comment), `pr-merge-conflict-label.yml` and `fork-pr-label.yml`
+  (both mirror a fact GitHub does not surface in the `/pulls` list onto a label), and
+  `add-contributor.yml` (a daily cron, plus manual dispatch, adds each merged
+  PR's author to the README Contributors block via
+  `scripts/update_contributors.py`; because the default branch is protected it
+  opens a rolling PR rather than committing directly, like `test-durations.yml`.
+  A login in `.github/contributors-optout.txt` is never added, which keeps the
+  README's removal promise enforceable against the full-rebuild collector).
 
 ## `ci.yml`: correctness
 
@@ -71,12 +85,13 @@ Every job here is blocking.
 | Job | What it enforces |
 |---|---|
 | `scrub-lint` | `scripts/scrub-lint.sh --no-history`. Fails on any internal marker in this public tree, so a sync cannot reintroduce a coupling |
+| `vendor-manifest` | `scripts/verify_vendor_manifest.py`. Hashes every file under `src/kiro_crew/_vendor` against the committed `scripts/vendor_manifest.sha256` — the tree is excluded from semgrep and the AI reviewers' diff, so this checksum is its only content review. Always-on (not behind the `changes` path filter) |
 | `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12. `black --check` is commented out pending a bulk format pass |
 | `backend-test` | 2 Python versions x 4 duration-balanced pytest-split shards (8 jobs), `-n auto` within each. Coverage only on 3.12 (3.10 passes `--no-cov` for a trace-free run) |
 | `backend-test-windows` | windows-latest, 4 shards, `--no-cov`, 180s per-test timeout. The backend supports Windows natively via `platform_compat`, and nothing else in CI holds that line |
 | `backend-test-macos` | macos-14, deliberately SCOPED (gateway, socketsec, platform-compat, pod and MCP-apps suites via a glob). A full macOS run needs its own exclusion burn-down first, and a job that is red on arrival trains people to ignore it |
 | `backend-test-sandbox` | The two suites the sharded matrix deselects because they need unprivileged user namespaces: `test_script_hooks.py` and `test_cron_script.py` |
-| `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces backend >= 70% and frontend >= 60% on the raw line-rate |
+| `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces backend >= 80% and frontend >= 60% on the raw line-rate (floors live in the job's `env:` block) |
 | `frontend-lint` | `tsc -b`, `eslint --max-warnings 1116`, `jscpd`, and `npm run i18n:check` |
 | `electron-test` | The Electron shell's own node:test suite (`website/electron`) |
 | `frontend-test` | `vitest run --coverage` |
@@ -99,7 +114,7 @@ Details worth knowing:
 - **`coverage-gate` is fail-closed.** It runs `if: always()` and its first step
   converts any non-success upstream result into an explicit failure, because GitHub
   treats a **skipped** required check as satisfied. It also compares the raw
-  line-rate and rounds only for display, so 69.95% cannot pass a 70% floor.
+  line-rate and rounds only for display, so 79.95% cannot pass an 80% floor.
 - **`eslint --max-warnings 1116` is a ratchet baseline.** Burn it down, never raise
   it.
 - **The i18n gates split into three tiers,** and only two can fail: diff-scoped
@@ -201,12 +216,12 @@ design axis is **what each is allowed to read** (its prompt-injection surface) a
 
 | Reviewer | Check name | Harness | Reads | Question | Blocks? |
 |---|---|---|---|---|---|
-| Opus 5 | `Opus 5 Review` | Agentic, `--max-turns 120`, one pass with two internal phases | **Code only**: `Read`, `Grep`, `Glob`, `Bash(gh pr diff:*)` | Line-level correctness, security, AUTOSDE | Yes, fail-closed |
+| Opus 4.8 | `Opus 4.8 Review` | Agentic, `--max-turns 120` per stage, **two real invocations** (discovery -> validation) | **Code only**: `Read`, `Grep`, `Glob`, `Bash(gh pr diff:*)` | Line-level correctness, security, AUTOSDE | Yes, fail-closed |
 | GPT 5.6 | `GPT 5.6 Review` | Non-agentic, **two** invocations (discovery, then authoritative falsification), `reasoning_effort: medium` | Code plus PR title and body as nonce-wrapped **UNTRUSTED** context | Line-level second perspective, plus description-versus-diff consistency (advisory) | Yes, fail-closed |
 | Design Review | `Design Review` | Agentic Fable 5, with an Opus fallback model | Code plus `gh pr view` (it must judge intent) | Should we build this, and is it the right *shape*? | Advisory; red only on a genuine `BLOCK` |
 | UX Review | `UX Review` | Agentic Fable 5, with the same fallback | Code plus committed screenshot PNGs, read directly | Does the shipped experience read correctly? | Advisory; red only on a genuine `BLOCK` |
 
-### Why Opus 5 is code-only
+### Why Opus 4.8 is code-only
 
 It is the agentic reviewer, so pulling attacker-controllable PR prose into its
 context is a prompt-injection surface. `gh pr view` and `gh api` are disallowed, and
@@ -234,12 +249,14 @@ says "No findings." is the expected output for a typical PR.
 
 ### Asymmetric multi-pass is intentional
 
-The agentic Opus 5 reviewer runs ONE pass with two internal phases: discover
-(generous candidate collection), then falsify (kill each candidate against code it
-opened, with extra falsification effort only where the diff touches
-security or data-integrity paths). The lean single-shot GPT 5.6 reviewer runs
-**two real invocations**: a discovery pass that generates candidates, then an
-**authoritative falsification** pass whose primary job is to *kill* them. A
+BOTH line reviewers now run **two real invocations**: a discovery pass that
+generates candidates, then an **authoritative falsification** pass whose primary
+job is to *kill* them. The Opus lane used to run one pass with two internal phases; that
+was measured on this repo to suppress findings the same model reports reliably
+without the precision clauses, because a prompt asked to discover AND to police
+its own precision stops discovering. Its discovery half therefore carries no
+precision gates, and its validation half applies a confidence floor and the closed
+blocking list to candidates that already exist. A
 candidate survives only if pass 2 re-derived the input, the call path and the
 observable outcome itself from code it opened in that pass. Pass 2 is the only
 gated verdict. Falsification raises precision *within a single run*, which is why
@@ -250,7 +267,7 @@ and therefore cannot contradict itself across rounds.
 
 The markers are the **only** gate:
 
-- Opus 5 emits `[OPUS-REVIEWED] <sha>` always, and `[BLOCK-MERGE] <sha>` only when a
+- Opus 4.8 emits `[OPUS-REVIEWED] <sha>` always, and `[BLOCK-MERGE] <sha>` only when a
   blocking finding exists. Both are parsed out of the action's `execution_file`
   transcript rather than a `--json-schema` structured output, because the harness's
   internal structured-output tool is unreliable when other tools are enabled:
@@ -347,7 +364,7 @@ queries the latest run per monitored workflow, and publishes **one `PR Readiness
 commit status plus one `readiness:` label**.
 
 - **Always required:** CI, Build, Code Review.
-- **Additionally required on a same-repo PR:** CodeQL, Opus 5 Review, GPT 5.6
+- **Additionally required on a same-repo PR:** CodeQL, Opus 4.8 Review, GPT 5.6
   Review, and completion of Design Review and UX Review.
 - **Design Review and UX Review are completion-required but advisory:** once
   complete they score as `"(advisory)"` whatever their conclusion, so neither their
@@ -357,8 +374,7 @@ commit status plus one `readiness:` label**.
   resolved by `path == "dynamic/github-code-scanning/codeql"`. `skipped` counts as
   passed for it.
 - **Labels:** `readiness: checking` (pending), `readiness: action required` (a
-  blocker), `readiness: maintainer review` (fork), `readiness: passed`. Exactly one
-  is ever present.
+  blocker), `readiness: passed`. Exactly one is ever present.
 
 Two subtleties:
 
@@ -385,6 +401,34 @@ Two subtleties:
   recompute it on an unchanged commit, freezing the status at pending indefinitely.
   So it is added only when the live evaluation still found something genuinely
   incomplete.
+- **A transport error during evaluation is non-terminal.** Every read-only `gh`
+  call goes through a bounded retry helper (3 attempts with backoff, 120s cap per
+  attempt); a non-429 HTTP 4xx is treated as permanent misconfiguration and fails
+  the job loudly instead of retrying. If an **evaluation** read still fails after
+  the retries, the evaluate step publishes an explicit non-terminal "could not be
+  evaluated" verdict (`pending` under `readiness: checking`) instead of exiting
+  non-zero — so a transient network/TLS blip during evaluation never leaves a red
+  check-run or skips the publish step (issue #2753: the same commit evaluated
+  green then red 39 seconds apart). Exhausted retries in the other steps (context
+  resolution, closed-PR label cleanup, the publish step's own reads) still fail
+  the job — only the evaluation loop has the non-terminal branch. This does not
+  weaken the gate: `pending` blocks merge exactly like `failure`, and only a
+  transport error with no already-observed blocker takes that branch (a genuine
+  failure recorded by an earlier lane dominates and the verdict stays the
+  terminal red `action required`, with a summary note that the evaluation was
+  truncated). Recovery is automatic — the self-heal sweep re-fires stale pending
+  statuses, and any later monitored-workflow event recomputes sooner. A truncated
+  run defers (publishes nothing) only when the revision already carries a
+  **blocking** verdict — the merge is already held and pending would only discard
+  the red's diagnostics. Every other prior state publishes pending: an existing
+  *success* is re-pended (a rerun means validation state is unknown again, and a
+  stale green left mergeable is the unsafe direction — pending can only ever
+  block, never allow), and an unreadable verdict state gets the same fail-safe
+  treatment. The status
+  POST itself is never retried: commit statuses are last-write-wins with no
+  conditional write, so any retry races a concurrent run's newer verdict — a
+  failed POST fails the step loud and a re-run republishes. The label writes
+  keep only the narrow 404/already-exists race tolerance they already have.
 - **Nothing keys off `workflow_run.pull_requests`.** That array is empty whenever the
   head repository is a fork, the same GitHub behaviour the `fork-*` workflows already
   work around. The job gate admits every `pull_request` and `dynamic` run and lets the
@@ -402,20 +446,21 @@ Two subtleties:
 A fork PR gets no repository OIDC credentials or secrets, and this repository's
 managed CodeQL workflow is not scheduled for fork heads. Two consequences.
 
-**Fork PRs cannot reach `readiness: passed`.** Passing public CI, Build and Code
-Review is not full validation, so `pr-readiness.yml` emits a dedicated **red**
-terminal verdict instead: `readiness: maintainer review` with `PR Readiness =
-failure`. It is unmistakable in the merge box and, as a required status check, blocks
-an accidental merge of code the AI reviewers never saw. A maintainer must review
-manually, or re-run validation from a trusted in-repo branch, before merge. This is
-the intended end state for a fork PR, not a bug to route around.
+**A fork PR can still reach `readiness: passed`.** The `fork-*` pipeline below runs
+the AI reviews from the trusted base branch and posts them as check-runs under the
+same names the same-repo lanes use, so `pr-readiness.yml` evaluates a fork from
+those check-runs and a fully green fork is fully validated. CodeQL is the single
+ineligible lane, reported as a non-blocking "Not eligible" note rather than a
+blocker. Readiness therefore says the same thing on a fork as anywhere else: the
+eligible automated validation passed for this revision. Human approval and branch
+protection remain separate gates.
 
 **The `fork-*` pipeline gives fork PRs AI review anyway, in two stages.**
 `fork-opus-review.yml`, `fork-gpt-review.yml`, `fork-design-review.yml` and
 `fork-ux-review.yml` each trigger on the **completion of CI** (stage 1) and run
 privileged from the default branch (stage 2), gated on
 `workflow_run.head_repository.full_name != github.repository`. Each posts a check-run
-named exactly like its same-repo twin (`Opus 5 Review`, `GPT 5.6 Review`,
+named exactly like its same-repo twin (`Opus 4.8 Review`, `GPT 5.6 Review`,
 `Design Review`, `UX Review`), so branch protection is satisfied on either path, and
 it opens that check-run as early as possible keyed to `head_sha` so a job that dies
 still leaves a fail-closed result.
@@ -457,10 +502,14 @@ resists this:
 - **Both line reviewers share an identical FIX BAR:** every finding must carry a fix
   expressible as an edit to lines **this PR changed**. If the fix would need a new
   function, module, abstraction, config knob, dependency, or an edit to untouched
-  code, it is out of scope for the bot and the finding is dropped. **The absence of a
+  code, it is out of scope for the bot. GPT 5.6 drops such a finding; Opus 4.8
+  **demotes it to advisory instead of dropping it** -- the author cannot land the
+  remedy in this PR, so it must not gate the merge, but the signal is real and a
+  human decides. A regression the diff itself introduces still blocks either way,
+  since reverting the hunk is an in-diff fix. **The absence of a
   mechanism is never a finding.** This makes "add mechanism X" structurally
   un-reportable: the demand fails the bar before it can become a finding. A scope cap
-  complements it: Opus 5 stays within the evident scope of the diff (it is code-only),
+  complements it: Opus 4.8 stays within the evident scope of the diff (it is code-only),
   and GPT 5.6 stays within the PR's stated purpose, flagging a
   description-versus-diff mismatch as an **advisory** finding rather than a block.
 - **The WHAT BLOCKS list is closed:** exhaustive, never extended, never reasoned about

@@ -28,6 +28,7 @@ from kiro_crew.acp.types import (  # noqa: F401
     EVENT_TOOL_RESULT,
 )
 from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
+from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
@@ -66,6 +67,16 @@ class LLMProvider(ABC):
     @abstractmethod
     def context_usage_pct(self) -> float:
         """Return last known context usage percentage."""
+
+    def context_usage_unknown(self) -> bool:
+        """True when a 0% reading means "unknown", not "empty".
+
+        A backend that compacts in place reports 0% for a transcript whose real
+        size it has not measured yet, which is byte-identical to a brand-new
+        session. Callers that act on a threshold need the two apart. Default
+        False for providers that never compact unobserved.
+        """
+        return False
 
     def context_window_tokens(self) -> int:
         """Return the real served context window in tokens (0 if unknown).
@@ -117,7 +128,7 @@ class LLMProvider(ABC):
     async def compact(self, context: str = "") -> None:
         """Trigger context compaction. No-op for providers without native support."""
 
-    async def wait_for_compaction(self, timeout: float = 120.0) -> dict:
+    async def wait_for_compaction(self, timeout: float = COMPACT_WAIT_TIMEOUT_SECS) -> dict:
         """Wait for compaction completed/failed. Returns ``{'type': 'timeout'}`` by default."""
         return {"type": "timeout"}
 
@@ -145,6 +156,17 @@ class LLMProvider(ABC):
     @property
     def cwd(self) -> str:
         """Working directory the provider operates in. Default: empty string."""
+        return ""
+
+    @property
+    def served_model(self) -> str:
+        """Model id the live session actually resolved to serve.
+
+        Public accessor so callers (e.g. the poisoned-conversation canary in
+        chat_runner) never reach through provider internals. Default: empty
+        string, meaning "unknown" — callers must treat that as inconclusive,
+        never as a wildcard.
+        """
         return ""
 
     def touch_activity(self) -> None:

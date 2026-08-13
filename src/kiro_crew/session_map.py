@@ -1,16 +1,22 @@
 """Persistent session-to-kiro-cli mapping.
 
 Stores ``session_map.json`` mapping session keys to kiro-cli session IDs,
-with Slack thread linkage for bidirectional sync.
+with channel thread linkage (Slack legacy fields; other channels use the
+generic ChannelLink mirror map) for bidirectional sync.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
 import tempfile
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import ParamSpec, TypeVar
 
 from kiro_crew.config.paths import config_dir, kiro_sessions_dir
 from kiro_crew.messaging.link import (
@@ -23,7 +29,12 @@ from kiro_crew.messaging.link import (
 
 logger = logging.getLogger(__name__)
 
-_SESSION_MAP_FILE = "session_map.json"
+# Public because another instance's map is read by file path, not through this
+# class: :func:`kiro_crew.session_storage.cotenant_sids` opens the map belonging
+# to a pod that shares the replay store. A second literal there would be a silent
+# hazard rather than a duplicate — a rename would turn that read into "no file",
+# which reads as "that instance owns nothing" and withdraws the protection.
+SESSION_MAP_FILENAME = "session_map.json"
 
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
@@ -38,26 +49,207 @@ def _kiro_sessions_dir() -> Path:
     return _KIRO_SESSIONS_DIR if _KIRO_SESSIONS_DIR is not None else kiro_sessions_dir()
 
 
+# Per-conversation flag recording a refusal of automatic origin mirroring. Named
+# here rather than at the caller because it is an ON-DISK contract: the map
+# persists it, so renaming the literal would silently re-enable mirroring for
+# every conversation that had already turned it off.
+MIRROR_OPT_OUT_FLAG = "mirror_opt_out"
+
+# Flags that are durable SETTINGS rather than session-scoped state, and so keep
+# their entry alive through :meth:`SessionMap.prune`. Membership is opt-in
+# BECAUSE immortality has a cost: an entry that prune can never collect is a row
+# the map carries forever, and every mutation rewrites the whole map. A flag
+# describing one session (Slack's ``temporary`` / ``incognito`` threads) must
+# stay collectable — one leaked row per such thread would grow without bound.
+_DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG})
+
+
+def _has_durable_flag(entry: dict) -> bool:
+    """True iff *entry* carries a flag that must outlive its native session."""
+    flags = entry.get("flags")
+    if not isinstance(flags, dict):
+        return False
+    return any(flags.get(name) for name in _DURABLE_FLAGS)
+
+
+# Serializes every structural access to the map. MODULE-level, not per-instance,
+# because the instances are not the unit of exclusion: the read-only call sites
+# build their own throwaway ``SessionMap()`` (``handlers/session_storage.py``,
+# ``slack/handler.py``) while ``SessionManager`` holds the long-lived one, and
+# all of them resolve the same file. A per-instance lock would leave a throwaway
+# reader iterating its map while the live writer rewrites the file — the exact
+# pair this exists to order.
+#
+# REENTRANT because the public surface composes: ``set_mirror_link`` reaches
+# ``clear_mirror_link`` -> ``clear_slack_link`` -> ``_save`` -> ``_write``, and
+# ``batched_save`` blocks nest. A plain Lock would deadlock the first such call.
+_MAP_LOCK = threading.RLock()
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _guarded(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Hold :data:`_MAP_LOCK` for the whole call.
+
+    Applied to every :class:`SessionMap` method that mutates the map, iterates
+    it, or reads several fields as one unit. Single-key probes are deliberately
+    left undecorated — see the class docstring's threading contract for why that
+    boundary is where it is, and ``test_session_map_locking.py`` for the ratchet
+    that keeps a new mutator from being added without it.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with _MAP_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+class ConversationOwnershipConflict(RuntimeError):
+    """Raised when a second session tries to bind a conversation already held.
+
+    One conversation belongs to at most one session. That is not a policy
+    preference — it is what makes an inbound reply routable at all. The inbound
+    resolver (``find_mirror_sessions(link, inbound_only=True)`` behind
+    ``DiscordSessionResume.resumed_session``) refuses to choose between two
+    candidates and returns ``None``, and "no owner" and "two owners" land on the
+    same ``None``. So a duplicate binding does not send the reply to the wrong
+    session, it sends it to NO session: the message silently starts a fresh
+    conversation, which is the very bug an inbound binding exists to prevent.
+
+    Enforced on the WRITER, deliberately. Readers stay permissive and keep
+    reporting every owner they find, so a map written before this check existed
+    still makes the resolver fail closed and still lets in-channel conflict
+    detection see the duplicate. Callers translate this into their own surface's
+    refusal — an HTTP 409, or the channel's own "run `!unlink` first" — never a
+    500 or a generic failure, which would send the user off to retry a command
+    that is working exactly as intended.
+    """
+
+
 class SessionMap:
     """Persistent mapping of session_key → kiro-cli session ID.
 
     Stored as ``~/.kiro/crew/session_map.json``. Atomic write via tmp+rename.
-    Only used for long-lived conversational sessions (Slack DM, dashboard).
+    Only used for long-lived conversational sessions (channel DMs, dashboard).
     Stateless sessions (cron, subagent, taskrunner) are excluded.
 
     Each entry is a dict with keys: ``sid``, ``slack_thread_ts``, ``slack_channel_id``.
     A reverse index ``_thread_to_session`` maps Slack thread_ts → session_key
     for bidirectional sync lookups.
+
+    THREADING CONTRACT
+    ------------------
+    Every mutation rewrites the WHOLE map from ``_data``, so a read-modify-write
+    is only atomic if nothing else touches the structure in between. Three rules
+    hold that together; the first two are enforced, the third cannot be:
+
+    1. **Any thread may call this class.** :data:`_MAP_LOCK` (module-level,
+       reentrant) guards every method that mutates the map, iterates it, or
+       reads several fields as one unit. Single-key probes (``get_cwd``,
+       ``get_flag``, ``get_session_for_thread``, …) are lock-free on purpose:
+       one ``dict.get`` cannot observe a half-applied write, and taking the lock
+       for them would put the map's cheapest reads — including the one on every
+       inbound Slack reply — behind its most expensive write. What that costs is
+       a rule for the WRITERS: a structure a lock-free reader looks at is
+       replaced by rebinding a finished copy, never cleared and refilled in
+       place (see :meth:`_rebuild_thread_index`).
+
+       Because a caller can now WAIT, what may be held under the lock is
+       bounded: **no guarded method reads or parses the map file.** The longest
+       hold is one whole-map write (0.77 ms at today's size) plus, in ``get`` and
+       ``prune``, a session-file stat per entry — costs the event loop already
+       paid inline before this lock existed. Loading a file into a fresh
+       instance is the one unbounded step, and :meth:`_load` is deliberately
+       unguarded so a worker-thread construction cannot stall the loop behind
+       its disk read.
+
+    2. **A multi-mutation sequence must say so.** Two locked calls are two
+       critical sections, and another thread's write can land between them and
+       be lost by the second one's whole-map rewrite. :meth:`batched_save` holds
+       the lock across the block, making the sequence one critical section AND
+       one write. Related mutations belong inside it — never merely adjacent.
+       It MUST NOT be held across an ``await``: the lock is per-thread
+       reentrant, so an await inside a batch lets another coroutine on the same
+       loop walk straight into the block, while a worker thread waiting on the
+       lock stalls until the await returns. ``test_session_map_locking.py``
+       ratchets this against the whole tree.
+
+    3. **Writes go through the LIVE map.** The lock orders access to the
+       structure; it cannot reconcile two instances that loaded ``_data``
+       independently, because the loser's rewrite is a whole-file write of a
+       stale snapshot. A throwaway ``SessionMap()`` is therefore READ-ONLY —
+       see ``session_transfer._join_layer_b`` for what a detached write costs.
+
+    Writes still happen synchronously on the caller's thread, which on the event
+    loop is a stall every task shares (~0.8 ms at today's map sizes, growing
+    linearly with entry count). Moving them off the loop is issue #2405, and the
+    lock is what makes that possible to attempt at all — before it, offloading a
+    single write made the map racy instead of non-blocking.
+
+    SCOPE: the lock is in-PROCESS. Two gateways writing one map file would still
+    lose updates, and nothing here changes that — the data-home singleton is what
+    keeps that from happening. ``history.ConversationLog._locked`` is the
+    cross-process, off-loop-enforcing primitive; this is deliberately not it.
     """
 
     def __init__(self) -> None:
-        self._path = config_dir() / _SESSION_MAP_FILE
+        self._path = config_dir() / SESSION_MAP_FILENAME
         self._data: dict[str, dict] = {}  # key → {"sid", "slack_thread_ts", "slack_channel_id"}
         self._thread_to_session: dict[str, str] = {}  # slack_thread_ts → session_key
+        self._batch_depth = 0
+        self._batch_dirty = False
         self._load()
 
+    @contextmanager
+    def batched_save(self) -> Iterator[None]:
+        """One critical section and one write for every mutation in this block.
+
+        A mutation rewrites the WHOLE map, so a caller making several related
+        mutations pays that cost once per operation rather than once per
+        sequence — and on the event loop each write is a stall every task
+        shares. Nesting is counted, and the write happens on the way out even if
+        the block raises, so a partial sequence is never left only in memory.
+
+        The block also holds :data:`_MAP_LOCK` throughout, which is what makes
+        the sequence ATOMIC and not merely coalesced: without it another
+        thread's write could land between two of these mutations and then be
+        dropped by this batch's whole-map rewrite.
+
+        MUST NOT be held across an ``await``. The lock is reentrant per THREAD,
+        so it does not exclude a second coroutine on the same loop — an await
+        inside the block lets one interleave exactly as it would have without
+        any lock, and meanwhile a worker thread blocked on the lock waits for
+        the await to finish. ``test_session_map_locking.py`` ratchets this
+        against the whole tree, so the rule is checked rather than trusted.
+        """
+        with _MAP_LOCK:
+            self._batch_depth += 1
+            try:
+                yield
+            finally:
+                self._batch_depth -= 1
+                if self._batch_depth == 0 and self._batch_dirty:
+                    self._batch_dirty = False
+                    self._write()
+
     def _load(self) -> None:
-        self._thread_to_session.clear()
+        """Populate this instance from the map file.
+
+        DELIBERATELY NOT ``@_guarded``. It runs from ``__init__`` only, on an
+        instance no other thread can reach yet, so the lock would protect
+        nothing here — and it would do harm: reading and parsing the file is the
+        one unbounded I/O step in this class, and a `SessionMap()` built on a
+        worker thread (``handlers/session_storage._build_index`` runs under
+        ``asyncio.to_thread``) would hold the lock across it, so a loop-side
+        ``set_slack_link`` would block on a worker's disk read and stall every
+        gateway task with it. The two shared effects it does have —
+        ``_rebuild_thread_index`` and the migration ``_save`` — take the lock
+        themselves, and both are bounded (see the class threading contract).
+        """
+        self._thread_to_session = {}
         if self._path.exists():
             try:
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
@@ -133,6 +325,7 @@ class SessionMap:
         else:
             self._data = {}
 
+    @_guarded
     def _rebuild_thread_index(self) -> None:
         """Rebuild _thread_to_session from current _data.
 
@@ -148,8 +341,16 @@ class SessionMap:
         a self-link, which is a no-op rewrite); any other key holds the real
         conversation. This heals maps corrupted before the fix, on load, with no
         migration pass.
+
+        Built into a FRESH dict and rebound at the end, never cleared in place.
+        ``get_session_for_thread`` reads this index without the lock (one keyed
+        lookup, the hot path of every inbound Slack reply), so a clear-then-refill
+        would give it a window in which the thread it is resolving has no owner —
+        and "no owner" is not a delay there, it is a brand-new conversation
+        forked off the user's reply. A rebind is atomic under the GIL, so that
+        reader sees either the whole old index or the whole new one.
         """
-        self._thread_to_session.clear()
+        rebuilt: dict[str, str] = {}
         derived: dict[str, str] = {}
         for key, entry in self._data.items():
             ts = entry.get("slack_thread_ts")
@@ -163,11 +364,20 @@ class SessionMap:
                 # Self-derived: only usable if nothing else claims the thread.
                 derived.setdefault(ts, key)
                 continue
-            self._thread_to_session[ts] = key
+            rebuilt[ts] = key
         for ts, key in derived.items():
-            self._thread_to_session.setdefault(ts, key)
+            rebuilt.setdefault(ts, key)
+        self._thread_to_session = rebuilt
 
+    @_guarded
     def _save(self) -> None:
+        if self._batch_depth:
+            self._batch_dirty = True
+            return
+        self._write()
+
+    @_guarded
+    def _write(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
         try:
@@ -181,6 +391,33 @@ class SessionMap:
                 pass
             raise
 
+    def _resolve_alias(self, key: str) -> "tuple[str, dict | None]":
+        """Resolve *key* through the map's alias folds; return (matched_key, entry).
+
+        The ONE place the key-alias rules live, shared by the pruning
+        :meth:`get` and the read-only :meth:`has_hint` so they cannot drift:
+        1. exact key;
+        2. bidirectional bare <-> ``slack:`` shim (a not-yet-updated caller
+           may pass a bare thread_ts; resolve to the namespaced entry);
+        3. dashboard history round-trip (``dashboard:dashboard_X`` -> the
+           original ``dashboard:X`` written via ``_safe_key``).
+        Pure lookup: no disk I/O, no pruning, no save.
+        """
+        entry = self._data.get(key)
+        if not entry:
+            canon = canonical_key(key)
+            if canon != key:
+                entry = self._data.get(canon)
+                if entry:
+                    key = canon
+        if not entry and key.startswith("dashboard:dashboard_"):
+            canonical = "dashboard:" + key[len("dashboard:dashboard_") :]
+            entry = self._data.get(canonical)
+            if entry:
+                key = canonical
+        return key, entry
+
+    @_guarded
     def get(self, key: str) -> str | None:
         """Return kiro-cli session ID if mapping exists and .json file is present.
 
@@ -190,22 +427,7 @@ class SessionMap:
         ``dashboard_chat-1-xxx``, producing session key
         ``dashboard:dashboard_chat-1-xxx``.  We try the canonical form too.
         """
-        entry = self._data.get(key)
-        # Bidirectional bare <-> slack: shim: a not-yet-updated caller may pass
-        # a bare thread_ts; resolve it to the namespaced entry written at load.
-        if not entry:
-            canon = canonical_key(key)
-            if canon != key:
-                entry = self._data.get(canon)
-                if entry:
-                    key = canon
-        # Fallback: dashboard history round-trip (dashboard:dashboard_X → dashboard:X)
-        matched_key = key
-        if not entry and key.startswith("dashboard:dashboard_"):
-            canonical = "dashboard:" + key[len("dashboard:dashboard_"):]
-            entry = self._data.get(canonical)
-            if entry:
-                matched_key = canonical
+        matched_key, entry = self._resolve_alias(key)
         if not entry:
             return None
         sid = entry["sid"]
@@ -227,6 +449,20 @@ class SessionMap:
             self._remove_entry(matched_key)
         return None
 
+    def has_hint(self, key: str) -> bool:
+        """Read-only, in-memory probe: does an entry exist for *key*?
+
+        Unlike :meth:`get`, this never touches disk and never mutates the map
+        (no stale-entry pruning, no ``_save``), so it is safe to call from the
+        event loop and carries no cross-thread hazard. It can return a false
+        positive for an entry whose session files are gone — callers that act
+        on the hint must treat the pruning :meth:`get` inside the actual
+        resume path as the authority and tolerate the resume falling back.
+        Alias folding is shared with :meth:`get` via ``_resolve_alias``.
+        """
+        return self._resolve_alias(key)[1] is not None
+
+    @_guarded
     def _remove_entry(self, key: str) -> None:
         """Remove an entry and update reverse index."""
         entry = self._data.pop(key, None)
@@ -236,6 +472,7 @@ class SessionMap:
                 del self._thread_to_session[ts]
             self._save()
 
+    @_guarded
     def set(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
         """Save mapping and persist to disk, preserving existing slack fields."""
         key = canonical_key(key)
@@ -269,55 +506,171 @@ class SessionMap:
             return ""
         return entry.get("provider", "")
 
+    @_guarded
     def clear_sid(self, key: str) -> None:
         """Clear the stored session ID without removing the entry.
 
-        Used on provider switch: the SID is incompatible with the new
-        provider, but we keep the entry so Slack link and CWD persist.
+        Used on provider switch (the SID is incompatible with the new
+        provider) and by the poisoned-conversation discard. The cleared sid
+        is stashed as ``discarded_sid`` so the operation is diagnosable and
+        manually reversible — the native conversation still exists on disk;
+        only the pointer to it is dropped.
         """
         entry = self._data.get(canonical_key(key))
         if entry and entry.get("sid"):
+            entry["discarded_sid"] = entry["sid"]
             entry["sid"] = ""
             self._save()
 
+    def get_discarded_sid(self, key: str) -> str:
+        """Return the last sid dropped by :meth:`clear_sid`, or ''."""
+        entry = self._data.get(canonical_key(key))
+        if not entry:
+            return ""
+        return entry.get("discarded_sid", "")
+
+    @_guarded
     def delete(self, key: str) -> None:
         """Remove mapping and persist."""
         self._remove_entry(canonical_key(key))
 
+    @_guarded
     def prune(self) -> int:
-        """Remove entries whose session files no longer exist."""
+        """Remove entries whose session files no longer exist.
+
+        An entry carrying a DURABLE flag is never deleted, and when its ``sid``
+        has gone stale the ``sid`` is cleared instead. A durable flag is a
+        per-conversation SETTING, not session state: it can be written before the
+        conversation has ever run a turn (``/unlink`` as the very first message
+        leaves no ``sid``, no thread and no mirror), and it must outlive the
+        native session the conversation happened to be using. Deleting the entry
+        either way would silently revert the setting at the next restart, and the
+        user's next message would land on the default they had just turned off.
+
+        Session-SCOPED flags (a temporary or incognito thread) are deliberately
+        NOT durable: they describe one session, so keeping their entries alive
+        would leak a never-collected row per such thread and grow the map — which
+        every mutation rewrites — without bound.
+
+        Returns the number of entries removed; a ``sid``-only reset is a repair,
+        not a removal, so it is not counted.
+        """
         sessions_dir = _kiro_sessions_dir()
-        stale = [
-            k
-            for k, entry in self._data.items()
-            if entry.get("provider") != "claude_code"
-            and (
-                (entry.get("sid") and not (sessions_dir / f"{entry['sid']}.json").exists())
-                or (
-                    not entry.get("sid")
-                    and not entry.get("slack_thread_ts")
-                    and not entry.get("mirror")
-                )
-            )
-        ]
+        stale: list[str] = []
+        repaired = False
+        for key, entry in self._data.items():
+            if entry.get("provider") == "claude_code":
+                continue
+            sid = entry.get("sid")
+            durable = _has_durable_flag(entry)
+            if sid and not (sessions_dir / f"{sid}.json").exists():
+                if durable:
+                    entry["sid"] = ""
+                    repaired = True
+                else:
+                    stale.append(key)
+            elif (
+                not sid
+                and not entry.get("slack_thread_ts")
+                and not entry.get("mirror")
+                and not durable
+            ):
+                stale.append(key)
         for k in stale:
             del self._data[k]
         if stale:
             self._rebuild_thread_index()
             self._save()
             logger.info("Pruned %d stale session map entries", len(stale))
+        elif repaired:
+            # A sid-only reset still has to reach disk, or the next startup sees
+            # the same stale sid and repairs it again forever.
+            self._save()
         return len(stale)
 
+    @_guarded
+    def mapped_sids_by_key(self) -> dict[str, str]:
+        """Session key to kiro-cli session ID, for every entry that has one.
+
+        A session ID present here is one Kiro Crew can still resume. Callers that
+        account for or reclaim disk space need both halves of this relation: the
+        IDs to exclude from deletion, and the key each ID belongs to so a
+        session's transcript can be paired with its replay log. Returning the
+        mapping rather than only the ID set is what lets such a caller reclaim a
+        session whole instead of leaving one half behind.
+        """
+        return {
+            key: sid
+            for key, entry in self._data.items()
+            if isinstance(sid := entry.get("sid"), str) and sid
+        }
+
+    @staticmethod
+    def _is_self_derived(key: str, thread_ts: str) -> bool:
+        """True when *key* derives from *thread_ts* itself (``slack:<ts>``).
+
+        Mirrors the predicate in ``_rebuild_thread_index``: a self-derived
+        claimant is the fork (or a self-link) and holds a contested thread
+        only when nothing else claims it.
+        """
+        return is_channel_session_key(key) and key.endswith(thread_ts)
+
+    @_guarded
+    def _evict_rival_claimants(self, key: str, thread_ts: str) -> list[str]:
+        """Clear the Slack link fields of every OTHER entry claiming *thread_ts*.
+
+        Returns the evicted keys. Only link fields are cleared (entry and
+        ``sid`` preserved, mirroring ``clear_slack_link``); the caller owns the
+        reverse-index write and the ``_save()``. A self-derived claimant — a
+        channel key whose ts IS the thread — never evicts: the load-time
+        tie-break in ``_rebuild_thread_index`` awards a contested thread to the
+        non-derived session, and stripping that owner's fields here would leave
+        the heal with nothing to restore.
+        """
+        if self._is_self_derived(key, thread_ts):
+            return []
+        evicted: list[str] = []
+        for other_key, other_entry in self._data.items():
+            if other_key != key and other_entry.get("slack_thread_ts") == thread_ts:
+                other_entry.pop("slack_thread_ts", None)
+                other_entry.pop("slack_channel_id", None)
+                evicted.append(other_key)
+        if evicted:
+            logger.info(
+                "Slack thread %s reassigned to session %s from %s",
+                thread_ts,
+                key,
+                ", ".join(evicted),
+            )
+        return evicted
+
+    @_guarded
     def set_slack_link(self, key: str, thread_ts: str, channel_id: str | None) -> None:
-        """Link a session to a Slack thread. Creates entry if needed."""
+        """Link a session to a Slack thread. Creates entry if needed.
+
+        A thread has at most one owner: a non-derived claim evicts every other
+        entry claiming *thread_ts* (see :meth:`_evict_rival_claimants`), and the
+        eviction lands in the same ``_save()`` as the new claim so a crash
+        between the two cannot persist a two-owner map. A self-derived claim
+        never evicts — the load-time tie-break resolves that contest instead.
+        An empty *thread_ts* is the clear sentinel and neither evicts anyone
+        nor enters the reverse index.
+        """
         key = canonical_key(key)
         entry = self._data.get(key)
+        evicted = self._evict_rival_claimants(key, thread_ts) if thread_ts else []
         if entry:
             if (
                 entry.get("slack_thread_ts") == thread_ts
                 and entry.get("slack_channel_id") == channel_id
             ):
-                self._thread_to_session.setdefault(thread_ts, key)
+                if thread_ts:
+                    if evicted:
+                        self._thread_to_session[thread_ts] = key
+                    else:
+                        self._thread_to_session.setdefault(thread_ts, key)
+                if evicted:
+                    self._save()
                 return
             old_ts = entry.get("slack_thread_ts")
             if old_ts and old_ts != thread_ts:
@@ -330,9 +683,18 @@ class SessionMap:
                 "slack_thread_ts": thread_ts,
                 "slack_channel_id": channel_id,
             }
-        self._thread_to_session[thread_ts] = key
+        if thread_ts:
+            # Same policy as the tie-break: a self-derived claim never
+            # displaces a live owner from the reverse index — it routes the
+            # thread only when nothing else claims it. A non-derived claim
+            # (which just swept its rivals) takes the index outright.
+            if self._is_self_derived(key, thread_ts):
+                self._thread_to_session.setdefault(thread_ts, key)
+            else:
+                self._thread_to_session[thread_ts] = key
         self._save()
 
+    @_guarded
     def get_slack_link(self, key: str) -> tuple[str | None, str | None]:
         """Return (thread_ts, channel_id) for a session."""
         entry = self._data.get(canonical_key(key))
@@ -340,6 +702,7 @@ class SessionMap:
             return None, None
         return entry.get("slack_thread_ts"), entry.get("slack_channel_id")
 
+    @_guarded
     def clear_slack_link(self, key: str) -> bool:
         """Remove the Slack link from a session, keeping the session itself.
 
@@ -376,6 +739,7 @@ class SessionMap:
     # special-casing Slack. Slack routes back through the dedicated fields;
     # every other channel stores a ``ChannelLink`` under ``mirror``.
 
+    @_guarded
     def set_mirror_link(
         self,
         key: str,
@@ -389,6 +753,13 @@ class SessionMap:
         messages arriving from that exact channel location may be routed back to
         *key*. Ordinary dashboard mirrors remain outbound-only. Slack keeps its
         dedicated reverse index and therefore ignores this flag.
+
+        Raises :class:`ConversationOwnershipConflict` when another session already
+        holds this exact location AND the conversation is inbound-committed —
+        either this claim is inbound-capable, or an occupant already is. See
+        :meth:`mirror_claim_blockers`: exclusivity exists to keep inbound routing
+        unambiguous, so it is scoped to that, and two outbound-only mirrors on one
+        conversation stay as permitted as they were before this rule.
         """
         if link is None:
             self.clear_mirror_link(key)
@@ -397,6 +768,12 @@ class SessionMap:
             self.set_slack_link(key, link.thread_id or "", link.channel_id)
             return
         key = canonical_key(key)
+        rivals = self.mirror_claim_blockers(key, link, accepts_inbound=accepts_inbound)
+        if rivals:
+            raise ConversationOwnershipConflict(
+                f"{link.channel_type} conversation is already held by "
+                f"{len(rivals)} other session(s)"
+            )
         entry = self._ensure_entry(key)
         entry["mirror"] = link.to_dict()
         if accepts_inbound:
@@ -405,6 +782,73 @@ class SessionMap:
             entry.pop("mirror_accepts_inbound", None)
         self._save()
 
+    @_guarded
+    def mirror_claim_blockers(
+        self,
+        key: str,
+        link: ChannelLink,
+        *,
+        accepts_inbound: bool = False,
+    ) -> list[str]:
+        """Sessions that must stop *key* from binding *link*, or ``[]`` if it is free.
+
+        The single definition of "this conversation is taken", shared by the
+        atomic check inside :meth:`set_mirror_link` and by the dashboard
+        endpoint's precheck. They must ask the same question with the same
+        arguments: a backstop whose idea of "occupied" differs from the precheck
+        it backs looks like coverage while diverging from it in exactly the cases
+        that matter.
+
+        Exclusivity is owed to INBOUND routing, so it is scoped to it. A
+        conversation is exclusive when it is inbound-committed — either this claim
+        is inbound-capable, or an existing occupant already is. That is precisely
+        when a second binding does harm: the inbound resolver refuses to choose
+        between two candidates and returns ``None``, and "no owner" and "two
+        owners" are the same ``None`` to it, so the reply silently starts a fresh
+        session instead of resuming.
+
+        Two outbound-only mirrors on one conversation are left alone. They are
+        merely noisy — both write out, nobody reads back — and refusing them
+        would reach transports that cannot resume at all, whose in-channel link
+        handlers do not translate this refusal because they can never provoke it.
+
+        The occupancy scan itself is UNFILTERED once the conversation is
+        inbound-committed: an outbound-only occupant counts. Narrowing that too
+        would let an in-channel ``!link`` land a second binding on a conversation
+        the dashboard is resuming through, which is the collision that strands the
+        reply.
+
+        A rebind by the SAME session is not a rivalry, and three spellings can all
+        mean "me": the canonical key, the row the binding actually lives on today
+        (a pre-unification ``dashboard:`` row, which only ``_mirror_key`` can
+        identify), and any other spelling that canonicalizes to this key. Deriving
+        the legacy name unconditionally instead of asking ``_mirror_key`` would
+        excuse a row that is NOT this session's binding, letting a genuine
+        duplicate persist.
+
+        CONTRACT FOR A NEW TRANSPORT: declaring
+        ``TransportCapabilities.supports_session_resume`` makes its conversations
+        inbound-committable, and therefore makes this refusal reachable from that
+        transport's own in-channel link handler. Translate it there into a
+        followable message, as ``discord/transport_dispatch.py`` does — an uncaught
+        raise inside a channel handler is a dropped task and a silent no-reply.
+        """
+        key = canonical_key(key)
+        selves = {key, self._mirror_key(key)}
+        rivals = [
+            other
+            for other in self.find_mirror_sessions(link)
+            if other not in selves and canonical_key(other) != key
+        ]
+        if not rivals:
+            return []
+        if accepts_inbound or any(
+            (self._data.get(other) or {}).get("mirror_accepts_inbound") for other in rivals
+        ):
+            return rivals
+        return []
+
+    @_guarded
     def _mirror_key(self, key: str) -> str:
         """The key a session's mirror binding is actually stored under.
 
@@ -427,6 +871,7 @@ class SessionMap:
                 return legacy_dashboard_mirror_key(canon)
         return canon
 
+    @_guarded
     def get_mirror_link(self, key: str) -> ChannelLink | None:
         """Return a session's outbound mirror target as a channel-neutral link.
 
@@ -461,6 +906,7 @@ class SessionMap:
         entry = self._data.get(canonical_key(key))
         return bool(entry and entry.get("mirror_accepts_inbound"))
 
+    @_guarded
     def find_mirror_sessions(
         self,
         link: ChannelLink,
@@ -489,6 +935,7 @@ class SessionMap:
                 matches.append(key)
         return matches
 
+    @_guarded
     def clear_mirror_links_at(self, link: ChannelLink) -> list[str]:
         """Clear EVERY session whose mirror targets an exact non-Slack location.
 
@@ -518,6 +965,7 @@ class SessionMap:
             self._save()
         return cleared
 
+    @_guarded
     def clear_mirror_link(self, key: str) -> bool:
         """Remove a session's outbound mirror binding; return True iff one existed.
 
@@ -540,6 +988,7 @@ class SessionMap:
             return self.clear_slack_link(mkey)
         return False
 
+    @_guarded
     def max_generation(self, bucket: str) -> int:
         """Return the highest persisted DM generation for a session *bucket*.
 
@@ -556,11 +1005,12 @@ class SessionMap:
         prefix = f"{bucket}:gen"
         for key in self._data:
             if key.startswith(prefix):
-                suffix = key[len(prefix):]
+                suffix = key[len(prefix) :]
                 if suffix.isdigit():
                     best = max(best, int(suffix))
         return best
 
+    @_guarded
     def find_key_by_sid(self, session_id: str) -> str | None:
         """Find the session map key for a given kiro-cli session ID."""
         for k, entry in self._data.items():
@@ -569,6 +1019,7 @@ class SessionMap:
                 return k
         return None
 
+    @_guarded
     def channel_key_for_stem(self, stem: str) -> str:
         """The real channel session key whose transcript filename is *stem*.
 
@@ -604,6 +1055,7 @@ class SessionMap:
         raw = entry.get("link")
         return ChannelLink.from_dict(raw) if raw else None
 
+    @_guarded
     def set_link(self, key: str, link: ChannelLink) -> None:
         """Set the session's OWN inbound-channel link. Creates entry if needed."""
         key = canonical_key(key)
@@ -625,6 +1077,7 @@ class SessionMap:
     # survive gateway restarts and ties its lifetime to the session (pruned
     # with the entry) rather than an ad-hoc bounded LRU in module-global dicts.
 
+    @_guarded
     def _ensure_entry(self, key: str) -> dict:
         """Return the entry for *key*, creating a blank one if absent."""
         entry = self._data.get(key)
@@ -633,6 +1086,7 @@ class SessionMap:
             self._data[key] = entry
         return entry
 
+    @_guarded
     def set_flag(self, key: str, flag: str, value: bool) -> None:
         """Set or clear a boolean per-conversation flag (e.g. ``temporary``).
 
@@ -670,6 +1124,7 @@ class SessionMap:
         flags = entry.get("flags")
         return bool(flags and flags.get(flag))
 
+    @_guarded
     def set_agent_override(self, key: str, agent: str | None) -> None:
         """Set (or clear, when *agent* is falsy) the per-thread agent override."""
         key = canonical_key(key)
@@ -687,6 +1142,7 @@ class SessionMap:
         entry = self._data.get(canonical_key(key))
         return entry.get("agent_override") if entry else None
 
+    @_guarded
     def set_project_override(self, key: str, project: str | None) -> None:
         """Set (or clear, when *project* is falsy) the per-thread project dir."""
         key = canonical_key(key)

@@ -10,9 +10,11 @@ import math
 import re
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 import uuid
+import weakref
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -20,17 +22,27 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.apps.builtins.auto_research import subquestion_queue as _sq
+from kiro_crew.apps.builtins.auto_research.session_keys import (
+    AUTO_RESEARCH_APP,
+    is_campaign_id,
+    is_research_slot_key,
+    research_slot_key,
+)
 from kiro_crew.apps.builtins.auto_research.workflow_template import (
     RESEARCH_WORKFLOW_SOURCE,
     build_workflow_args,
 )
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.autonudge import (
+    AUTONUDGE_STOP_REASON,
+)
 from kiro_crew.autonudge import get_instance as _autonudge_instance
 from kiro_crew.config.paths import data_home
 from kiro_crew.dashboard.chat_utils import (
-    effective_session_key,
+    slot_history_key,
 )
 from kiro_crew.knowledge.llm_pool import LLMPool
+from kiro_crew.platform_compat import is_link_or_junction, unlink_link_or_junction
 
 try:
     from kiro_crew.artifacts import ArtifactNotFoundError, ArtifactStore
@@ -115,6 +127,7 @@ DEFAULT_MAX_SUBQUESTIONS_PER_ROUND = 3
 DEFAULT_DEPTH_DECAY = 0.5
 DEFAULT_RESERVE_FRACTION = 0.15
 POLL_INTERVAL = 5
+_TERMINAL_LOOP_REMOVAL_ATTEMPTS = 3
 _MAX_PARALLEL_WORKERS = 5  # hard cap on parallel sub-agents per cycle
 # Default seconds between cycles (until the next nudge fires). The watchdog's
 # inactivity timeout is idle_secs * 2; the first cycle gets a longer startup
@@ -124,7 +137,10 @@ _FIRST_CYCLE_GRACE_SECS = 600
 # Worker auto-approve is capped at 24h; past this the watchdog pauses the
 # campaign to NEEDS_INPUT and it must be resumed (re-authorized) to continue.
 _TRUST_TTL_SECS = 24 * 3600
-_CAMPAIGN_ID_RE = re.compile(r"^[a-f0-9]{8}$")
+
+# Cap on a stored model id. Longest ids in the wild (fully-qualified Bedrock
+# inference profiles) are ~60 chars; anything past this is not a model id.
+_MAX_MODEL_LEN = 128
 
 
 def _unresponsive_deadline(idle_secs: int) -> int:
@@ -167,7 +183,7 @@ _RESEARCH_NUDGE = (
 
 def _validate_campaign_id(campaign_id: str) -> bool:
     """Reject IDs that could cause path traversal."""
-    return bool(_CAMPAIGN_ID_RE.match(campaign_id))
+    return is_campaign_id(campaign_id)
 
 
 def _safe_campaign_dir(campaign_id: str) -> Path | None:
@@ -276,6 +292,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "ALTER TABLE campaigns ADD COLUMN reserve_fraction REAL NOT NULL DEFAULT 0.15"
                 )
+            # Explicit per-campaign model pick ('' = inherit the research
+            # agent's / backend's default — never a hardcoded id).
+            if "model" not in cols:
+                conn.execute("ALTER TABLE campaigns ADD COLUMN model TEXT NOT NULL DEFAULT ''")
             conn.commit()
             _INITIALIZED_DBS.add(key)
         except Exception:
@@ -368,6 +388,28 @@ def _audit(operation: str, campaign_id: str, **extra: Any) -> None:
 # --- Validation ---
 
 
+def _campaign_model(config: dict) -> str:
+    """The campaign's explicit model pick from a create/fork config, normalized.
+
+    '' means "no explicit pick" — the worker slot inherits the research agent's
+    (and ultimately the backend's) default resolution. A concrete id is stored
+    verbatim (trimmed); over-length ids are rejected in ``validate_campaign``
+    rather than truncated, so a bad id gets a 400 that names the problem instead
+    of being stored as a different string.
+
+    Availability is NOT screened here: no advertised-model list exists outside a
+    live session. If the pick stops being served, the session layer's withhold
+    (``_pinned_model_withheld`` in chat_runner) KEEPS the pin, runs the worker on
+    the backend default, and posts a notice card — but that card lands in the
+    app-owned ``research-<cid>`` transcript, which the Research Lab page does not
+    render, so the fallback is not visible on this app's own surfaces.
+    """
+    raw = config.get("model")
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip()
+
+
 def validate_campaign(config: dict) -> dict:
     errors: list[str] = []
     warnings: list[str] = []
@@ -379,6 +421,24 @@ def validate_campaign(config: dict) -> dict:
     # RL v2: validate execution_mode against supported modes.
     if config.get("execution_mode", DEFAULT_EXECUTION_MODE) not in VALID_EXECUTION_MODES:
         errors.append("Execution mode must be 'agent' or 'workflow'")
+
+    raw_model = config.get("model")
+    if raw_model is not None and not isinstance(raw_model, str):
+        errors.append("Model must be a string")
+    elif isinstance(raw_model, str) and len(raw_model.strip()) > _MAX_MODEL_LEN:
+        # Reject rather than truncate: a sliced id is a *different* string that
+        # is never served, which would take the silent-fallback path instead of
+        # a 400 that names the problem.
+        errors.append(f"Model id too long (max {_MAX_MODEL_LEN} characters)")
+    elif (
+        _campaign_model(config)
+        and config.get("execution_mode", DEFAULT_EXECUTION_MODE) == "workflow"
+    ):
+        # The workflow engine resolves its own models per step; a campaign-level
+        # pin would be silently ignored, which the AGENTS.md contract forbids.
+        errors.append(
+            "Model selection requires agent mode — workflow mode runs on the default model"
+        )
 
     max_cycles = config.get("max_cycles", 30)
     if max_cycles > MAX_CYCLES_HARD_CAP:
@@ -564,11 +624,21 @@ def _list_cycle_files(campaign_id: str) -> list[Path]:
 
 
 def _read_finding_file(path: Path) -> dict:
-    """Read + redact a single cycle finding file; {} on parse/IO error."""
+    """Read + redact a single cycle finding file; {} on parse/IO/shape error.
+
+    The file is LLM-written, so valid-but-wrong-shape JSON (`[]`, a bare
+    string) is as reachable as malformed JSON. `_redact_finding` requires a
+    dict (`.items()`), so a non-object payload must be rejected here — letting
+    it raise would abort the watchdog iteration mid-cycle (e.g. the stall
+    verdict would never settle the campaign, leaving it RUNNING forever).
+    """
     try:
-        return _redact_finding(json.loads(path.read_text()))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    return _redact_finding(data)
 
 
 # --- CRUD ---
@@ -612,8 +682,8 @@ def create_campaign(config: dict) -> dict:
         "INSERT INTO campaigns (id,name,question,sub_questions,sources,scope_constraints,"
         "max_cycles,idle_secs,success_criteria,auto_approve,parent_id,parallel_workers,"
         "execution_mode,max_subquestions_per_round,depth_decay,reserve_fraction,"
-        "status,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "model,status,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             campaign_id,
             name,
@@ -631,6 +701,7 @@ def create_campaign(config: dict) -> dict:
             max_subq,
             depth_decay,
             reserve_fraction,
+            _campaign_model(config),
             CampaignStatus.READY,
             time.time(),
         ),
@@ -750,6 +821,20 @@ def delete_campaign(campaign_id: str) -> dict:
 _watchdog_task: asyncio.Task | None = None
 _SSE_QUEUE_MAXSIZE = 256
 _sse_queues: list[asyncio.Queue] = []
+_campaign_transition_locks: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.WeakValueDictionary[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _campaign_transition_lock(campaign_id: str) -> asyncio.Lock:
+    """Serialize one campaign's user and watchdog status transitions per loop."""
+    event_loop = asyncio.get_running_loop()
+    locks = _campaign_transition_locks.setdefault(event_loop, weakref.WeakValueDictionary())
+    lock = locks.get(campaign_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[campaign_id] = lock
+    return lock
 
 
 def _emit_sse(event: dict) -> None:
@@ -793,7 +878,7 @@ async def _suspend_research_loops_while_disabled(state: Any) -> None:
     if svc is None:
         return
     for loop in svc.list_all():
-        if not loop.slot_key.startswith("research-"):
+        if not is_research_slot_key(loop.slot_key):
             continue
         if loop.active:
             try:
@@ -803,6 +888,335 @@ async def _suspend_research_loops_while_disabled(state: Any) -> None:
         slot = state._slots.get(loop.slot_key) if state is not None else None
         if slot is not None and getattr(slot, "_trust", False):
             slot._trust = False
+
+
+_WORKER_DONE_FILENAME = "worker_done.json"
+# The marker is LLM-written: bound how much of it the gateway will ever read.
+# A legitimate marker is one short JSON object, so 64 KiB is already generous.
+_WORKER_DONE_MAX_BYTES = 64 * 1024
+
+
+def _read_worker_done(campaign_id: str) -> dict | None:
+    """Read the worker's explicit end-of-run marker, or None.
+
+    The worker writes ``worker_done.json`` in its campaign dir immediately
+    before ending its run via ``autonudge_stop`` (instructed in the brief).
+    This LLM-written marker is the compatibility fallback when the source-owned
+    ``autonudge_stop`` tombstone is unavailable. Unlike the mere absence of the
+    autonudge loop — which also happens when a deleted/closed worker session
+    makes the nudge fire path retire the loop (``_fire_dashboard_nudge``:
+    session unreachable → ``remove()``) — the marker file can only exist
+    because the worker chose to finish. Malformed content, a non-object
+    payload, or a missing/non-string/empty ``reason`` is treated as absent
+    (fail toward FAILED, the conservative verdict) — the brief instructs the
+    worker to write ``{"reason": "<one line>"}``, so anything else is not a
+    deliberate completion signal.
+
+    The path is LLM-writable, so the read itself is guarded: links (POSIX
+    symlink or Windows junction) and non-regular files are rejected outright —
+    a marker symlinked to ``/dev/zero`` must not become an unbounded read on
+    the gateway — and at most ``_WORKER_DONE_MAX_BYTES`` are ever read; an
+    over-cap file is treated as absent, never truncated-and-parsed.
+    """
+    d = _safe_campaign_dir(campaign_id)
+    if d is None:
+        return None
+    marker = d / _WORKER_DONE_FILENAME
+    try:
+        if is_link_or_junction(marker):
+            return None
+        st = marker.stat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _WORKER_DONE_MAX_BYTES:
+            return None
+        # Cap at open time too (the file can grow between stat and read):
+        # read one byte past the cap so an over-cap file is detected and
+        # rejected rather than silently truncated into valid-looking JSON.
+        with open(marker, "rb") as fh:
+            raw = fh.read(_WORKER_DONE_MAX_BYTES + 1)
+        if len(raw) > _WORKER_DONE_MAX_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return data
+
+
+def _clear_worker_done_marker(campaign_id: str) -> None:
+    """Remove a stale ``worker_done.json`` so a fresh run cannot inherit it.
+
+    The campaign dir is LLM-writable, so tolerate a rogue DIRECTORY at the
+    marker path too: ``unlink()`` would raise ``IsADirectoryError`` mid-resume
+    (status already RUNNING, worker never launched, HTTP 500). ``rmtree`` only
+    for a REAL directory — any link (POSIX symlink or Windows junction, per
+    ``platform_compat.is_link_or_junction``; a junction reports ``is_dir()``
+    True and ``is_symlink()`` False) is removed as a link so a link into a
+    foreign tree can never recursively delete its target's contents.
+    """
+    d = _safe_campaign_dir(campaign_id)
+    if d is None:
+        return
+    marker = d / _WORKER_DONE_FILENAME
+    if is_link_or_junction(marker):
+        unlink_link_or_junction(marker)
+    elif marker.is_dir():
+        shutil.rmtree(marker, ignore_errors=True)
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def _stalled_campaign_verdict(
+    campaign_id: str,
+    cycle_files: list[Path],
+    *,
+    stopped_reason: str = "",
+) -> tuple[CampaignStatus, str | None]:
+    """Classify an idle-deadline expiry — not every silence is a failure.
+
+    The watchdog only marks COMPLETE when a NEW cycle file arrives carrying
+    ``verification.passed=true`` (or the cycle cap is hit). A worker that ends
+    its run deliberately via ``autonudge_stop`` — goal met, nothing more to
+    write — produces no further findings, so the campaign used to sit silent
+    until the unresponsive deadline and get stamped FAILED ("research stalled")
+    despite a finished report on disk. Distinguish the cases from durable
+    evidence:
+
+    - Latest finding has ``verification.passed=true`` → COMPLETE. Also heals a
+      completed campaign whose status was later reset to RUNNING (resume paths
+      allow terminal→RUNNING): with no new files the count never advances, so
+      the count>prev COMPLETE branch can never re-fire.
+    - A source-owned ``autonudge_stop`` tombstone, or as a fallback the
+      worker-written ``worker_done.json`` marker, plus a READABLE latest
+      finding → the worker ended the run on purpose → STOPPED. The tombstone
+      wins without reading the LLM-written marker. Same terminal affordances
+      as a user Stop (fork / export / add-to-knowledge), no red failure banner.
+      A stop signal alongside only unreadable findings is NOT a deliberate
+      finish — STOPPED's "findings are preserved" promise would be false — so
+      it falls through to FAILED. Mere ABSENCE of the autonudge loop is
+      deliberately NOT used as the signal: the nudge fire path also removes
+      loops for unreachable (deleted/closed) worker sessions, which is a
+      failure, not a finish.
+    - Otherwise → FAILED (genuine stall), unchanged.
+    """
+    if cycle_files:
+        latest = _read_finding_file(cycle_files[-1])
+        verified = latest.get("verification")
+        if isinstance(verified, dict) and verified.get("passed") is True:
+            return CampaignStatus.COMPLETE, None
+        deliberate_stop = stopped_reason == AUTONUDGE_STOP_REASON
+        if latest and (deliberate_stop or _read_worker_done(campaign_id) is not None):
+            return (
+                CampaignStatus.STOPPED,
+                "Worker ended the research loop — findings are preserved.",
+            )
+    return (
+        CampaignStatus.FAILED,
+        "No activity — research stalled. Resume to continue.",
+    )
+
+
+def _persist_new_cycle_bookkeeping(campaign_id: str, cycle_files: list[Path]) -> dict:
+    """Persist one observed cycle advance and run its recursive-exploration step."""
+    count = len(cycle_files)
+    latest = _read_finding_file(cycle_files[-1])
+    db = _get_db()
+    try:
+        db.execute("BEGIN")
+        db.execute(
+            "UPDATE campaigns SET total_cycles=? WHERE id=?",
+            (count, campaign_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+    # File and SQLite work in recursive exploration belongs on the same worker
+    # thread as the finding read and cycle-count persistence.
+    _advance_exploration(campaign_id)
+    return latest
+
+
+async def _record_new_cycle_from_watchdog(
+    campaign_id: str,
+    cycle_files: list[Path],
+    last_counts: dict[str, int],
+    last_ts: dict[str, float],
+) -> dict:
+    """Record a newly observed cycle without blocking the gateway event loop."""
+    latest = await asyncio.to_thread(
+        _persist_new_cycle_bookkeeping,
+        campaign_id,
+        cycle_files,
+    )
+    last_counts[campaign_id] = len(cycle_files)
+    last_ts[campaign_id] = time.time()
+    _emit_sse({"type": "new_finding", "campaign_id": campaign_id, "finding": latest})
+    return latest
+
+
+def _campaign_run_has_status(
+    campaign_id: str,
+    observed_started_at: float | None,
+    expected_status: str,
+) -> bool:
+    """Return whether one run generation has the expected persisted status."""
+    if observed_started_at is None:
+        return False
+    db = _get_db()
+    try:
+        row = db.execute(
+            "SELECT status, started_at FROM campaigns WHERE id = ?",
+            (campaign_id,),
+        ).fetchone()
+    finally:
+        db.close()
+    return bool(
+        row is not None
+        and row["status"] == expected_status
+        and row["started_at"] == observed_started_at
+    )
+
+
+def _campaign_run_is_current(campaign_id: str, observed_started_at: float | None) -> bool:
+    """Return whether the watchdog observation still names the active run."""
+    return _campaign_run_has_status(
+        campaign_id,
+        observed_started_at,
+        CampaignStatus.RUNNING,
+    )
+
+
+async def _settle_campaign_from_watchdog(
+    campaign_id: str,
+    cycle_files: list[Path],
+    last_counts: dict[str, int],
+    last_ts: dict[str, float],
+    *,
+    observed_started_at: float | None,
+    stopped_reason: str = "",
+) -> None:
+    """Classify one terminal signal and cancellation-safely remove its loop."""
+
+    # Bind cleanup to the loop that produced this terminal observation. Status
+    # persistence makes Resume legal and may be slow; Resume can replace the
+    # slot-bound loop before settlement continues. Re-resolving by slot after
+    # that await would delete the replacement and leave RUNNING with no worker.
+    svc = _autonudge_instance()
+    terminating_loop = svc.get_by_slot(research_slot_key(campaign_id)) if svc else None
+    terminating_loop_id = terminating_loop.id if terminating_loop is not None else None
+
+    async def _settle() -> None:
+        async def _remove_terminating_loop() -> None:
+            try:
+                if svc is not None and terminating_loop_id is not None:
+                    for attempt in range(1, _TERMINAL_LOOP_REMOVAL_ATTEMPTS + 1):
+                        try:
+                            await svc.remove(terminating_loop_id)
+                        except OSError:
+                            if attempt == _TERMINAL_LOOP_REMOVAL_ATTEMPTS:
+                                raise
+                            logger.warning(
+                                "Auto Research: retrying durable loop removal for %s "
+                                "after store failure (%s/%s)",
+                                campaign_id,
+                                attempt,
+                                _TERMINAL_LOOP_REMOVAL_ATTEMPTS,
+                            )
+                        else:
+                            break
+            finally:
+                last_counts.pop(campaign_id, None)
+                last_ts.pop(campaign_id, None)
+
+        async with _campaign_transition_lock(campaign_id):
+            if not await asyncio.to_thread(
+                _campaign_run_is_current,
+                campaign_id,
+                observed_started_at,
+            ):
+                return
+            if len(cycle_files) > last_counts.get(campaign_id, 0):
+                # The worker may publish its final finding and stop tombstone in the
+                # same turn. Preserve the ordinary cycle bookkeeping before the
+                # terminal fast path consumes the loop record.
+                await _record_new_cycle_from_watchdog(
+                    campaign_id,
+                    cycle_files,
+                    last_counts,
+                    last_ts,
+                )
+            status, message = await asyncio.to_thread(
+                _stalled_campaign_verdict,
+                campaign_id,
+                cycle_files,
+                stopped_reason=stopped_reason,
+            )
+            # Persist a non-rearmable loop state before SQLite becomes terminal.
+            # If the later removal write fails, restart may retain this exact
+            # loop, but it cannot schedule another worker turn.
+            if (
+                svc is not None
+                and terminating_loop is not None
+                and terminating_loop.active
+            ):
+                await svc.update(terminating_loop.id, active=False)
+            try:
+                await asyncio.to_thread(
+                    update_campaign_status,
+                    campaign_id,
+                    status,
+                    error_message=message,
+                )
+            except Exception:
+                # SQLite commits before the status sidecar and audit write. If
+                # either later step fails, the campaign is already terminal and
+                # retaining its persisted loop would re-arm it after restart.
+                # Bind the recovery to this observed generation and verdict so a
+                # failure before the commit still keeps the non-terminal loop for
+                # a later retry.
+                terminal_committed = await asyncio.to_thread(
+                    _campaign_run_has_status,
+                    campaign_id,
+                    observed_started_at,
+                    status,
+                )
+                if terminal_committed:
+                    await _remove_terminating_loop()
+                raise
+            await _remove_terminating_loop()
+            _emit_sse({"type": status.value, "campaign_id": campaign_id})
+
+    settlement = asyncio.create_task(_settle())
+    try:
+        await asyncio.shield(settlement)
+    except asyncio.CancelledError as cancelled:
+        # Status persistence and loop removal are one terminal transition. A
+        # shutdown cancellation after SQLite commits must not leave an active
+        # persisted loop that start() can re-arm for a terminal campaign.
+        while not settlement.done():
+            try:
+                await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                # Repeated shutdown cancellation must not cancel the cleanup
+                # task or let the watchdog resume its polling loop.
+                continue
+            except Exception:
+                # Retrieve and report the worker failure below without letting
+                # it replace the watchdog's shutdown cancellation.
+                break
+        try:
+            settlement.result()
+        except asyncio.CancelledError:
+            logger.error("auto_research terminal settlement was cancelled")
+        except Exception:
+            # Preserve shutdown cancellation even when persistence fails. The
+            # campaign remains non-terminal and its active loop can retry after
+            # restart instead of leaving shutdown stuck in the watchdog loop.
+            logger.exception("auto_research terminal settlement failed during shutdown")
+        raise cancelled
 
 
 async def _watchdog_loop(app: web.Application | None = None) -> None:
@@ -819,7 +1233,7 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
             # later starts work without a gateway restart, and disabling it stops
             # the work. is_app_enabled reads installed.json synchronously, so run
             # it off the event loop.
-            if not await asyncio.to_thread(is_app_enabled, "auto-research"):
+            if not await asyncio.to_thread(is_app_enabled, AUTO_RESEARCH_APP):
                 # Disabling the app must NOT leave a running campaign auto-approved.
                 # The per-campaign 24h trust expiry lives in the body below, which a
                 # disabled cycle skips, and the autonudge loops fire regardless of the
@@ -844,9 +1258,44 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
                 if row["execution_mode"] == "workflow":
                     await _poll_workflow_campaign(cid, state)
                     continue
-                slot = state._slots.get(f"research-{cid}") if state is not None else None
-                # 24h auto-approve cap: expire trust and require re-authorization.
+                slot_key = research_slot_key(cid)
+                slot = state._slots.get(slot_key) if state is not None else None
+                svc = _autonudge_instance()
+                loop = svc.get_by_slot(slot_key) if svc is not None else None
                 started = row["started_at"]
+                run_newly_observed = (
+                    cid not in last_counts or last_ts.get(cid, 0.0) < (started or 0)
+                )
+                if loop is not None and not loop.active:
+                    stopped_reason = str(getattr(loop, "stopped_reason", "") or "")
+                    if stopped_reason == AUTONUDGE_STOP_REASON:
+                        if run_newly_observed:
+                            # A resume marks the campaign RUNNING before _launch_loop
+                            # removes the previous run's tombstone. Establish this
+                            # run's observation boundary before trusting stop evidence
+                            # so a watchdog poll in that window cannot settle the new
+                            # run. Keep the tombstone inactive while launch catches up.
+                            cycle_files = await asyncio.to_thread(_list_cycle_files, cid)
+                            last_counts[cid] = len(cycle_files)
+                            last_ts[cid] = time.time()
+                        # The directive runs inside the worker turn. Removing
+                        # its loop before that turn exits would cancel the
+                        # firing timer and destroy the response/bookkeeping.
+                        if slot is not None and slot.running:
+                            continue
+                        if run_newly_observed:
+                            continue
+                        cycle_files = await asyncio.to_thread(_list_cycle_files, cid)
+                        await _settle_campaign_from_watchdog(
+                            cid,
+                            cycle_files,
+                            last_counts,
+                            last_ts,
+                            observed_started_at=started,
+                            stopped_reason=stopped_reason,
+                        )
+                        continue
+                # 24h auto-approve cap: expire trust and require re-authorization.
                 if started and time.time() - started > _TRUST_TTL_SECS:
                     if slot is not None:
                         slot._trust = False
@@ -870,11 +1319,8 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
                     _audit("campaign_trust_reestablished", cid)
                 # Re-arm the autonudge loop if a prior app-disable deactivated it
                 # (see _suspend_research_loops_while_disabled at the enabled guard).
-                _svc = _autonudge_instance()
-                if _svc is not None:
-                    _loop = _svc.get_by_slot(f"research-{cid}")
-                    if _loop is not None and not _loop.active:
-                        await _svc.update(_loop.id, active=True)
+                if svc is not None and loop is not None and not loop.active:
+                    await svc.update(loop.id, active=True)
                 # Attended: pause for the user. Unattended: discard the stray
                 # question + keep running (code-enforced; see helper).
                 if _should_pause_for_question(cid, bool(row["auto_approve"])):
@@ -886,29 +1332,18 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
                 # JSON files every 5s).
                 cycle_files = _list_cycle_files(cid)
                 count = len(cycle_files)
-                if cid not in last_counts or last_ts.get(cid, 0.0) < (started or 0):
+                if run_newly_observed:
                     last_counts[cid] = count
                     last_ts[cid] = time.time()
                     continue
                 prev = last_counts[cid]
                 if count > prev:
-                    last_counts[cid] = count
-                    last_ts[cid] = time.time()
-                    # Read only the newest finding (last file).
-                    latest = _read_finding_file(cycle_files[-1])
-                    _emit_sse({"type": "new_finding", "campaign_id": cid, "finding": latest})
-                    db2 = _get_db()
-                    db2.execute("BEGIN")
-                    db2.execute(
-                        "UPDATE campaigns SET total_cycles=? WHERE id=?",
-                        (count, cid),
+                    latest = await _record_new_cycle_from_watchdog(
+                        cid,
+                        cycle_files,
+                        last_counts,
+                        last_ts,
                     )
-                    db2.commit()
-                    db2.close()
-                    # RL v2: advance recursive exploration (ingest agent-proposed
-                    # emergent sub-questions + activate queued ones). Agent-mode
-                    # only and fully guarded — must never break the watchdog.
-                    _advance_exploration(cid)
                     verified = latest.get("verification")
                     if isinstance(verified, dict) and verified.get("passed") is True:
                         update_campaign_status(cid, CampaignStatus.COMPLETE)
@@ -925,15 +1360,21 @@ async def _watchdog_loop(app: web.Application | None = None) -> None:
                         # take minutes) — alive, not unresponsive. Refresh liveness.
                         last_ts[cid] = time.time()
                     elif time.time() - last_ts[cid] > _unresponsive_deadline(row["idle_secs"]):
-                        update_campaign_status(
+                        # Deadline expired — but classify before condemning: a
+                        # worker that deliberately ended its run (worker_done
+                        # marker; verified finding on disk) finished, it didn't
+                        # stall. See _stalled_campaign_verdict. Off the event
+                        # loop: it reads LLM-written files (finding + marker)
+                        # whose size is unbounded, and this watchdog shares the
+                        # gateway's single loop with every request and the
+                        # heartbeat (no-blocking-call-on-event-loop).
+                        await _settle_campaign_from_watchdog(
                             cid,
-                            CampaignStatus.FAILED,
-                            error_message="No activity — research stalled. Resume to continue.",
+                            cycle_files,
+                            last_counts,
+                            last_ts,
+                            observed_started_at=started,
                         )
-                        await _stop_loop(cid, remove=True)  # tear down so Resume re-arms cleanly
-                        last_counts.pop(cid, None)
-                        last_ts.pop(cid, None)
-                        _emit_sse({"type": "failed", "campaign_id": cid})
         except asyncio.CancelledError:
             break
         except Exception:
@@ -961,12 +1402,40 @@ def _require_auth(request: web.Request) -> web.Response | None:
 # --- Campaign worker loop (autonudge-backed) ---
 
 
-async def _launch_loop(request: web.Request, cid: str) -> None:
+async def _prepare_loop_launch(cid: str) -> None:
+    """Remove prior-run stop evidence before a campaign becomes RUNNING.
+
+    The watchdog queries RUNNING campaigns, so callers must await this helper
+    before publishing that state. Otherwise a slow marker cleanup can expose a
+    resumed campaign alongside its previous run's tombstone, letting the
+    watchdog settle the new run before its worker is armed.
+    """
+    # A fresh run must not inherit the previous run's deliberate-stop signals:
+    # stale marker/tombstone evidence would classify a genuine stall of THIS
+    # run as STOPPED. Consume the source-owned tombstone before the potentially
+    # slow marker cleanup so even direct _launch_loop callers preserve that
+    # ordering. The marker path is LLM-writable, so its cleanup runs off-loop
+    # and may rmtree an arbitrarily large rogue directory.
+    svc = _autonudge_instance()
+    if svc is not None:
+        previous = svc.get_by_slot(research_slot_key(cid))
+        if (
+            previous is not None
+            and not previous.active
+            and str(getattr(previous, "stopped_reason", "") or "") == AUTONUDGE_STOP_REASON
+        ):
+            await svc.remove(previous.id)
+    await asyncio.to_thread(_clear_worker_done_marker, cid)
+
+
+async def _launch_loop(request: web.Request, cid: str, *, prepared: bool = False) -> None:
     """Arm an autonudge loop that drives the research cycles for this campaign.
 
     Best-effort: if autonudge or dashboard state is unavailable, the status
     change still stands but no worker is launched (logged for visibility).
     """
+    if not prepared:
+        await _prepare_loop_launch(cid)
     state = request.app.get("state")
     svc = _autonudge_instance()
     if state is None or svc is None:
@@ -977,16 +1446,31 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
     db = _get_db()
     row = db.execute(
         "SELECT name, question, sub_questions, sources, scope_constraints, max_cycles, idle_secs, "
-        "success_criteria, auto_approve, parallel_workers FROM campaigns WHERE id = ?",
+        "success_criteria, auto_approve, parallel_workers, model FROM campaigns WHERE id = ?",
         (cid,),
     ).fetchone()
     db.close()
     if row is None:
         return
     _write_brief(cid, row)
+    # Pin the campaign's explicit model pick on the worker slot ('' = inherit
+    # the research agent's / backend's default resolution — never a hardcoded
+    # id here). If a concrete pick is not served for this account, the session
+    # layer's withhold (_pinned_model_withheld) KEEPS the pin and runs the
+    # worker on the backend default — the notice it posts lands in the hidden
+    # research-<cid> transcript, not on the Research Lab page.
+    campaign_model = row["model"] or ""
+    slot_key = research_slot_key(cid)
     slot = state.get_or_create_slot(
-        name=f"research-{cid}", agent=_RESEARCH_AGENT, app="auto-research"
+        name=slot_key,
+        agent=_RESEARCH_AGENT,
+        app=AUTO_RESEARCH_APP,
+        model=campaign_model,
     )
+    # get_or_create_slot only applies kwargs on CREATE; on resume the slot
+    # already exists, so re-pin explicitly — the campaign row stays the single
+    # source of truth for the worker's model across gateway restarts.
+    slot.model = campaign_model
     # Give the app-owned worker slot a meaningful title (the campaign's human
     # name) instead of the "New Session…" placeholder. The slot is driven by
     # autonudge, whose injected messages carry role "nudge" (not "user"), so the
@@ -995,7 +1479,7 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
     # pattern: redact user-supplied text (defence-in-depth), lock _titled so
     # display_title returns it instead of the placeholder, persist so it survives
     # a gateway restart, and push a live SSE update to the sidebar/header.
-    raw_title = row["name"] or f"research-{cid}"
+    raw_title = row["name"] or slot_key
     if _HAS_SECURITY:
         raw_title, _ = redact_exfiltration_urls(raw_title)
         raw_title, _ = redact_credentials(raw_title)
@@ -1003,7 +1487,7 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
         # Fail closed: the campaign name is user-controlled, so if the security
         # redactors are unavailable we must NOT persist/broadcast it. Fall back
         # to the non-user-derived slot key, which carries no user content.
-        raw_title = f"research-{cid}"
+        raw_title = slot_key
     slot.title = raw_title
     slot._titled = True
     # Persist the title so it survives a gateway restart. set_title() does
@@ -1014,7 +1498,7 @@ async def _launch_loop(request: web.Request, cid: str) -> None:
     if getattr(state, "conversation_log", None) is not None:
         try:
             await asyncio.to_thread(
-                state.conversation_log.set_title, effective_session_key(slot), slot.title
+                state.conversation_log.set_title, slot_history_key(slot), slot.title
             )
         except Exception:
             logger.warning("auto_research: failed to persist slot title for %s", cid, exc_info=True)
@@ -1128,6 +1612,12 @@ def _write_brief(cid: str, row: Any) -> None:
         "Each cycle, also read `guidance.txt` in this dir if present and follow any "
         "directive there (e.g. a FINALIZE MODE instruction to stop exploring and "
         "synthesize your final answer).",
+        "",
+        "**Ending the run:** if you decide the research is finished (goal met or no "
+        "productive work remains), FIRST write `worker_done.json` in this dir as "
+        '`{"reason": "<one line>"}` — this is the durable signal that you ended the '
+        "run on purpose if the source stop record is unavailable — "
+        "and only THEN call `autonudge_stop`.",
         "",
         "Adapt direction each cycle from prior findings; pursue the highest-value open "
         "lead toward the question.",
@@ -1375,7 +1865,7 @@ async def _stop_loop(cid: str, *, remove: bool) -> None:
     svc = _autonudge_instance()
     if svc is None:
         return
-    loop = svc.get_by_slot(f"research-{cid}")
+    loop = svc.get_by_slot(research_slot_key(cid))
     if not loop:
         return
     if remove:
@@ -1460,7 +1950,7 @@ async def _launch_workflow(request: web.Request, cid: str) -> None:
         return
     args = build_workflow_args(dict(row))
     try:
-        res = await svc.start(RESEARCH_WORKFLOW_SOURCE, name="research-" + cid, args=args)
+        res = await svc.start(RESEARCH_WORKFLOW_SOURCE, name=research_slot_key(cid), args=args)
     except Exception:
         logger.exception("auto_research: workflow start failed for %s", cid)
         update_campaign_status(
@@ -1902,7 +2392,7 @@ async def _handle_action(request: web.Request) -> web.Response:
     if action == "fork":
         db = _get_db()
         parent = db.execute(
-            "SELECT id, question, sources, status FROM campaigns WHERE id = ?",
+            "SELECT id, question, sources, status, model FROM campaigns WHERE id = ?",
             (cid,),
         ).fetchone()
         db.close()
@@ -1924,6 +2414,7 @@ async def _handle_action(request: web.Request) -> web.Response:
             "success_criteria": body.get("success_criteria"),
             "auto_approve": body.get("auto_approve", False),
             "parent_id": cid,
+            "model": parent["model"] or "",  # fork continues on the parent's pick
             "grill_tree": body.get("grill_tree"),
         }
         loop = asyncio.get_running_loop()
@@ -1966,37 +2457,41 @@ async def _handle_action(request: web.Request) -> web.Response:
             CampaignStatus.NEEDS_INPUT,
         },
     }
-    db = _get_db()
-    srow = db.execute("SELECT status FROM campaigns WHERE id = ?", (cid,)).fetchone()
-    db.close()
-    if srow is None:
-        return web.json_response({"error": "Not found"}, status=404)
-    if srow["status"] not in allowed[action]:
-        return web.json_response(
-            {"error": f"Cannot {action} a campaign in '{srow['status']}' state"}, status=409
-        )
-    result = update_campaign_status(cid, status_map[action])
-    if "error" in result:
-        return web.json_response(result, status=404)
-    if action in ("start", "resume"):
+    async with _campaign_transition_lock(cid):
+        db = _get_db()
+        srow = db.execute("SELECT status FROM campaigns WHERE id = ?", (cid,)).fetchone()
+        db.close()
+        if srow is None:
+            return web.json_response({"error": "Not found"}, status=404)
+        if srow["status"] not in allowed[action]:
+            return web.json_response(
+                {"error": f"Cannot {action} a campaign in '{srow['status']}' state"}, status=409
+            )
         mode = _campaign_execution_mode(cid)
-        if mode == "workflow":
-            await _launch_workflow(request, cid)
-        else:
-            await _launch_loop(request, cid)
-    elif action == "pause":
-        mode = _campaign_execution_mode(cid)
-        if mode == "workflow":
-            await _stop_workflow(request, cid)
-        else:
-            await _stop_loop(cid, remove=False)
-    elif action == "stop":
-        mode = _campaign_execution_mode(cid)
-        if mode == "workflow":
-            await _stop_workflow(request, cid)
-        else:
-            await _stop_loop(cid, remove=True)
-    return web.json_response(result)
+        if action in ("start", "resume") and mode != "workflow":
+            # Publish RUNNING only after old stop evidence is gone. The watchdog
+            # selects RUNNING campaigns, so reversing this order exposes a partial
+            # resume while marker cleanup or tombstone persistence is still pending.
+            await _prepare_loop_launch(cid)
+        result = update_campaign_status(cid, status_map[action])
+        if "error" in result:
+            return web.json_response(result, status=404)
+        if action in ("start", "resume"):
+            if mode == "workflow":
+                await _launch_workflow(request, cid)
+            else:
+                await _launch_loop(request, cid, prepared=True)
+        elif action == "pause":
+            if mode == "workflow":
+                await _stop_workflow(request, cid)
+            else:
+                await _stop_loop(cid, remove=False)
+        elif action == "stop":
+            if mode == "workflow":
+                await _stop_workflow(request, cid)
+            else:
+                await _stop_loop(cid, remove=True)
+        return web.json_response(result)
 
 
 async def _handle_delete(request: web.Request) -> web.Response:
@@ -2005,17 +2500,18 @@ async def _handle_delete(request: web.Request) -> web.Response:
     cid = request.match_info["id"]
     if not _validate_campaign_id(cid):
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
-    # Tear down any running worker (agent loop or workflow run) first.
-    mode = _campaign_execution_mode(cid)
-    if mode == "workflow":
-        await _stop_workflow(request, cid)
-    else:
-        await _stop_loop(cid, remove=True)
-    result = delete_campaign(cid)
-    if "error" in result:
-        return web.json_response(result, status=404)
-    _audit("campaign_deleted", cid)
-    return web.json_response(result)
+    async with _campaign_transition_lock(cid):
+        # Tear down any running worker (agent loop or workflow run) first.
+        mode = _campaign_execution_mode(cid)
+        if mode == "workflow":
+            await _stop_workflow(request, cid)
+        else:
+            await _stop_loop(cid, remove=True)
+        result = delete_campaign(cid)
+        if "error" in result:
+            return web.json_response(result, status=404)
+        _audit("campaign_deleted", cid)
+        return web.json_response(result)
 
 
 async def _handle_nudge(request: web.Request) -> web.Response:

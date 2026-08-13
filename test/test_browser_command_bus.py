@@ -86,6 +86,60 @@ async def test_submit_no_panel_raises_fast() -> None:
         await bus.submit("s1", "navigate", {}, timeout_ms=5000)
 
 
+# ── bus: cold-start race — submit waits for a host that is present ─────────
+
+
+@pytest.mark.asyncio
+async def test_submit_waits_for_cold_starting_panel() -> None:
+    """A host IS polling (heartbeat) but the target panel is not registered yet.
+
+    submit must HOLD for the panel to register (the cold-start window) rather
+    than 503 straight to the mirror, then proceed once a drain registers it.
+    """
+    bus = BrowserCommandBus(panel_wait_ms=2000)
+    # Empty-keys heartbeat: marks a host present, registers no panel.
+    assert await bus.drain([], wait_ms=0) is None
+    assert await bus.is_registered("s1") is False
+
+    submit_task = asyncio.create_task(
+        bus.submit("s1", "navigate", {"url": "http://x"}, timeout_ms=2000)
+    )
+    # It must be blocking on registration, not failed.
+    await asyncio.sleep(0.02)
+    assert not submit_task.done(), "submit should hold for the panel, not fail fast"
+
+    # The panel finally registers (Electron's drain loop picked up the key).
+    drain_task = asyncio.create_task(bus.drain(["s1"], wait_ms=2000))
+    await _wait_registered(bus, "s1")
+    cmd = await drain_task
+    assert cmd is not None and cmd["op"] == "navigate"
+    await bus.complete(cmd["id"], True, result={"ok": 1})
+    outcome = await submit_task
+    assert outcome["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_submit_gives_up_after_panel_wait_when_never_registered() -> None:
+    """Host present but the panel never registers -> NoPanelError after the
+    bounded wait (so the proxy still falls back, just not instantly)."""
+    bus = BrowserCommandBus(panel_wait_ms=50)
+    assert await bus.drain([], wait_ms=0) is None  # host present, no panel
+    with pytest.raises(NoPanelError):
+        await bus.submit("s1", "navigate", {}, timeout_ms=5000)
+
+
+@pytest.mark.asyncio
+async def test_submit_no_host_never_waits() -> None:
+    """With no host ever polling (remote / non-Electron), submit fails fast even
+    though panel_wait_ms is large — no delay before the Playwright fall-back."""
+    bus = BrowserCommandBus(panel_wait_ms=100000)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    with pytest.raises(NoPanelError):
+        await bus.submit("s1", "navigate", {}, timeout_ms=5000)
+    assert loop.time() - t0 < 1.0, "must not wait when no host is present"
+
+
 # ── bus: drain registers a session, then submit no longer 503s ────────────
 
 
@@ -112,8 +166,9 @@ async def test_drain_registers_then_submit_ok() -> None:
 @pytest.mark.asyncio
 async def test_ttl_expiry_deregisters() -> None:
     clock = {"t": 1000.0}
-    bus = BrowserCommandBus(now=lambda: clock["t"])
-    # wait_ms small -> TTL floors at 1.0s; registered at t=1000, expiry=1001.
+    # Inject a small liveness TTL so expiry is testable without real sleeps.
+    bus = BrowserCommandBus(now=lambda: clock["t"], panel_ttl_s=1.0)
+    # Registered at t=1000, expiry=1001 (fixed TTL, independent of wait_ms).
     res = await bus.drain(["s1"], wait_ms=20)
     assert res is None
     assert await bus.is_registered("s1") is True
@@ -122,6 +177,37 @@ async def test_ttl_expiry_deregisters() -> None:
     assert await bus.is_registered("s1") is False
     with pytest.raises(NoPanelError):
         await bus.submit("s1", "op", {}, timeout_ms=100)
+
+
+@pytest.mark.asyncio
+async def test_panel_ttl_is_independent_of_drain_wait() -> None:
+    """Liveness TTL is a FIXED window, not ~2x the poll wait: a short drain wait
+    still keeps the panel live long enough to survive a long op's dispatch gap
+    (the regression a short interval would otherwise introduce)."""
+    clock = {"t": 1000.0}
+    bus = BrowserCommandBus(now=lambda: clock["t"], panel_ttl_s=30.0)
+    assert await bus.drain(["s1"], wait_ms=50) is None  # a short poll wait
+    clock["t"] = 1005.0  # well past 2x the wait, within the fixed TTL
+    assert await bus.is_registered("s1") is True
+
+
+@pytest.mark.asyncio
+async def test_complete_refreshes_liveness() -> None:
+    """A result post refreshes the session's liveness (the window proved itself
+    alive), so an op whose dispatch outlasts a poll gap does not let the panel
+    lapse before the next op."""
+    clock = {"t": 1000.0}
+    bus = BrowserCommandBus(now=lambda: clock["t"], panel_ttl_s=10.0)
+    drain_task = asyncio.create_task(bus.drain(["s1"], wait_ms=2000))
+    await _wait_registered(bus, "s1")
+    submit_task = asyncio.create_task(bus.submit("s1", "op", {}, timeout_ms=5000))
+    cmd = await drain_task
+    assert cmd is not None
+    clock["t"] = 1008.0  # time passed during dispatch (near the 10s TTL)
+    await bus.complete(cmd["id"], True, result=None)
+    await submit_task
+    clock["t"] = 1017.0  # 9s after the refresh at 1008 -> still live
+    assert await bus.is_registered("s1") is True
 
 
 # ── bus: timeout path cleans up ───────────────────────────────────────────
@@ -261,13 +347,60 @@ async def test_handlers_reject_loopback_cookie_caller(fresh_bus) -> None:
 
 @pytest.mark.asyncio
 async def test_handler_command_missing_fields_400(fresh_bus) -> None:
-    resp = await msg.api_browser_command(_req({"op": "navigate"}))
+    # ``op`` is the only hard-required field now; a missing session identity is a
+    # graceful 503 (below), not a 400.
+    resp = await msg.api_browser_command(_req({"session_key": "s1"}))
     assert resp.status == 400
+    assert _body(resp)["code"] == "op_required"
+
+
+@pytest.mark.asyncio
+async def test_handler_command_no_session_identity_is_503_not_400(fresh_bus) -> None:
+    """op present but no resolvable session (no host_pid, empty fallback) ->
+    answer like no-panel (503) so the proxy falls back to Playwright, rather than
+    surfacing a hard 400 MCP error to the agent."""
+    resp = await msg.api_browser_command(_req({"op": "navigate", "args": {}}))
+    assert resp.status == 503
+    assert _body(resp)["error"] == "no-native-panel"
+
+
+@pytest.mark.asyncio
+async def test_handler_command_resolves_session_from_host_pid(fresh_bus, monkeypatch) -> None:
+    """The gateway resolves the authoritative key from host_pid, OVERRIDING the
+    proxy's empty frozen-env fallback, and strips the "dashboard:" prefix to
+    match the bare slot key the Electron panel registers via command-drain."""
+    monkeypatch.setattr(msg, "_resolve_browse_session_key", lambda _pid: "dashboard:chat-9")
+    # Panel registers under the BARE slot key (what Electron's listPanelIds yields).
+    drain_task = asyncio.create_task(
+        msg.api_browser_command_drain(_req({"session_keys": ["chat-9"], "wait_ms": 2000}))
+    )
+    await _wait_registered(fresh_bus, "chat-9")
+    # Warm-pool proxy: empty session_key, but host_pid resolves to chat-9.
+    submit_task = asyncio.create_task(
+        msg.api_browser_command(
+            _req({"session_key": "", "host_pid": 4242, "op": "navigate", "args": {"url": "http://x"}})
+        )
+    )
+    drain_resp = await drain_task
+    assert drain_resp.status == 200
+    assert _body(drain_resp)["session_key"] == "chat-9", "resolved+stripped key drives the panel"
+    await msg.api_browser_command_result(_req({"id": _body(drain_resp)["id"], "ok": True, "result": "ok"}))
+    submit_resp = await submit_task
+    assert submit_resp.status == 200
+    assert _body(submit_resp)["ok"] is True
 
 
 @pytest.mark.asyncio
 async def test_handler_drain_idle_204(fresh_bus) -> None:
     resp = await msg.api_browser_command_drain(_req({"session_keys": ["s1"], "wait_ms": 30}))
+    assert resp.status == 204
+
+
+@pytest.mark.asyncio
+async def test_handler_drain_heartbeat_wait0_returns_204(fresh_bus) -> None:
+    """The Electron idle heartbeat (empty keys, wait_ms=0) returns 204 at once
+    rather than being coerced to the long default wait."""
+    resp = await msg.api_browser_command_drain(_req({"session_keys": [], "wait_ms": 0}))
     assert resp.status == 204
 
 

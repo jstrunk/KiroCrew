@@ -1,5 +1,7 @@
 """Unit tests for mcp_playwright_proxy — compression, framing, error handling."""
 
+import json
+
 from kiro_crew import mcp_playwright_proxy as proxy
 from kiro_crew.mcp_playwright_proxy import (
     _compress_to_outline,
@@ -209,6 +211,7 @@ class TestResolvePlaywrightCmd:
 
             def __init__(self, cmd, **kw):
                 captured["cmd"] = cmd
+                captured["env"] = kw.get("env") or {}
                 self.stdin = None
                 self.stdout = None
 
@@ -227,7 +230,198 @@ class TestResolvePlaywrightCmd:
             pass
 
         assert captured["cmd"][0] == launcher
-        assert captured["cmd"][1] == "@playwright/mcp"
+        # ``--yes`` (npx flag) precedes the pinned package spec.
+        assert captured["cmd"][1] == "--yes"
+        # No version pinned in this isolated home -> falls back to @latest.
+        assert captured["cmd"][2] == "@playwright/mcp@latest"
+        # The public registry is pinned in the child env so a private/stale-token
+        # default .npmrc cannot 401 this public package.
+        assert captured["env"].get("npm_config_registry") == proxy.PUBLIC_NPM_REGISTRY
+
+    def test_run_proxy_launches_pinned_version_when_recorded(self, monkeypatch):
+        # When the enable-time prime recorded a version, the runtime launches THAT
+        # exact spec (offline-deterministic, no drift), not @latest.
+        import os as _os
+
+        launcher = _os.path.join("node-bin", "npx")
+        monkeypatch.setattr(proxy, "_resolve_playwright_cmd", lambda: launcher)
+        from kiro_crew.browser import setup as _setup
+
+        monkeypatch.setattr(_setup, "get_pinned_playwright_version", lambda: "0.0.78")
+        captured = {}
+
+        class _FakeProc:
+            returncode = 0
+
+            def __init__(self, cmd, **kw):
+                captured["cmd"] = cmd
+                captured["env"] = kw.get("env") or {}
+                self.stdin = None
+                self.stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(proxy.subprocess, "Popen", _FakeProc)
+        monkeypatch.setattr(proxy.threading, "Thread", lambda *a, **k: _NoopThread())
+        monkeypatch.setattr(proxy, "_read_message", lambda *a, **k: None)
+
+        try:
+            proxy.run_proxy([])
+        except SystemExit:
+            pass
+
+        assert captured["cmd"][2] == "@playwright/mcp@0.0.78"
+        # prefer-offline so a cached pinned version launches without a registry
+        # round-trip (offline host still starts); the registry pin still applies for
+        # the fetch-when-missing case.
+        assert captured["env"].get("npm_config_prefer_offline") == "true"
+        assert captured["env"].get("npm_config_registry") == proxy.PUBLIC_NPM_REGISTRY
+
+    def test_run_proxy_does_not_pin_registry_for_binary_launcher(self, monkeypatch):
+        # A standalone binary launcher is not an npm fetch, so no registry pin is
+        # injected — we must not perturb the env for a non-npx launcher.
+        launcher = "/usr/local/bin/mcp-server-playwright"
+        monkeypatch.setattr(proxy, "_resolve_playwright_cmd", lambda: launcher)
+        captured = {}
+
+        class _FakeProc:
+            returncode = 0
+
+            def __init__(self, cmd, **kw):
+                captured["cmd"] = cmd
+                captured["env"] = kw.get("env") or {}
+                self.stdin = None
+                self.stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(proxy.subprocess, "Popen", _FakeProc)
+        monkeypatch.setattr(proxy.threading, "Thread", lambda *a, **k: _NoopThread())
+        monkeypatch.setattr(proxy, "_read_message", lambda *a, **k: None)
+        monkeypatch.delenv("npm_config_registry", raising=False)
+
+        try:
+            proxy.run_proxy([])
+        except SystemExit:
+            pass
+
+        assert captured["cmd"] == [launcher]
+        assert "npm_config_registry" not in captured["env"]
+
+
+class TestRunProxyConfigRepair:
+    """run_proxy self-heals the config at its load moment (#2491).
+
+    A stale contextOptions.storageState (file deleted, or config written
+    before the #2209 generation-time fix) made Playwright raise ENOENT at
+    context creation on every browser_* call, and the running playwright-mcp
+    process caches the config — so the repair must happen HERE, before the
+    spawn, not only at generation time.
+    """
+
+    def _arm(self, monkeypatch, captured):
+        class _FakeProc:
+            returncode = 0
+
+            def __init__(self, cmd, **kw):
+                captured["cmd"] = cmd
+                self.stdin = None
+                self.stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        monkeypatch.setattr(proxy, "_resolve_playwright_cmd", lambda: "/usr/bin/playwright-mcp")
+        monkeypatch.setattr(proxy.subprocess, "Popen", _FakeProc)
+        monkeypatch.setattr(proxy.threading, "Thread", lambda *a, **k: _NoopThread())
+        monkeypatch.setattr(proxy, "_read_message", lambda *a, **k: None)
+
+    def test_dangling_storage_state_repaired_before_spawn(self, monkeypatch, tmp_path):
+        cfg = tmp_path / "playwright-config.json"
+        missing = tmp_path / "playwright-storage-state.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "browser": {
+                        "browserName": "chromium",
+                        "contextOptions": {"storageState": str(missing)},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        captured: dict = {}
+        self._arm(monkeypatch, captured)
+        try:
+            proxy.run_proxy(["--config", str(cfg)])
+        except SystemExit:
+            pass
+        # The on-disk config was healed BEFORE @playwright/mcp got spawned with it.
+        on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+        assert "storageState" not in on_disk["browser"]["contextOptions"]
+        assert captured["cmd"][-2:] == ["--config", str(cfg)]
+
+    def test_config_equals_form_also_repaired(self, monkeypatch, tmp_path):
+        # @playwright/mcp accepts --config=<path> too; a hand-written mcp.json
+        # entry using the equals form must get the same self-heal.
+        cfg = tmp_path / "playwright-config.json"
+        missing = tmp_path / "playwright-storage-state.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "browser": {
+                        "browserName": "chromium",
+                        "contextOptions": {"storageState": str(missing)},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        captured: dict = {}
+        self._arm(monkeypatch, captured)
+        try:
+            proxy.run_proxy([f"--config={cfg}"])
+        except SystemExit:
+            pass
+        on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+        assert "storageState" not in on_disk["browser"]["contextOptions"]
+
+    def test_no_config_arg_skips_repair(self, monkeypatch, tmp_path):
+        # Extension-mode launches carry no --config; the repair must not run
+        # (and must not guess at the default path from inside the proxy).
+        calls: list = []
+        import kiro_crew.browser.setup as setup_mod
+
+        monkeypatch.setattr(
+            setup_mod, "repair_playwright_config", lambda *a, **k: calls.append(a)
+        )
+        captured: dict = {}
+        self._arm(monkeypatch, captured)
+        try:
+            proxy.run_proxy(["--extension"])
+        except SystemExit:
+            pass
+        assert calls == []
+
+    def test_trailing_config_flag_without_value_is_safe(self, monkeypatch):
+        # Malformed argv (--config as last arg) must neither crash the proxy
+        # nor invoke the repair (which would guess at a path).
+        calls: list = []
+        import kiro_crew.browser.setup as setup_mod
+
+        monkeypatch.setattr(
+            setup_mod, "repair_playwright_config", lambda *a, **k: calls.append(a)
+        )
+        captured: dict = {}
+        self._arm(monkeypatch, captured)
+        try:
+            proxy.run_proxy(["--config"])
+        except SystemExit:
+            pass
+        assert captured["cmd"][-1] == "--config"
+        assert calls == []
 
 
 class _NoopThread:

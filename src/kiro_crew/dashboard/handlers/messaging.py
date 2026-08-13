@@ -24,13 +24,35 @@ from kiro_crew.browser.command_bus import (
 )
 from kiro_crew.browser.screencast import BROWSER_FRAME_EVENT, build_frame_payload
 from kiro_crew.browser.setup import (
+    BROWSER_ENGINES,
+    BROWSER_FIRST_USE_NOTE,
+    browser_mode_enabled,
+    deregister_playwright_proxy,
+    ensure_playwright_installed,
+    generate_playwright_config,
+    get_browser_engine,
     get_extension_token,
     has_playwright_extension,
+    is_playwright_installed,
     register_playwright_proxy,
+    set_browser_engine,
+    set_browser_mode_enabled,
 )
 from kiro_crew.cron import CronStoreBusy
+from kiro_crew.dashboard.channel_folders import (
+    LIVE_RELOAD_FIELDS,
+    clean_session_folder,
+    ensure_channel_folder,
+    stored_folder_name,
+)
 from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
-from kiro_crew.dashboard.chat_utils import _remove_queued_by_id, dashboard_slot_key
+from kiro_crew.dashboard.chat_utils import (
+    _remove_queued_by_id,
+    dashboard_slot_key,
+    mint_options_token,
+    remember_slack_options,
+    slack_options_owner_key,
+)
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.origin import is_direct_local_request, is_loopback
 from kiro_crew.dashboard.state import (
@@ -45,6 +67,8 @@ from kiro_crew.notifications.bus import (
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_pid_sig import verify_session_pid
 from kiro_crew.slack.format import build_options_blocks, extract_options
+from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
+from kiro_crew.spawn_warm import warm_project_agents_for_spawn
 from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
@@ -91,6 +115,9 @@ async def api_spawn(request: web.Request) -> web.Response:
                 "max_turns": body.get("max_turns", 0),
                 "cwd": body.get("cwd", ""),
                 "model": body.get("model", ""),
+                "include_memory": body.get("include_memory", True),
+                "include_lessons": body.get("include_lessons", True),
+                "include_project": body.get("include_project", True),
             },
             SPAWN_RUN_SCHEMA,
         )
@@ -134,6 +161,10 @@ async def api_spawn(request: web.Request) -> web.Response:
         batch_total = max(0, min(int(body.get("batch_total", 0) or 0), 1000))
     except (TypeError, ValueError):
         batch_total = 0
+    # The async moment preceding the synchronous spawn(): warm here so the
+    # on-loop, cache-only agent validation inside spawn() is a hit.
+    if agent:
+        await warm_project_agents_for_spawn(state, cwd)
     info = state.subagents.spawn(
         task,
         parent_session_key=parent_session,
@@ -146,6 +177,9 @@ async def api_spawn(request: web.Request) -> web.Response:
         batch_id=batch_id,
         batch_total=batch_total,
         keep=keep,
+        include_memory=cleaned.get("include_memory", True) is not False,
+        include_lessons=cleaned.get("include_lessons", True) is not False,
+        include_project=cleaned.get("include_project", True) is not False,
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -201,6 +235,12 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         max_turns = max(0, min(int(body.get("max_turns", 0) or 0), 1000))
     except (TypeError, ValueError):
         max_turns = 0
+    # The run's own cwd, resolved OFF the event loop: a continuation has to run
+    # where the run ran (a project-local agent does not resolve against the pool
+    # project), but reading state.json and probing the path are blocking calls and
+    # `continue_conversation` is synchronous. Doing it here keeps the gateway
+    # responsive even when the recorded path lives on a stalled mount.
+    resumed_cwd = await asyncio.to_thread(state.subagents.recorded_cwd, conv_id)
     info = state.subagents.continue_conversation(
         conv_id,
         task,
@@ -208,6 +248,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         agent=agent,
         model=model or None,
         max_turns=max_turns,
+        cwd=resumed_cwd,
     )
     if not info:
         return web.json_response(
@@ -235,7 +276,12 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
 
 
 async def api_spawn_steer(request: web.Request) -> web.Response:
-    """POST /api/spawn/{agent_id}/steer — inject into a RUNNING run's turn."""
+    """POST /api/spawn/{agent_id}/steer — inject into a RUNNING run's turn.
+
+    Body: ``{message, mode?}``. ``mode="interrupt"`` (default) injects into
+    the running turn; ``mode="follow_up"`` queues the message for delivery as
+    a continuation AFTER the run's current turn completes (never interrupts).
+    """
     state: DashboardState = request.app["state"]
     if not state.subagents:
         return web.json_response(
@@ -254,7 +300,16 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "message is required", "code": "message_required"}, status=400
         )
-    ok, detail = await state.subagents.steer_run(agent_id, message)
+    mode = str(body.get("mode", "") or "interrupt").strip()
+    if mode not in ("interrupt", "follow_up"):
+        return web.json_response(
+            {"error": "mode must be 'interrupt' or 'follow_up'", "code": "invalid_mode"},
+            status=400,
+        )
+    if mode == "follow_up":
+        ok, detail = await state.subagents.follow_up_run(agent_id, message)
+    else:
+        ok, detail = await state.subagents.steer_run(agent_id, message)
     if not ok:
         if detail == "not_found":
             return web.json_response(
@@ -276,7 +331,9 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": detail, "code": "steer_failed"}, status=502
         )
-    return web.json_response({"id": agent_id, "status": "steered"})
+    return web.json_response(
+        {"id": agent_id, "status": "follow_up_queued" if mode == "follow_up" else "steered"}
+    )
 
 
 async def api_spawn_release(request: web.Request) -> web.Response:
@@ -534,6 +591,19 @@ async def api_spawn_list(request: web.Request) -> web.Response:
             entry["turns"] = info.turns
             entry["last_tool"] = _redact(info.last_tool)
             entry["elapsed"] = round(time.time() - info.started)
+        # Present only when a group was actually withheld, so the default
+        # (everything on) payload is unchanged.
+        withheld = [
+            group
+            for group, on in (
+                ("memory", info.include_memory),
+                ("lessons", info.include_lessons),
+                ("project", info.include_project),
+            )
+            if not on
+        ]
+        if withheld:
+            entry["context_withheld"] = withheld
         agents.append(entry)
     return web.json_response({"agents": agents})
 
@@ -568,6 +638,12 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
             {"error": f"only failed agents can be retried (outcome={old.outcome})"},
             status=409,
         )
+    # Same validated warm as the primary spawn handler. old.cwd was validated
+    # at the ORIGINAL spawn, but the allowlist may have changed since (and a
+    # gateway restart leaves the cache cold), so it is re-checked against the
+    # current config before any discovery read.
+    if old.agent:
+        await warm_project_agents_for_spawn(state, old.cwd or "")
     info = state.subagents.spawn(
         old._raw_task or old.task,
         parent_session_key=old.parent_session_key,
@@ -577,6 +653,11 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         model=old.model or None,
         approval_mode=old.approval_mode or None,
         silent=old.silent,
+        # A retry must see the SAME context scope as the run it replaces —
+        # otherwise the retried agent is a different experiment.
+        include_memory=old.include_memory,
+        include_lessons=old.include_lessons,
+        include_project=old.include_project,
     )
     if not info:
         return web.json_response(
@@ -1125,7 +1206,11 @@ async def api_send_message(request: web.Request) -> web.Response:
             resources=f"target_user={target_user}",
         )
         return web.json_response(
-            {"error": "user not in allowlist — configure allowed_users in config.json"}, status=403
+            {
+                "error": "user not in allowlist — configure allowed_users in config.json",
+                "code": "user_not_in_allowlist",
+            },
+            status=403,
         )
 
     sent_slack = False
@@ -1282,12 +1367,53 @@ async def api_send_message(request: web.Request) -> web.Response:
                             )
                             if options:
                                 try:
-                                    await state.slack_client.post_blocks(
+                                    # Asker is the thread's owner: an out-of-band
+                                    # post has no running session of its own, so
+                                    # the conversation that receives the reply is
+                                    # the right subject.
+                                    _sm_o = slack_options_owner_key(state, thread_ts or "")
+                                    _sm_t = (
+                                        await asyncio.to_thread(mint_options_token, state, _sm_o)
+                                        if _sm_o
+                                        else None
+                                    )
+                                    option_blocks = build_options_blocks(
+                                        options, staleness_token=_sm_t
+                                    )
+                                    # Fallback text is the SAFE stub, not the
+                                    # message body. Slack parses entities in a
+                                    # message's top-level `text` -- which is what
+                                    # notifications render -- so an agent-authored
+                                    # body containing `<!channel>` would ping the
+                                    # whole channel, and the expiry would ping it
+                                    # AGAIN every time it replays this text on its
+                                    # edit. Nothing is lost: the body was already
+                                    # posted as its own message just above, so here
+                                    # it was pure duplication. This is the same stub
+                                    # the other three posting paths use.
+                                    option_ts = await state.slack_client.post_blocks(
                                         channel,
-                                        build_options_blocks(options),
-                                        text,
+                                        option_blocks,
+                                        OPTIONS_FALLBACK_TEXT,
                                         thread_ts=thread_ts,
                                     )
+                                    # A thread IS a conversation, so bind the
+                                    # control to whichever session owns that
+                                    # thread — a dashboard session mirroring into
+                                    # it, or the Slack-born one. Without a thread
+                                    # there is no conversation to supersede it, so
+                                    # nothing is recorded.
+                                    if thread_ts and option_ts:
+                                        remember_slack_options(
+                                            state,
+                                            slack_options_owner_key(state, str(thread_ts)),
+                                            PostedOptions(
+                                                channel=channel,
+                                                ts=option_ts,
+                                                choices=tuple(options),
+                                                blocks=tuple(option_blocks),
+                                            ),
+                                        )
                                 except Exception:
                                     logger.debug(
                                         "send_message: failed to post OPTIONS blocks",
@@ -1872,8 +1998,11 @@ async def api_browser_command(request: web.Request) -> web.Response:
     """POST /api/browser/command — run one op against the native browser panel.
 
     Called by the Playwright MCP proxy. Body:
-    ``{"session_key": str, "op": str, "args": object, "timeout_ms"?: int}``.
-    Enqueues the op on the command bus and awaits the native panel's result.
+    ``{"op": str, "host_pid": int, "session_key"?: str, "args"?: object, "timeout_ms"?: int}``.
+    The session is resolved from ``host_pid`` (signed session_pid sidecar, same as
+    ``api_browser_frame``); ``session_key`` is only a fallback for per-session
+    spawns. Enqueues the op on the command bus and awaits the native panel's
+    result.
 
     Responses:
     - 200 ``{"id", "ok": true, "result": <any>}`` — op ran and succeeded;
@@ -1913,23 +2042,55 @@ async def api_browser_command(request: web.Request) -> web.Response:
             resources="invalid-json",
         )
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    session_key = body.get("session_key")
+    fallback_key = body.get("session_key")
     op = body.get("op")
     args = body.get("args")
     timeout_ms = body.get("timeout_ms")
-    if not isinstance(session_key, str) or not session_key or not isinstance(op, str) or not op:
+    if not isinstance(op, str) or not op:
         _sel().log_tool_invocation(
             session_key="dashboard",
             tool_name="browser_command",
             outcome="invalid_input",
             downstream_service="browser",
-            resources="missing session_key/op",
+            resources="missing op",
         )
-        return web.json_response({"error": "session_key and op required", "code": "session_key_and_op_required"}, status=400)
+        return web.json_response({"error": "op required", "code": "op_required"}, status=400)
     if args is not None and not isinstance(args, dict):
         return web.json_response({"error": "args must be an object", "code": "args_must_be_object"}, status=400)
     if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms <= 0:
         timeout_ms = DEFAULT_COMMAND_TIMEOUT_MS
+    # Resolve the AUTHORITATIVE session key from the posting proxy's host pid
+    # (gateway-signed session_pid sidecar), overriding the proxy's frozen-env key
+    # which is EMPTY under the warm pool -- the same resolution api_browser_frame
+    # does. Strip the "dashboard:" prefix so the key matches the BARE slot key the
+    # Electron panel registers via command-drain and dispatches on (see
+    # api_browser_frame for the identical normalization). The proxy-provided
+    # session_key is only a fallback for per-session spawns whose pid does not
+    # resolve.
+    resolved_key = await asyncio.to_thread(
+        _resolve_browse_session_key,
+        body.get("host_pid"),
+    )
+    if resolved_key:
+        session_key = resolved_key.removeprefix("dashboard:")
+    elif isinstance(fallback_key, str):
+        session_key = fallback_key
+    else:
+        session_key = ""
+    if not session_key:
+        # No identifiable session -> no panel we could address. Answer like the
+        # no-panel case (503) so the proxy falls back to Playwright, NOT 400: a
+        # 400 surfaces a hard MCP error to the agent instead of the graceful
+        # mirror path, and a warm-pool worker on a remote/non-Electron host (no
+        # sidecar to resolve) legitimately reaches here on every browser_* call.
+        _sel().log_tool_invocation(
+            session_key="dashboard",
+            tool_name="browser_command",
+            outcome="no_panel",
+            downstream_service="browser",
+            resources=op,
+        )
+        return web.json_response({"error": "no-native-panel", "code": "no_native_panel"}, status=503)
     bus = get_command_bus()
     try:
         outcome = await bus.submit(session_key, op, args or {}, timeout_ms=timeout_ms)
@@ -1982,9 +2143,13 @@ async def api_browser_command_drain(request: web.Request) -> web.Response:
     Called by the Electron main process. Body:
     ``{"session_keys": [str, ...], "wait_ms"?: int}``.
 
-    SIDE EFFECT: registers ``session_keys`` as having a live native panel (TTL
-    ~2x ``wait_ms``); this registration is what ``/api/browser/command`` checks
-    to decide whether to 503.
+    SIDE EFFECT: registers ``session_keys`` as having a live native panel for a
+    fixed liveness window (independent of ``wait_ms``, refreshed by drains and
+    result posts) AND marks a native host as present for the same window; the
+    registration is what ``/api/browser/command`` checks to decide whether to
+    503, and host-presence is what lets it briefly WAIT for a cold-starting
+    panel instead. ``wait_ms == 0`` with empty ``session_keys`` is the Electron
+    idle heartbeat: it refreshes host-presence and returns 204 at once.
 
     Responses:
     - 200 ``{"id", "session_key", "op", "args"}`` — a command is available;
@@ -2011,7 +2176,10 @@ async def api_browser_command_drain(request: web.Request) -> web.Response:
     if not isinstance(session_keys, list) or not all(isinstance(k, str) for k in session_keys):
         return web.json_response({"error": "session_keys must be a list of strings", "code": "session_keys_invalid"}, status=400)
     wait_ms = body.get("wait_ms")
-    if not isinstance(wait_ms, int) or isinstance(wait_ms, bool) or wait_ms <= 0:
+    # ``wait_ms == 0`` is a valid heartbeat: register / refresh the host-present
+    # signal and return 204 at once, without holding a long-poll open. Only a
+    # missing, negative, or non-int value falls back to the default long wait.
+    if not isinstance(wait_ms, int) or isinstance(wait_ms, bool) or wait_ms < 0:
         wait_ms = DEFAULT_DRAIN_WAIT_MS
     bus = get_command_bus()
     command = await bus.drain(session_keys, wait_ms=wait_ms)
@@ -2089,34 +2257,139 @@ async def api_browser_auth_retry(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=500)
 
 
+def _browser_config_snapshot() -> dict[str, Any]:
+    """Read the Browser Mode surface. BLOCKING -- callers on the event loop must
+    offload it.
+
+    Every field is a filesystem read: three flag/token files under the data home,
+    plus a launcher probe that resolves over the Node-augmented PATH. The probe is
+    the expensive one -- it lists the Node toolchain candidate dirs (once per
+    process, then cached) and walks PATH looking for a launcher, so on a network
+    HOME those stats are slow enough to be worth keeping off the loop.
+    """
+    return {
+        "enabled": browser_mode_enabled(),
+        "engine": get_browser_engine(),
+        "engines": list(BROWSER_ENGINES),
+        "extension_mode": has_playwright_extension(),
+        "token": get_extension_token() is not None,
+        "installed": is_playwright_installed(),
+    }
+
+
 async def api_browser_config_get(request: web.Request) -> web.Response:
-    """GET /api/browser/config — get browser extension mode and token status."""
+    """GET /api/browser/config — browser mode, engine, extension mode, token."""
     _sel().log_tool_invocation(
         session_key="dashboard",
         tool_name="browser_config_get",
         outcome="completed",
         downstream_service="browser",
     )
-    return web.json_response(
-        {
-            "extension_mode": has_playwright_extension(),
-            "token": get_extension_token() is not None,
-        }
-    )
+    return web.json_response(await asyncio.to_thread(_browser_config_snapshot))
 
 
 async def api_browser_config_save(request: web.Request) -> web.Response:
-    """PUT /api/browser/config — save browser extension mode and token."""
-    from kiro_crew.config.loader import data_home  # noqa: F811
+    """PUT /api/browser/config — save browser mode, engine, extension, token.
+
+    On a fresh enable this also downloads ``@playwright/mcp`` and the selected
+    engine's browser binary (bootstrapping Node if needed). The install runs off
+    the event loop and its result is reported in the body — a failed install
+    never 500s, so the persisted preference and an actionable ``code`` reach the
+    UI instead of a blank error.
+    """
+    # Enabling Browser Mode is a keystone-level authorization (registration mounts
+    # the browser_* tools, and in attach mode drives the operator's real logged-in
+    # browser). An APP TOKEN must not be able to self-grant it — an app token
+    # yields a truthy request["user"] too, so gate on the empty app identity,
+    # mirroring the computer-use keystone save. Every denial emits a SEL event.
+    if request.get("app"):
+        _sel().log_api_access(
+            caller=f"app:{request.get('app')}",
+            operation="browser_config_save",
+            outcome="denied",
+            source="browser_config_api",
+            error="app tokens may not enable Browser Mode",
+        )
+        return web.json_response(
+            {"ok": False, "code": "dashboard_user_required"},
+            status=403,
+        )
 
     body = await request.json()
+
+    extension_mode = body.get("extension_mode", False)
+    token = body.get("token", "")
+    # Strict boolean: a truthy non-bool (``"false"``, ``1``, ``"off"``) must NOT
+    # enable a security capability. Only a real JSON ``true`` enables Browser Mode.
+    enabled = body.get("enabled", False) is True
+
+    engine = body.get("engine", get_browser_engine())
+    if engine not in BROWSER_ENGINES:
+        return web.json_response(
+            {"ok": False, "code": "invalid_engine", "engine": engine},
+            status=400,
+        )
+
+    # Persist preferences + regenerate the engine config UNDER the in-process
+    # config lock, then release it before the long installer and the proxy
+    # register/deregister. The lock's job is narrow: make the durable engine and
+    # ``playwright-config.json`` move as one unit so two Settings tabs saving
+    # different engines can't interleave and leave the persisted engine disagreeing
+    # with the config the launcher reads (worker A persists firefox, worker B
+    # persists webkit, then A's slower generate_playwright_config lands last and
+    # writes a firefox config under the webkit preference — wrong browser). It is
+    # the same repo-wide config lock the messaging and MCP writers take.
+    #
+    # It is deliberately NOT held across register/deregister: those serialize on
+    # their OWN inter-process ``mcp.lock`` file lock, and holding an asyncio lock
+    # across that blocking wait would couple the two locks — a wedged ``mcp.lock``
+    # would then freeze every config.json writer (Slack, MCP sync, computer-use)
+    # dashboard-wide. Registration reads only the enable + extension flags (never
+    # the engine or config.json), so releasing the config lock first cannot make
+    # the proxy entry disagree with the persisted engine.
+    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
+
+    async with _get_config_lock():
+        # Read the current enable BEFORE mutating so the session reset below fires
+        # only on a real transition (inside the lock, so it cannot race the write).
+        enabled_before = browser_mode_enabled()
+        await asyncio.to_thread(
+            _persist_browser_preferences,
+            enabled=enabled,
+            engine=engine,
+            extension_mode=extension_mode,
+            token=token,
+        )
+
+    return await _browser_config_finalize(
+        request,
+        enabled=enabled,
+        engine=engine,
+        extension_mode=extension_mode,
+        enabled_before=enabled_before,
+    )
+
+
+def _persist_browser_preferences(
+    *, enabled: bool, engine: str, extension_mode: Any, token: str
+) -> None:
+    """Write the durable browser preferences + engine config (holds the config lock).
+
+    Synchronous file writes only, dispatched via ``asyncio.to_thread`` by the
+    caller inside ``_get_config_lock()``. Persisting the enable/engine flags first
+    means they survive even if the later install fails — the enable state lives in
+    a data-home flag, not per-session React state, which is what makes it durable
+    across restart.
+    """
+    from kiro_crew.config.loader import data_home  # noqa: F811
+
     kirocrew_dir = data_home()
     kirocrew_dir.mkdir(parents=True, exist_ok=True)
     flag_file = kirocrew_dir / "playwright-extension-mode"
     token_file = kirocrew_dir / "playwright-extension-token"
 
-    extension_mode = body.get("extension_mode", False)
-    token = body.get("token", "")
+    set_browser_mode_enabled(enabled)
+    set_browser_engine(engine)
 
     if extension_mode:
         flag_file.touch()
@@ -2128,18 +2401,68 @@ async def api_browser_config_save(request: web.Request) -> web.Response:
         flag_file.unlink(missing_ok=True)
         token_file.unlink(missing_ok=True)
 
-    # Re-register through register_playwright_proxy rather than the patch
-    # primitives: it holds the shared mcp.json lock (so a concurrent app-bridge or
-    # dashboard MCP write is not clobbered), refuses to overwrite a user-authored
-    # non-proxy entry under the canonical key, and creates the file when a fresh
-    # install has no kiro settings yet. Blocking (file lock + disk I/O), so it
-    # runs off the event loop.
+    # Regenerate the launched-browser config so the persisted engine actually
+    # takes effect (the proxy launches `--config <playwright-config.json>`, whose
+    # ``browserName`` is the ONLY place the engine reaches Playwright). Also
+    # creates the file for a dashboard-only user who never ran the CLI setup, so
+    # `--config` never points at a missing path. Kept in the SAME locked unit as
+    # set_browser_engine so the pair is atomic against a concurrent save.
+    if enabled:
+        generate_playwright_config(engine)
+
+
+async def _browser_config_finalize(
+    request: web.Request,
+    *,
+    enabled: bool,
+    engine: str,
+    extension_mode: Any,
+    enabled_before: bool,
+) -> web.Response:
+    """Install, (de)register the proxy, and reset sessions — no config lock held."""
+    # Download @playwright/mcp + the engine browser on enable. Run the installer
+    # whenever Browser Mode is on, NOT gated on launcher resolvability: `npx`
+    # being on PATH means the package can be fetched, not that the OS/arch browser
+    # binary is on disk, so gating on it would skip the one step that downloads
+    # the browser. The installer itself skips the npm install when a launcher
+    # already resolves and `playwright install` is an idempotent fast no-op when
+    # the browser is present, so a re-save stays cheap. Blocking (subprocess +
+    # network), so it runs off the event loop.
     #
-    # The mode preference above is already persisted, so an mcp.json-level failure
-    # is reported in the payload rather than raised — a 500 here would tell the
-    # user nothing was saved when the flag/token files were in fact written.
+    # ``ensure_playwright_installed`` is contracted never to raise, but enabling
+    # Browser Mode must NEVER 500 or dump a raw install error at the user, so this
+    # is belt-and-suspenders: any unexpected exception becomes a calm advisory in
+    # the payload (Browser Mode stays on; the browser downloads on first use).
+    install_result: dict[str, Any] | None = None
+    if enabled:
+        try:
+            install_result = await asyncio.to_thread(ensure_playwright_installed, engine)
+        except Exception:
+            logger.exception("browser provisioning raised unexpectedly; deferring to first use")
+            install_result = {
+                "ok": True,
+                "step": "browser-deferred",
+                "detail": BROWSER_FIRST_USE_NOTE,
+                "engine": engine,
+            }
+
+    # Tool availability is the gate (there is no per-message marker): enabling
+    # REGISTERS the proxy so the browser_* tools appear in the agent's tool list;
+    # disabling DEREGISTERS it so they disappear and "off" actually prevents
+    # browser operation. Both go through the setup helpers, which hold the shared
+    # mcp.json lock (so a concurrent app-bridge or dashboard MCP write is not
+    # clobbered), refuse to touch a user-authored non-proxy entry under the
+    # canonical key, and create/rewrite the file safely. Blocking (file lock +
+    # disk I/O), so off the event loop.
+    #
+    # The preferences above are already persisted, so an mcp.json-level failure is
+    # reported in the payload rather than raised — a 500 here would tell the user
+    # nothing was saved when the flag/engine files were in fact written.
     try:
-        _, mcp_status = await asyncio.to_thread(register_playwright_proxy)
+        if enabled:
+            _, mcp_status = await asyncio.to_thread(register_playwright_proxy)
+        else:
+            _, mcp_status = await asyncio.to_thread(deregister_playwright_proxy)
     except OSError as exc:
         logger.warning("browser config: MCP registration failed: %s", exc)
         mcp_status = "registration-failed"
@@ -2149,12 +2472,46 @@ async def api_browser_config_save(request: web.Request) -> web.Response:
         tool_name="browser_config_save",
         outcome="completed",
         downstream_service="browser",
-        resources=f"extension_mode={extension_mode} mcp={mcp_status}",
+        resources=(
+            f"enabled={enabled} engine={engine} extension_mode={extension_mode} "
+            f"mcp={mcp_status}"
+        ),
     )
+
+    # Flipping the enable changes the agent's tool surface (register mounts the
+    # browser_* tools, deregister removes them), and kiro-cli caches ``tools/list``
+    # for the LIFETIME of a session — ACP has no ``tools/list_changed`` push. Reset
+    # active sessions on the transition, the same primitive ``POST /api/mcp/sync``
+    # and the computer-use keystone use. Without this, DISABLING leaves the live
+    # session holding browser tools (the security-relevant direction: settings say
+    # off while browsing still works), and enabling shows "0 browser tools" until
+    # some later cold session. Only on a real change: a re-save with the same value
+    # must not tear down the user's session.
+    sessions_reset = 0
+    if enabled != enabled_before:
+        from kiro_crew.dashboard.handlers.sessions import _reset_all_sessions
+
+        try:
+            sessions_reset = await _reset_all_sessions(request)
+        except Exception:
+            # The preferences already landed and were audited; a reset failure must
+            # not report the SAVE as failed. Worst case is the prior behavior — the
+            # new tool surface applies on the next cold session.
+            logger.exception("browser config saved, but session reset failed")
+
     # ``mcp_status`` is "kept-user-entry" when the caller's own hand-authored
-    # Playwright server was left in place — the mode preference was still saved,
+    # Playwright server was left in place — the preferences were still saved,
     # but KiroCrew's proxy was deliberately NOT written over their config.
-    return web.json_response({"ok": True, "mcp_status": mcp_status})
+    payload: dict[str, Any] = {
+        "ok": True,
+        "mcp_status": mcp_status,
+        "enabled": enabled,
+        "engine": engine,
+        "sessions_reset": sessions_reset,
+    }
+    if install_result is not None:
+        payload["install"] = install_result
+    return web.json_response(payload)
 
 
 # ── Slack configuration API ──
@@ -2299,28 +2656,23 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
     alias substituted, and the comment-stripped YAML is URL-encoded into
     Slack's new-app deep link. Serves only the public template — no secrets.
     """
-    import re  # noqa: F811
-    from importlib.resources import files as _pkg_files
-    from urllib.parse import quote
+    from kiro_crew import slack_manifest
 
     # Default to a non-identifying alias: $USER is a host account name and
     # should not be volunteered to every authenticated client.
     alias = request.query.get("alias", "").strip() or "kirocrew"
-    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", alias):
+    if not slack_manifest.valid_alias(alias):
         return web.json_response({"error": "invalid alias"}, status=400)
     try:
-        template = _pkg_files("kiro_crew").joinpath("slack-manifest.yaml").read_text("utf-8")
+        rendered = slack_manifest.render(alias)
+        create_url = slack_manifest.deep_link(alias)
     except FileNotFoundError:
         return web.json_response({"error": "manifest template missing"}, status=500)
-    rendered = template.replace("{{ALIAS}}", alias)
-    # Strip comment lines to keep the deep link short (same as the CLI).
-    lines = [ln for ln in rendered.splitlines() if not ln.lstrip().startswith("#")]
-    encoded = quote("\n".join(lines).strip() + "\n", safe="")
     return web.json_response(
         {
             "alias": alias,
             "manifest": rendered,
-            "create_url": f"https://api.slack.com/apps?new_app=1&manifest_yaml={encoded}",
+            "create_url": create_url,
         }
     )
 
@@ -2366,6 +2718,7 @@ async def api_slack_config_get(request: web.Request) -> web.Response:
             "allowed_enterprise_ids": list(slack.allowed_enterprise_ids),
             "reactions_enabled": slack.reactions_enabled,
             "show_thinking": slack.show_thinking,
+            "session_folder": slack.session_folder,
         }
     )
 
@@ -2509,6 +2862,15 @@ async def _slack_config_save_locked(request: web.Request) -> web.Response:
             staged[key] = val
             applied.append(key)
 
+    if "session_folder" in body:
+        try:
+            new_folder = clean_session_folder(body.get("session_folder"))
+        except ValueError as exc:
+            return _deny(str(exc))
+        if new_folder != str(slack_cfg.get("session_folder", "") or ""):
+            staged["session_folder"] = new_folder
+            applied.append("session_folder")
+
     # ── Phase 1.5: verify newly pasted tokens against Slack before storing.
     # A token Slack rejects (invalid_auth etc.) fails the save right here,
     # where the user can act on it — instead of being stored and silently
@@ -2544,6 +2906,18 @@ async def _slack_config_save_locked(request: web.Request) -> web.Response:
     if staged:
         slack_cfg.update(staged)
         _atomic_json_write(path, data)
+
+    # Create the configured session folder now, on this user-initiated save,
+    # so the reconcile path never has to write the folder store. Best-effort:
+    # a failure leaves conversations unfiled until the next save.
+    _folder_name = stored_folder_name(slack_cfg.get("session_folder"))
+    if _folder_name:
+        _state = request.app.get("state")
+        if _state is not None:
+            await ensure_channel_folder(
+                    _state, "slack", _folder_name,
+                    relabel="session_folder" in staged,
+                )
 
     _sel().log_api_access(
         caller=caller,
@@ -2637,6 +3011,7 @@ async def api_discord_config_get(request: web.Request) -> web.Response:
             "allowed_user_ids": [str(u) for u in dc.allowed_user_ids],
             "allowed_thread_ids": [str(t) for t in dc.allowed_thread_ids],
             "soft_threshold_pct": int(dc.soft_threshold_pct),
+            "session_folder": dc.session_folder,
         }
     )
 
@@ -2785,6 +3160,15 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
             staged["soft_threshold_pct"] = pct
             applied.append("soft_threshold_pct")
 
+    if "session_folder" in body:
+        try:
+            new_folder = clean_session_folder(body.get("session_folder"))
+        except ValueError as exc:
+            return _deny(str(exc))
+        if new_folder != str(dc_cfg.get("session_folder", "") or ""):
+            staged["session_folder"] = new_folder
+            applied.append("session_folder")
+
     # ── Phase 1.5: verify a newly pasted token against Discord before storing.
     # A token Discord rejects fails the save right here, where the user can
     # act on it. Network failure is NOT a rejection: the save proceeds with a
@@ -2815,6 +3199,18 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
         dc_cfg.update(staged)
         _atomic_json_write(path, data)
 
+    # Create the configured session folder now, on this user-initiated save,
+    # so the reconcile path never has to write the folder store. Best-effort:
+    # a failure leaves conversations unfiled until the next save.
+    _folder_name = stored_folder_name(dc_cfg.get("session_folder"))
+    if _folder_name:
+        _state = request.app.get("state")
+        if _state is not None:
+            await ensure_channel_folder(
+                    _state, "discord", _folder_name,
+                    relabel="session_folder" in staged,
+                )
+
     _sel().log_api_access(
         caller=caller,
         operation="discord.config.update",
@@ -2827,7 +3223,8 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates) or bool(staged),
+            "restart_required": bool(env_updates)
+            or bool(staged.keys() - LIVE_RELOAD_FIELDS),
             "verify_warning": verify_warning,
         }
     )
@@ -2899,6 +3296,7 @@ async def api_telegram_config_get(request: web.Request) -> web.Response:
             # accepts digit strings and stores canonical ints.
             "allowed_user_ids": [str(u) for u in tg.allowed_user_ids],
             "soft_threshold_pct": int(tg.soft_threshold_pct),
+            "session_folder": tg.session_folder,
             # Forum per-topic config. chat_ids are serialized as strings for
             # the tag editor UI; they are NEGATIVE (e.g. "-1001234567890"),
             # so the save path accepts a leading minus (not a digits-only check).
@@ -3036,6 +3434,15 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
             staged["soft_threshold_pct"] = pct
             applied.append("soft_threshold_pct")
 
+    if "session_folder" in body:
+        try:
+            new_folder = clean_session_folder(body.get("session_folder"))
+        except ValueError as exc:
+            return _deny(str(exc))
+        if new_folder != str(tg_cfg.get("session_folder", "") or ""):
+            staged["session_folder"] = new_folder
+            applied.append("session_folder")
+
     if "allow_forum" in body:
         val = body.get("allow_forum")
         if not isinstance(val, bool):
@@ -3108,6 +3515,18 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
         # Off-loop: the atomic write (temp file + fsync + replace) must not
         # block the gateway event loop.
         await asyncio.to_thread(_atomic_json_write, path, data)
+
+    # Create the configured session folder now, on this user-initiated save,
+    # so the reconcile path never has to write the folder store. Best-effort:
+    # a failure leaves conversations unfiled until the next save.
+    _folder_name = stored_folder_name(tg_cfg.get("session_folder"))
+    if _folder_name:
+        _state = request.app.get("state")
+        if _state is not None:
+            await ensure_channel_folder(
+                    _state, "telegram", _folder_name,
+                    relabel="session_folder" in staged,
+                )
     if env_updates:
         # Off-loop: on Windows the owner-only lockdown shells out to icacls,
         # which must not block the event loop.
@@ -3133,7 +3552,8 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates) or bool(staged),
+            "restart_required": bool(env_updates)
+            or bool(staged.keys() - LIVE_RELOAD_FIELDS),
             "verify_warning": verify_warning,
         }
     )
@@ -3202,9 +3622,9 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     ``TeamsClient.on_activity`` built by ``maybe_start_teams`` once credentials
     are present. Until then (channel disabled/uncredentialed) we return 503.
 
-    This route is exempt from the dashboard cookie gate (see token_auth
-    ``_BYPASS_EXACT``); the delegated handler performs Bot Framework JWT
-    validation itself before doing anything with the payload.
+    This route is exempt from the dashboard cookie gate for POST only (see
+    token_auth ``_BYPASS_EXACT_METHODS``); the delegated handler performs Bot
+    Framework JWT validation itself before doing anything with the payload.
     """
     state: DashboardState = request.app["state"]
     handler = getattr(state, "teams_on_activity", None)
@@ -3241,6 +3661,7 @@ async def api_teams_config_get(request: web.Request) -> web.Response:
             "enabled": cfg.teams.enabled,
             "tenant_id": cfg.teams.tenant_id,
             "allowed_emails": list(cfg.teams.allowed_emails),
+            "session_folder": cfg.teams.session_folder,
         }
     )
 
@@ -3337,6 +3758,12 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
             return _deny(str(exc))
         staged["allowed_emails"] = new_ids
 
+    if "session_folder" in body:
+        try:
+            staged["session_folder"] = clean_session_folder(body.get("session_folder"))
+        except ValueError as exc:
+            return _deny(str(exc))
+
     # ── Phase 2: commit under the repo-wide config lock (read fresh, merge only
     # the teams section, write atomic) so a concurrent save is never clobbered.
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
@@ -3362,6 +3789,10 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
             "allowed_emails", []
         ):
             changes["allowed_emails"] = staged["allowed_emails"]
+        if "session_folder" in staged and staged["session_folder"] != str(
+            teams_cfg.get("session_folder", "") or ""
+        ):
+            changes["session_folder"] = staged["session_folder"]
         applied = list(changes.keys())
         # The secret is env-only; if a legacy plaintext app_password ever landed
         # in config.json, purge it so it can't shadow or outlive the .env value.
@@ -3372,6 +3803,18 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
         if changes:
             teams_cfg.update(changes)
             _atomic_json_write(path, data)
+
+        # Create the configured session folder now, on this user-initiated save,
+        # so the reconcile path never has to write the folder store. Best-effort:
+        # a failure leaves conversations unfiled until the next save.
+        _folder_name = stored_folder_name(teams_cfg.get("session_folder"))
+        if _folder_name:
+            _state = request.app.get("state")
+            if _state is not None:
+                await ensure_channel_folder(
+                    _state, "teams", _folder_name,
+                    relabel="session_folder" in changes,
+                )
         if env_updates:
             # Off-loop: restrict_to_owner spawns whoami/icacls subprocesses on
             # Windows, which would stall the gateway loop if run inline.
@@ -3392,7 +3835,8 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates) or bool(applied),
+            "restart_required": bool(env_updates)
+            or bool(set(applied) - LIVE_RELOAD_FIELDS),
             "verify_warning": "",
         }
     )
@@ -3427,6 +3871,7 @@ async def api_webex_config_get(request: web.Request) -> web.Response:
             "bot_token_preview": _mask_secret(token),
             "enabled": cfg.webex.enabled,
             "allowed_emails": list(cfg.webex.allowed_emails),
+            "session_folder": cfg.webex.session_folder,
         }
     )
 
@@ -3505,6 +3950,12 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
             return _deny(str(exc))
         staged["allowed_emails"] = new_emails
 
+    if "session_folder" in body:
+        try:
+            staged["session_folder"] = clean_session_folder(body.get("session_folder"))
+        except ValueError as exc:
+            return _deny(str(exc))
+
     # ── Phase 1.5: verify a newly pasted token against Webex before storing.
     # Network failure is NOT a rejection: the save proceeds with a warning so
     # being offline never blocks config. Mirrors the Slack token verification.
@@ -3546,6 +3997,10 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
             "allowed_emails", []
         ):
             changes["allowed_emails"] = staged["allowed_emails"]
+        if "session_folder" in staged and staged["session_folder"] != str(
+            webex_cfg.get("session_folder", "") or ""
+        ):
+            changes["session_folder"] = staged["session_folder"]
         applied = list(changes.keys())
         # Any token set/clear also purges the legacy config.json
         # ``webex.bot_token`` fallback so a stale plaintext copy can't shadow
@@ -3559,6 +4014,18 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
         if changes:
             webex_cfg.update(changes)
             _atomic_json_write(path, data)
+
+        # Create the configured session folder now, on this user-initiated save,
+        # so the reconcile path never has to write the folder store. Best-effort:
+        # a failure leaves conversations unfiled until the next save.
+        _folder_name = stored_folder_name(webex_cfg.get("session_folder"))
+        if _folder_name:
+            _state = request.app.get("state")
+            if _state is not None:
+                await ensure_channel_folder(
+                    _state, "webex", _folder_name,
+                    relabel="session_folder" in changes,
+                )
         if env_updates:
             _write_env_updates(env_updates)
             # Keep the live process environment in sync (see the Slack save path).
@@ -3579,7 +4046,8 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates) or bool(applied),
+            "restart_required": bool(env_updates)
+            or bool(set(applied) - LIVE_RELOAD_FIELDS),
             "verify_warning": verify_warning,
         }
     )
@@ -3657,6 +4125,7 @@ async def api_wecom_config_get(request: web.Request) -> web.Response:
             # stored display names to surviving entries.
             "allowed_user_ids": userids,
             "soft_threshold_pct": int(wc.soft_threshold_pct),
+            "session_folder": wc.session_folder,
         }
     )
 
@@ -3818,6 +4287,15 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
             staged["soft_threshold_pct"] = pct
             applied.append("soft_threshold_pct")
 
+    if "session_folder" in body:
+        try:
+            new_folder = clean_session_folder(body.get("session_folder"))
+        except ValueError as exc:
+            return _deny(str(exc))
+        if new_folder != str(wc_cfg.get("session_folder", "") or ""):
+            staged["session_folder"] = new_folder
+            applied.append("session_folder")
+
     # No Phase 1.5 credential verification: validating WeCom credentials
     # requires opening the AI-bot WebSocket long-connection (no cheap REST
     # "whoami" like Telegram's getMe), so credentials are stored as given and
@@ -3829,6 +4307,18 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
         # Off-loop: the atomic write (temp file + fsync + replace) must not
         # block the gateway event loop.
         await asyncio.to_thread(_atomic_json_write, path, data)
+
+    # Create the configured session folder now, on this user-initiated save,
+    # so the reconcile path never has to write the folder store. Best-effort:
+    # a failure leaves conversations unfiled until the next save.
+    _folder_name = stored_folder_name(wc_cfg.get("session_folder"))
+    if _folder_name:
+        _state = request.app.get("state")
+        if _state is not None:
+            await ensure_channel_folder(
+                    _state, "wecom", _folder_name,
+                    relabel="session_folder" in staged,
+                )
     if env_updates:
         # Off-loop: on Windows the owner-only lockdown shells out to icacls,
         # which must not block the event loop.
@@ -3853,7 +4343,8 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(env_updates) or bool(staged),
+            "restart_required": bool(env_updates)
+            or bool(staged.keys() - LIVE_RELOAD_FIELDS),
             "verify_warning": "",
         }
     )

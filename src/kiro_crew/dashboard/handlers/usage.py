@@ -7,6 +7,7 @@ import getpass
 import json
 import logging
 import math
+import re
 import time
 from collections import Counter
 from datetime import datetime, timedelta
@@ -118,6 +119,119 @@ def _shards_in_window(days: int) -> list[Path]:
     return paths
 
 
+#: Window (in days) that the spend tab and the sessions table both sum over.
+#: This is the single source of truth: ``cost_breakdown`` defaults to it, and
+#: ``slot_spend`` uses it, so the two surfaces are arithmetically incapable of
+#: reporting different totals for the same session.
+SPEND_WINDOW_DAYS = 7
+
+# Bare dashboard slot key: chat-<seq>-<epoch>. The shard's ``slot`` field uses
+# this shape (without a ``dashboard:`` prefix), while the session manager keys
+# are ``dashboard:chat-<seq>-<epoch>``. Normalization aligns them.
+_BARE_CHAT_SLOT_RE = re.compile(r"^chat-\d+-\d+$")
+
+# ── per-slot spend (shared by the Sessions table and Spend tab) ────────────
+
+
+def spend_key_for_slot(slot: str) -> str:
+    """The key a slot's spend is filed under in :func:`slot_spend`'s result.
+
+    One owner for this rule. Shards record a bare dashboard slot key
+    (``chat-69-1785905004``) while sessions are addressed as
+    ``dashboard:chat-69-…``; a caller that re-derived the prefix would be a second
+    owner, and a second owner of an identity rule is exactly how the spend join
+    and the session list drifted apart before.
+    """
+    return f"dashboard:{slot}" if _BARE_CHAT_SLOT_RE.match(slot) else slot
+
+
+_SLOT_SPEND_CACHE: dict[str, dict[str, float]] = {}
+_SLOT_SPEND_CACHE_SIG: tuple[object, ...] = ()
+_SLOT_SPEND_CACHE_AT: float = 0.0
+
+# The shard signature alone cannot key this cache. The result also depends on
+# ``cutoff = now - days*86400``, which moves continuously, so on an idle machine
+# (no shard write) a row that ages PAST the cutoff would keep being counted
+# until some shard changed -- up to a day, since ``_shards_in_window`` only
+# re-picks the shard set when the date rolls. A short TTL bounds that drift to
+# seconds against a 7-day window while still sparing the 5s poll a re-read.
+_SLOT_SPEND_TTL_S = 60.0
+
+
+def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
+    """Per-session spend over the last *days*: ``{session_key: {"credits", "turns"}}``.
+
+    This is the ONE aggregation path that both the Sessions table and the Spend
+    tab's per-conversation view must go through. It uses the same per-row
+    ``ts_epoch`` cutoff as :func:`cost_breakdown`, so a row inside the boundary
+    shard but older than the cutoff is NOT counted; and it normalizes bare
+    dashboard slot keys (``chat-69-1785905004``) to the full session key form
+    (``dashboard:chat-69-1785905004``) so a direct lookup by session key works.
+
+    Cached against shard size + mtime AND a short TTL, so polling every few
+    seconds does not re-read the window while the moving cutoff still takes
+    effect. Safe to call from a thread (the offloaded sampling thread in
+    session_memory).
+    """
+    global _SLOT_SPEND_CACHE, _SLOT_SPEND_CACHE_SIG, _SLOT_SPEND_CACHE_AT
+
+    now = time.time()
+    paths = _shards_in_window(days)
+    sig: tuple[object, ...] = tuple(
+        (str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths if p.exists()
+    )
+    if (
+        sig == _SLOT_SPEND_CACHE_SIG
+        and _SLOT_SPEND_CACHE_SIG
+        and now - _SLOT_SPEND_CACHE_AT < _SLOT_SPEND_TTL_S
+    ):
+        return _SLOT_SPEND_CACHE
+
+    cutoff = now - (days * 86400)
+    out: dict[str, dict[str, float]] = {}
+
+    for path in paths:
+        try:
+            with path.open() as fh:
+                for line in fh:
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
+                        continue
+                    # Per-row timestamp cutoff: the shard file date is a coarse
+                    # filter (a shard can span midnight), so rows older than the
+                    # cutoff must still be excluded individually.
+                    ts_raw = str(obj.get("ts") or "")
+                    try:
+                        ts_str = (
+                            ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
+                        )
+                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    if ts_epoch < cutoff:
+                        continue
+                    slot = str(obj.get("slot") or "")
+                    if not slot or not is_session_slot(slot):
+                        continue
+                    credits = obj.get("credits")
+                    if not isinstance(credits, (int, float)) or not math.isfinite(credits):
+                        continue
+                    # Normalize bare dashboard keys to the full session-key form.
+                    key = spend_key_for_slot(slot)
+                    cur = out.setdefault(key, {"credits": 0.0, "turns": 0.0})
+                    cur["credits"] += float(credits)
+                    cur["turns"] += 1
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    _SLOT_SPEND_CACHE, _SLOT_SPEND_CACHE_SIG = out, sig
+    _SLOT_SPEND_CACHE_AT = now
+    return out
+
+
 # A payload backstop, not a top-N: the panel lists sessions for the user to
 # browse, sort and group, so cutting it to the "hottest" few hid most of them
 # behind a number they could not reach. Measured over a 7d window this is 260
@@ -196,6 +310,18 @@ _BACKGROUND_CHANNELS = frozenset(
 #: dashboard link to go, which is exactly the bug the old "titled -> link it"
 #: rule shipped.
 NAVIGABLE_CATEGORY = "dashboard"
+
+
+_LEGACY_TELEMETRY_SURFACES = {"task_runner": "taskrunner"}
+
+
+def _canonical_telemetry_surface(surface: str) -> str:
+    """Return the operational telemetry spelling used for new and stored rows.
+
+    The alias keeps historical token shards comparable with current writes;
+    artifact use-case labels are a separate schema and are not normalized here.
+    """
+    return _LEGACY_TELEMETRY_SURFACES.get(surface, surface)
 
 
 def is_session_slot(slot: str) -> bool:
@@ -332,7 +458,9 @@ def context_occupancy(days: int = 14) -> dict[str, Any]:
                                 "window": window,
                                 "agent": str(obj.get("agent") or ""),
                                 "model": str(obj.get("model") or ""),
-                                "surface": str(obj.get("surface") or ""),
+                                "surface": _canonical_telemetry_surface(
+                                    str(obj.get("surface") or "")
+                                ),
                             }
                         )
         except (OSError, UnicodeDecodeError):
@@ -352,7 +480,7 @@ def context_occupancy(days: int = 14) -> dict[str, Any]:
     def _q(q: float) -> float:
         # Nearest-rank on the sorted samples: these are exact per-turn values,
         # not histogram buckets, so no interpolation is warranted.
-        idx = min(len(pcts) - 1, max(0, int(round(q * (len(pcts) - 1)))))
+        idx = min(len(pcts) - 1, max(0, math.ceil(q * len(pcts)) - 1))
         return round(pcts[idx], 1)
 
     sessions = sorted(
@@ -461,7 +589,7 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
     }
 
 
-def cost_breakdown(days: int = 7) -> dict[str, Any]:
+def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
     """Aggregate per-turn spend from the token row store into a cost view.
 
     Answers "what did the last *days* cost, compared with the *days* before it,
@@ -475,10 +603,11 @@ def cost_breakdown(days: int = 7) -> dict[str, Any]:
       model switch, which on real data moved the bill far more than usage volume
       did, and a single-user store is small enough to render complete.
     * ``channel`` is derived from the session key, NOT read from the row's
-      ``surface`` field. Each persist site passes a hardcoded surface, so every
-      turn routed through the dashboard chat runner is stamped ``dashboard``
-      whatever transport the human used -- the field cannot separate a Telegram
-      turn from a browser one, and the key can.
+      ``surface`` field. Historical rows can carry a wrong but non-empty value
+      such as ``dashboard`` for a Telegram turn, and the token-row schema has no
+      version or writer marker that distinguishes them from trustworthy rows.
+      The key therefore remains authoritative until the store gains such a
+      boundary; a surface-first fallback would silently misattribute history.
     * Context bands are absolute token counts rather than occupancy ratios:
       spend tracks how many tokens get re-sent, and window sizes differ per
       model, so a ratio would average incomparable populations.
@@ -676,7 +805,7 @@ def cost_breakdown(days: int = 7) -> dict[str, Any]:
             if rate > 0:
                 growth = round(rate, 2)
                 remaining = _COMPACTION_PCT - seg[-1][1]
-                to_90 = int(remaining / rate) if remaining > 0 else 0
+                to_90 = math.ceil(remaining / rate) if remaining > 0 else 0
         convo_rows.append(
             {
                 "slot": c["slot"],
@@ -840,30 +969,53 @@ def read_effective_model(source: object) -> str:
         for attr in ("_resolved_model_id", "_model"):
             for node in chain:
                 candidate = getattr(node, attr, "")
-                if isinstance(candidate, str) and candidate and candidate != "auto":
+                if (
+                    isinstance(candidate, str)
+                    and candidate
+                    and candidate.strip().lower() != "auto"
+                ):
                     return candidate
     except Exception:
         pass
     return ""
 
 
-def _resolve_model(model: str, model_source: object) -> str:
-    """Resolve the model to record, treating the ``"auto"`` sentinel as unresolved.
+def _source_requests_auto(source: object) -> bool:
+    """Whether the provider chain still reports Auto as its model request.
 
-    ``"auto"`` is not a model — it means "let the backend choose" — so recording
-    it would put a non-model value in the attribution dimension. Several
-    surfaces pass it verbatim (``agent.model`` defaults to ``"auto"``, and the
-    task runner forwards that value), so gating only on an empty string lets it
-    through. When the caller's value is unresolved we take the provider's
-    resolved id; if that is unavailable the field stays blank, which is what
-    ``test_late_backfill_skips_auto_sentinel`` requires ("the record stays blank
-    until a real model is known").
+    This is deliberately separate from :func:`read_effective_model`: ``auto``
+    is not a resolved model id, but it is useful attribution when a completed
+    turn has no more specific id from the backend. A blank request does not
+    prove Auto was selected, so it remains blank in the row store.
     """
-    if (model or "").strip().lower() not in ("", "auto"):
+    try:
+        return any(
+            isinstance(candidate := getattr(node, "_model", ""), str)
+            and candidate.strip().lower() == "auto"
+            for node in _wrapper_chain(source)
+        )
+    except Exception:
+        return False
+
+
+def _resolve_model(model: str, model_source: object) -> str:
+    """Resolve the model to record, retaining a known Auto selection.
+
+    A concrete resolved id remains the preferred accounting dimension. When a
+    completed Auto turn exposes no concrete id, ``"auto"`` still distinguishes
+    that deliberate backend choice from an unavailable model source. A blank
+    caller value with no Auto request remains blank because it carries no model
+    information at all.
+    """
+    requested = (model or "").strip().lower()
+    if requested not in ("", "auto"):
         return model
-    if model_source is None:
-        return "" if (model or "").strip().lower() == "auto" else model
-    return read_effective_model(model_source)
+    resolved = read_effective_model(model_source) if model_source is not None else ""
+    if resolved:
+        return resolved
+    if requested == "auto" or _source_requests_auto(model_source):
+        return "auto"
+    return ""
 
 
 def _coerce_int(value: Any) -> int:

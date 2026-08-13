@@ -16,7 +16,10 @@ Design note: a literal ``ssh -fN`` would make ssh fork into the background and
 the foreground process exit immediately, which would leave the gateway unable to
 supervise or kill the real forwarder. A gateway-supervised child must stay in the
 foreground, so we use ``-N`` (no remote command) *without* ``-f``, mirroring how
-``TunnelManager`` supervises its own child. ``ExitOnForwardFailure=yes`` ensures
+``TunnelManager`` supervises its own child. Connection multiplexing is pinned
+off in the argv (``ControlPath=none``) for the same reason: it lets a user's
+``~/.ssh/config`` recreate that fork-and-exit shape from outside this module.
+``ExitOnForwardFailure=yes`` ensures
 ssh exits if the local forward can't be bound, so a failed connect is detected
 rather than hanging. The SSM transport gets the equivalent detection from the
 generic ready-poll (:meth:`_Tunnel._wait_until_ready`) plus a post-hoc ownership
@@ -50,6 +53,7 @@ import signal
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 
@@ -67,6 +71,7 @@ from kiro_crew.instances.constants import DEFAULT_PROBE_INTERVAL_SECS as _PROBE_
 from kiro_crew.instances.constants import (
     DEFAULT_RECOVER_BACKOFF_MAX_SECS as _RECOVER_BACKOFF_MAX_SECS,
 )
+from kiro_crew.instances.constants import DEFAULT_SESSION_TRANSFER_TIMEOUT_SECS as _TRANSFER_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_TOKEN_PROBE_TIMEOUT_SECS as _TOKEN_PROBE_TIMEOUT
 from kiro_crew.instances.constants import DEFAULT_TOKEN_REFRESH_FRACTION as _REFRESH_FRACTION
 from kiro_crew.instances.constants import (
@@ -230,6 +235,19 @@ def _build_ssh_tunnel_argv(
         "ServerAliveCountMax=3",
         "-o",
         "AddressFamily=inet",  # force IPv4 loopback (dodge ::1 fallback)
+        # The forward must stay owned by the child this manager supervises.
+        # Multiplexing takes it away from the user's ssh_config: ssh hands the
+        # forward to an existing shared connection and exits 0, leaving it alive
+        # under a process the gateway never spawned, so a tunnel that is in fact
+        # serving is reported as dead.
+        #
+        # Routing and identity (`User`, `IdentityFile`, `Port`,
+        # `ProxyJump`/`ProxyCommand`) are deliberately still inherited -- the
+        # registry carries no inline equivalents. See §9 of the instances spec.
+        "-o",
+        "ControlPath=none",  # no socket to share -- this is what disables it
+        "-o",
+        "ControlMaster=no",  # policy; ControlPath alone suffices  # wokeignore:rule=master
         "-L",
         forward,
         ssh_host,
@@ -794,6 +812,37 @@ class SshTunnelManager:
         self._token_minted_at: dict[str, float] = {}
         self._token_ttl_secs: dict[str, int] = {}
 
+    async def _persist_hint(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        """Run a registry hint write in a worker thread; return only when it is DONE.
+
+        A cancelled ``await asyncio.to_thread(...)`` abandons only the await —
+        the already-submitted worker thread keeps running, and its
+        read-modify-rewrite of ``instances.json`` can land AFTER the caller's
+        ``async with self._lock`` block has unwound. That late write races the
+        next locked write (e.g. a cancelled connect's ``was_connected=True``
+        overtaking a disconnect's reset and reviving an instance the user
+        disconnected). So on cancellation this helper keeps waiting for the
+        worker to finish, then re-raises the cancellation — the caller's lock
+        is not released until the write has durably completed. Write FAILURES
+        are swallowed: hint persistence is best-effort, matching the
+        pre-offload ``contextlib.suppress(Exception)`` semantics.
+        """
+        task: asyncio.Task[Any] = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as e:
+                if task.done():
+                    raise  # write already completed; propagate the cancel as-is
+                cancelled = e
+                continue  # keep waiting: the worker write is still in flight
+            except Exception:
+                pass  # best-effort hint write
+            break
+        if cancelled is not None:
+            raise cancelled
+
     def _reserved_ports(self) -> set[int]:
         """Ports already taken: live tunnels + local_port set on any instance."""
         reserved: set[int] = {t.status.local_port for t in self._tunnels.values()}
@@ -939,7 +988,7 @@ class SshTunnelManager:
         :meth:`_resolve_transport`.
         """
         async with self._lock:
-            inst = self._registry.get(instance_id)
+            inst = await asyncio.to_thread(self._registry.get, instance_id)
             if inst is None:
                 raise KeyError(f"no instance with id {instance_id!r}")
 
@@ -1031,10 +1080,20 @@ class SshTunnelManager:
             self._store_token(instance_id, token, inst.ttl)
             self._schedule_token_refresh(instance_id)
 
-            # Persist hints: port assignment, was_connected, last-active.
-            with contextlib.suppress(Exception):
-                self._registry.update(instance_id, local_port=local_port, was_connected=True)
-                self._registry.set_last_active(instance_id)
+            # Persist hints: port assignment, was_connected, last-active — ONE
+            # read-modify-rewrite of instances.json (fsync), so the pair is
+            # durable together and the manager lock is held for a single fsync
+            # round-trip. _persist_hint runs it off the loop and does not
+            # return — even under cancellation — until the write completes, so
+            # the lock cannot release while the worker write is still in
+            # flight (a late hint write would race a subsequent disconnect).
+            await self._persist_hint(
+                self._registry.update,
+                instance_id,
+                mark_last_active=True,
+                local_port=local_port,
+                was_connected=True,
+            )
             # A successful (re)connect clears any stale give-up counter so the next
             # unexpected drop gets a full fresh recovery budget instead of tripping
             # the cap immediately.
@@ -1068,12 +1127,18 @@ class SshTunnelManager:
             # Clear the lazy-reconnect hint AND the recorded local port together
             # (one atomic write). local_port must return to the unallocated
             # sentinel so the now-free port is not treated as reserved forever.
-            with contextlib.suppress(Exception):
-                self._registry.update(
-                    instance_id,
-                    was_connected=False,
-                    local_port=_UNALLOCATED_PORT,
-                )
+            # _persist_hint runs the read-modify-rewrite off the loop and does
+            # not return — even if this handler is cancelled (e.g. aiohttp
+            # aborting at shutdown) — until the write completes: the in-memory
+            # teardown above is already done, so abandoning the persisted reset
+            # would leave was_connected=True plus a stale local_port, reviving
+            # an instance the user disconnected and pinning the freed port.
+            await self._persist_hint(
+                self._registry.update,
+                instance_id,
+                was_connected=False,
+                local_port=_UNALLOCATED_PORT,
+            )
             return tunnel is not None
 
     async def shutdown(self) -> None:
@@ -1157,12 +1222,23 @@ class SshTunnelManager:
         return await tunnel.start()
 
     async def _mark_recovered(self, instance_id: str) -> None:
-        """Reset the attempt counter (under lock, iff still tracked) + persist."""
+        """Reset the attempt counter and persist the hint, under lock, iff tracked.
+
+        The persist stays INSIDE the manager lock so write order equals
+        lock-acquisition order: a concurrent :meth:`disconnect`'s
+        ``was_connected=False`` (also written under the lock) can never be
+        overwritten by this recovery write landing late. The tracked-check
+        gates the persist — an instance the user disconnected must not be
+        re-marked auto-reconnectable. ``_persist_hint`` keeps the lock held
+        until the worker write completes even under cancellation; a cancelled
+        bare ``to_thread`` await would NOT stop the already-running thread, so
+        its write could land after the lock released and break the ordering.
+        """
         async with self._lock:
-            if instance_id in self._tunnels:
-                self._recover_attempts[instance_id] = 0
-        with contextlib.suppress(Exception):
-            self._registry.set_was_connected(instance_id, True)
+            if instance_id not in self._tunnels:
+                return
+            self._recover_attempts[instance_id] = 0
+            await self._persist_hint(self._registry.set_was_connected, instance_id, True)
 
     async def _recover(self, instance_id: str) -> None:
         """2-tier self-heal for an unhealthy tunnel (either transport).
@@ -1181,7 +1257,7 @@ class SshTunnelManager:
         """
         # Phase 1 — validate + bump the attempt counter under the lock, then release.
         async with self._lock:
-            inst = self._registry.get(instance_id)
+            inst = await asyncio.to_thread(self._registry.get, instance_id)
             current = self._tunnels.get(instance_id)
             if inst is None or current is None:
                 return  # disconnected / removed while we waited
@@ -1261,7 +1337,7 @@ class SshTunnelManager:
         Runs WITHOUT the manager lock (the probes do network I/O). Returns the
         result dict, or None for an unknown instance.
         """
-        inst = self._registry.get(instance_id)
+        inst = await asyncio.to_thread(self._registry.get, instance_id)
         if inst is None:
             return None
         tunnel = self._tunnels.get(instance_id)
@@ -1297,7 +1373,7 @@ class SshTunnelManager:
         probe detects the drop and self-heals (Stage 2) — no manual reconnect
         needed. Returns ``{ok, message}``.
         """
-        inst = self._registry.get(instance_id)
+        inst = await asyncio.to_thread(self._registry.get, instance_id)
         if inst is None:
             return {"ok": False, "message": "unknown instance"}
         try:
@@ -1389,6 +1465,159 @@ class SshTunnelManager:
             )
             return False
 
+    async def send_session_bundle(self, instance_id: str, bundle: dict) -> tuple[bool, dict]:
+        """POST a session-transfer *bundle* to a connected instance's importer.
+
+        Returns ``(ok, payload)``: on success *payload* is the peer's JSON reply
+        (carrying the new session key); on failure it carries ``error`` and a
+        machine-readable ``code`` so the caller can tell a stale token from an
+        unreachable peer from a bundle the peer refused from a peer too old to
+        have an importer at all.
+
+        Runs entirely over the already-open forward — **no SSH spawn**, same as
+        :meth:`token_validates`.
+
+        **The token never leaves this object.** The request is issued here rather
+        than in the API layer specifically so that ``connect`` and
+        ``refresh-token`` remain the only two routes where a minted token crosses
+        the API boundary (instances.md §6). A transfer needs the credential but
+        the browser does not, so handing it out would widen that boundary for no
+        reason. It is sent as a cookie rather than a query parameter so it cannot
+        land in the peer's HTTP access log, and it is never logged here.
+        """
+        st = self.status(instance_id)
+        if st is None or st.state is not TunnelState.CONNECTED:
+            return False, {
+                "error": "instance is not connected",
+                "code": "transfer_peer_not_connected",
+            }
+        local_port = st.local_port
+        if local_port <= 0:
+            return False, {
+                "error": "no live credential for this instance; reconnect it",
+                "code": "transfer_no_credential",
+            }
+        url = f"http://{_LOOPBACK}:{int(local_port)}/api/chat/slots/import"
+        # The dashboard cookie is keyed by the port the CLIENT connects to, taken
+        # from the Host header (token_auth._cookie_port_from_host) — not by the
+        # peer's own listen port, so two remotes both serving 7777 through
+        # different forwards do not collide on one cookie. We connect to
+        # 127.0.0.1:<local_port>, so that is the name the peer will look for; a
+        # bare ``mc_token`` is never read and would 403 every transfer.
+        cookie_name = f"mc_token_{int(local_port)}"
+        timeout = aiohttp.ClientTimeout(total=_TRANSFER_TIMEOUT)
+        # Two INDEPENDENT one-shot retries, tracked by flag rather than by loop
+        # index so neither consumes the other's budget:
+        #  * ``reminted`` -- a retained credential can go stale while the tunnel
+        #    stays CONNECTED (the condition ``token_validates`` exists for: a
+        #    failed self-heal re-mint, or a remote restart that invalidates
+        #    credentials). One fresh mint turns that into a transparent success.
+        #  * ``downgraded`` -- an older peer refuses bundle_version 2; resend the
+        #    transcript-only v1 shape it has always accepted.
+        # Bounded at 3 attempts so at most one of each can fire plus the original.
+        reminted = False
+        downgraded = False
+        for _attempt in range(3):
+            token = self._tokens.get(instance_id, "")
+            if not token:
+                return False, {
+                    "error": "no live credential for this instance; reconnect it",
+                    "code": "transfer_no_credential",
+                }
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        url, json=bundle, headers={"Cookie": f"{cookie_name}={token}"}
+                    ) as resp:
+                        try:
+                            payload = await resp.json()
+                        except Exception:
+                            payload = {}
+                        if 200 <= resp.status < 300:
+                            return True, payload if isinstance(payload, dict) else {}
+                        if resp.status in (401, 403):
+                            if not reminted and await self.refresh_token(instance_id):
+                                reminted = True
+                                continue  # retry once with the fresh credential
+                            return False, {
+                                "error": "peer rejected the credential",
+                                "code": "transfer_unauthorized",
+                            }
+                        if resp.status in (404, 405):
+                            # A peer with no importer route cannot receive a
+                            # session at all, and says so in two different ways
+                            # depending on its routing table: 404 when nothing
+                            # matches, 405 when the path falls through to
+                            # ``/api/chat/slots/{slot}`` (registered GET/DELETE
+                            # only) and aiohttp reports the method instead.
+                            # Neither is a status the importer itself ever
+                            # returns, so both mean the same actionable thing —
+                            # surface that rather than a bare status code the
+                            # user cannot act on.
+                            return False, {
+                                "error": (
+                                    "instance is running an older Kiro Crew that cannot "
+                                    "receive sessions — update it, then reconnect"
+                                ),
+                                "code": "transfer_peer_too_old",
+                            }
+                        # Forward the peer's own code when it sent one: a version
+                        # mismatch or an oversized bundle is actionable, and
+                        # rewriting it here would erase that.
+                        code = payload.get("code") if isinstance(payload, dict) else None
+                        # An OLDER peer refuses bundle_version 2 outright, even
+                        # though its Layer B is purely additive. Downgrade once
+                        # and resend the transcript-only v1 shape that peer has
+                        # always handled: without this, gaining Layer B would
+                        # REMOVE the ability to send to a peer that has not been
+                        # upgraded yet.
+                        #
+                        # Gated on the VERSION, not on Layer B presence: a
+                        # context-free session ships a v2 bundle with NO
+                        # ``layer_b`` key at all, and a presence check would skip
+                        # the downgrade for exactly those transfers and fail them
+                        # against a v1 peer. Dropping ``layer_b`` below stays
+                        # unconditional because it is simply absent in that case.
+                        if (
+                            code == "transfer_version_unsupported"
+                            and not downgraded
+                            and bundle.get("bundle_version") == 2
+                        ):
+                            downgraded = True
+                            bundle = {
+                                k: v for k, v in bundle.items() if k != "layer_b"
+                            }
+                            bundle["bundle_version"] = 1
+                            logger.info(
+                                "Session transfer to %s: peer refused v2; "
+                                "retrying transcript-only at v1",
+                                instance_id,
+                            )
+                            continue
+                        return False, {
+                            "error": (
+                                payload.get("error")
+                                if isinstance(payload, dict) and payload.get("error")
+                                else f"peer refused the transfer (HTTP {resp.status})"
+                            ),
+                            "code": code or "transfer_peer_refused",
+                        }
+            except Exception as e:
+                logger.info(
+                    "Session transfer to %s failed (%s)",
+                    instance_id,
+                    type(e).__name__,  # never the credential, never the bundle
+                )
+                return False, {
+                    "error": f"could not reach the instance ({type(e).__name__})",
+                    "code": "transfer_unreachable",
+                }
+        # Both attempts came back unauthorized.
+        return False, {
+            "error": "peer rejected the credential",
+            "code": "transfer_unauthorized",
+        }
+
     def token_ttl_remaining(self, instance_id: str) -> int | None:
         """Seconds until the current token reaches its TTL, or None if unknown.
 
@@ -1471,7 +1700,7 @@ class SshTunnelManager:
         if the instance is still connected (guards a disconnect mid-mint). Uses
         whichever transport the instance is configured for.
         """
-        inst = self._registry.get(instance_id)
+        inst = await asyncio.to_thread(self._registry.get, instance_id)
         if inst is None or instance_id not in self._tunnels:
             return False
         try:

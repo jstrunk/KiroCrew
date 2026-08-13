@@ -33,6 +33,9 @@ import { removeWarm } from '../../store/instancesSlice'
 import { i18nT } from '../../i18n/t'
 import { fmtDuration, fmtUnit } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
+import { Trans } from 'react-i18next'
+
+import { SettingRef } from '../../components/settingRef/SettingRef'
 const STATE_DOT: Record<InstanceTunnelStatus['state'], string> = {
   connected: 'bg-success',
   connecting: 'bg-warning',
@@ -42,7 +45,7 @@ const STATE_DOT: Record<InstanceTunnelStatus['state'], string> = {
 }
 
 /** Human-friendly duration ("3h 12m", "45m", "30s"). */
-function humanizeSecs(secs: number): string {
+export function humanizeSecs(secs: number): string {
   if (secs <= 0) return fmtUnit(0, 'second', { maximumFractionDigits: 0 })
   const h = Math.floor(secs / 3600)
   const m = Math.floor((secs % 3600) / 60)
@@ -51,7 +54,7 @@ function humanizeSecs(secs: number): string {
   return fmtUnit(secs, 'second', { maximumFractionDigits: 0 })
 }
 
-function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
+export function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
   const dot = STATE_DOT[status.state] ?? 'bg-muted'
   return (
     <span className="inline-flex items-center gap-1.5 text-[13px] text-muted">
@@ -62,7 +65,7 @@ function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
   )
 }
 
-function AddInstanceForm({ onAdded, usedPorts }: { onAdded: () => void; usedPorts: number[] }) {
+export function AddInstanceForm({ onAdded, usedPorts }: { onAdded: () => void; usedPorts: number[] }) {
   const [name, setName] = useState('')
   const [method, setMethod] = useState<'ssh' | 'ssm'>('ssh')
   const [sshHost, setSshHost] = useState('')
@@ -423,8 +426,13 @@ export function InstancesPanel() {
         </Btn>
         <ErrorNotice message={actionErr} className="mt-2" />
         <p className="mt-2 text-[12px] text-muted">
-          {i18nT('pages.settings.instancesPanel.equivalent_cli')} <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_config_set_instances_enabled_true')}</code> {i18nT('pages.settings.instancesPanel.then')}{' '}
-          <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>.
+          <Trans
+            i18nKey="pages.settings.instancesPanel.enable_via_setting"
+            components={{
+              settingRef: <SettingRef configKey="instances.enabled" />,
+              restartCmd: <code className="text-text">kirocrew restart</code>,
+            }}
+          />
         </p>
       </Card>
     )
@@ -529,7 +537,7 @@ export function InstancesPanel() {
               </div>
               <p className="mt-2 text-[12px] text-muted">
                 {i18nT('pages.settings.instancesPanel.up_to')} {warmCap} {i18nT('pages.settings.instancesPanel.instances_stay_warm_live_tunnel_at_once_the_rest')}{' '}
-                <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_config_set_instances_warm_set_cap_n')}</code>.
+                <SettingRef configKey="instances.warm_set_cap" />.
               </p>
             </Card>
           ) : (

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Globe, RotateCw, ExternalLink, ArrowLeft, ArrowRight, Maximize2, Minimize2, Smartphone, Monitor, Check, Crop, MousePointerClick } from 'lucide-react'
+import { Globe, RotateCw, ExternalLink, ArrowLeft, ArrowRight, Expand, Minimize, Smartphone, Monitor, Check, Crop } from 'lucide-react'
 
 import { safeSetItem } from '../utils/safeStorage'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
@@ -55,18 +55,6 @@ export const PREVIEW_FOCUS_EVENT = 'kirocrew-preview-focus'
  * crop button just asks for it via this event rather than duplicating capture.
  */
 export const PREVIEW_SNIP_EVENT = 'kirocrew-web-preview-snip'
-/**
- * Window event: the panel requests enabling "Let the agent use the browser" (operate mode) so the
- * agent may actively drive the browser. ChatPage listens and turns browse mode
- * on for the active slot. Fired by the live mirror's "Let the agent act" button.
- */
-export const PREVIEW_ENABLE_BROWSE_EVENT = 'kirocrew-enable-browse'
-/**
- * Window event: ChatPage broadcasts the current per-slot browse-mode state so
- * the panel can reflect it — the "Let the agent act" button shows only while
- * browse mode is OFF.
- */
-export const BROWSE_MODE_EVENT = 'kirocrew-browse-mode'
 /**
  * How long after the last agent-browse frame we keep the live mirror on screen
  * before falling back to the preview body. Frames arrive only when the agent
@@ -198,6 +186,52 @@ function isLoopbackHost(h: string): boolean {
   return LOOPBACK_HOSTS.has(h) || h === 'localhost' || h.endsWith('.localhost')
 }
 
+/** A URL's port as the browser resolves it, so `:80` and an absent port on
+ *  `http://` compare equal. */
+function effectivePort(u: URL): string {
+  if (u.port) return u.port
+  return u.protocol === 'https:' ? '443' : '80'
+}
+
+/**
+ * True when `url` points back at the gateway serving this dashboard.
+ *
+ * Such a target can never render in the preview iframe, and the panel would
+ * otherwise show a blank frame with no explanation. The gateway answers every
+ * request with `X-Frame-Options: SAMEORIGIN` and CSP `frame-ancestors 'self'`,
+ * and `isolatePreviewHost` deliberately swaps the host to the *other* loopback
+ * name for cookie isolation — so the frame is always cross-origin to the
+ * dashboard by construction, and always refused. (Keeping the host identical to
+ * pass `'self'` is not an option: that is the cookie leak the swap exists to
+ * prevent.) Reporting it beats framing it.
+ *
+ * Both sides must be loopback: when the dashboard is reached over a tunnel or a
+ * LAN address, a loopback target is the *user's own* machine — an ordinary dev
+ * server — not this gateway. Ports are compared because the host strings
+ * legitimately differ (`localhost` vs `127.0.0.1`) for one and the same server.
+ * `dashboardOrigin` defaults to the current document location (overridable for
+ * tests).
+ *
+ * Same port on loopback therefore means the same server, with one exception: a
+ * dev server bound to a DIFFERENT loopback interface (`::1`) on the gateway's own
+ * port is a distinct listener that this reports as self. That target degrades to
+ * the explanatory state plus its open-in-browser link rather than to a blank
+ * frame, so the misread costs a click and never silently swallows a page.
+ */
+export function isDashboardOrigin(url: string, dashboardOrigin?: string): boolean {
+  let target: URL
+  try { target = new URL(url) } catch { return false }
+  let origin = dashboardOrigin
+  if (origin == null) {
+    try { origin = typeof window !== 'undefined' ? window.location.href : '' } catch { origin = '' }
+  }
+  if (!origin) return false
+  let self_: URL
+  try { self_ = new URL(origin) } catch { return false }
+  if (!isLoopbackHost(target.hostname) || !isLoopbackHost(self_.hostname)) return false
+  return effectivePort(target) === effectivePort(self_)
+}
+
 /**
  * Normalize a loopback preview URL's host so it is both reachable under the
  * dashboard CSP and cookie-isolated from the dashboard. Two rewrites, in order:
@@ -248,6 +282,21 @@ export function isolatePreviewHost(url: string, dashboardHost?: string): string 
 }
 
 /**
+ * Isolate a host only for a target the panel will actually FRAME.
+ *
+ * The host swap in `isolatePreviewHost` exists to keep the dashboard's
+ * host-scoped cookie out of a framed server. A target that is this gateway is
+ * never framed — it renders the explanatory state instead — so the swap buys no
+ * safety there and actively misreports the target: someone who typed
+ * `127.0.0.1:6776` would be told `localhost:6776` "is the dashboard's own
+ * server", at the exact moment the panel is explaining itself. Show what they
+ * entered.
+ */
+function isolateFrameTarget(url: string): string {
+  return isDashboardOrigin(url) ? url : isolatePreviewHost(url)
+}
+
+/**
  * Feed a URL into a session's Web Preview tab from OUTSIDE the panel — e.g.
  * ChatPage auto-detecting a dev-server URL (or the agent's `kirocrew:preview`
  * marker) in chat. Persists it as the session's preview target (so the panel
@@ -261,7 +310,7 @@ export function setSessionPreviewUrl(sessionKey: string, rawUrl: string, open = 
   if (!sessionKey) return null
   const norm = normalizeUrl(rawUrl)
   if (!norm) return null
-  const isolated = isolatePreviewHost(norm)
+  const isolated = isolateFrameTarget(norm)
   safeSetItem(`${URL_KEY_PREFIX}${sessionKey}`, isolated)
   if (open) {
     window.dispatchEvent(new CustomEvent(PREVIEW_URL_EVENT, { detail: { slot: sessionKey, url: isolated } }))
@@ -281,9 +330,11 @@ export function setSessionPreviewUrl(sessionKey: string, rawUrl: string, open = 
  * Chat-fed URLs are additionally **loopback-only**: agent output (which can be
  * prompt-injected by browsed/read content) can only ever offer a LOCAL dev
  * server, never an external host — the feature's whole purpose is local
- * previews, so this costs nothing. The manual URL bar is not restricted (typing
- * a URL is the user's own action). Returns the normalized+isolated URL, or null
- * when unusable or non-loopback.
+ * previews, so this costs nothing. A URL pointing back at this gateway is
+ * rejected too: it can never be framed (see `isDashboardOrigin`), so offering it
+ * would only produce a Load button that leads to a blank panel. The manual URL
+ * bar is not restricted (typing a URL is the user's own action). Returns the
+ * normalized+isolated URL, or null when unusable, non-loopback, or self.
  */
 export function setSessionPreviewPending(sessionKey: string, rawUrl: string): string | null {
   if (!sessionKey) return null
@@ -294,6 +345,7 @@ export function setSessionPreviewPending(sessionKey: string, rawUrl: string): st
   } catch {
     return null
   }
+  if (isDashboardOrigin(norm)) return null
   const isolated = isolatePreviewHost(norm)
   safeSetItem(`${PENDING_KEY_PREFIX}${sessionKey}`, isolated)
   window.dispatchEvent(new CustomEvent(PREVIEW_PENDING_EVENT, { detail: { slot: sessionKey, url: isolated } }))
@@ -342,6 +394,9 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   const [deviceId, setDeviceId] = useState('responsive')
   const [deviceMenuOpen, setDeviceMenuOpen] = useState(false)
   const deviceMenuRef = useRef<HTMLDivElement>(null)
+  // The native address-bar input. The view-URL sync effect reads its focus so a
+  // view-initiated navigation never overwrites the field while the user types.
+  const nativeInputRef = useRef<HTMLInputElement>(null)
 
   const url = nav.index >= 0 ? nav.stack[nav.index] : ''
   const canBack = nav.index > 0
@@ -362,14 +417,6 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // they go stale (LIVE_FRAME_TTL_MS) we fall back to the preview body.
   const { frame, lastTs, sessionKey: frameSessionKey, sessionName } = useBrowserFrame()
   const [nowTick, setNowTick] = useState(() => Date.now())
-  // Whether "Let the agent use the browser" (operate) is currently on — broadcast by ChatPage so
-  // the mirror can show "Let the agent act" only while it's off.
-  const [browseOn, setBrowseOn] = useState(false)
-  useEffect(() => {
-    const onMode = (e: Event) => setBrowseOn(!!(e as CustomEvent<{ on?: boolean }>).detail?.on)
-    window.addEventListener(BROWSE_MODE_EVENT, onMode)
-    return () => window.removeEventListener(BROWSE_MODE_EVENT, onMode)
-  }, [])
   // While frames are live, re-evaluate staleness on an interval so the mirror
   // auto-retires after the agent stops browsing (frames only push on capture).
   useEffect(() => {
@@ -387,9 +434,9 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   }, [frame, lastTs])
   // Session-scoped: only surface the mirror when the streaming frame belongs to
   // THIS panel's session. useBrowserFrame is global (latest frame from ANY
-  // session); without this check a background session's browse would render in —
-  // and, via "Let the agent act" below, authorize [BROWSE] on — the wrong
-  // session's panel. `sessionKey` must be present and equal the frame's key.
+  // session); without this check a background session's browse would render into
+  // the wrong session's panel. `sessionKey` must be present and equal the
+  // frame's key.
   const isLive = !!frame && !!lastTs && !!sessionKey && frameSessionKey === sessionKey
     && nowTick - lastTs < LIVE_FRAME_TTL_MS
 
@@ -405,15 +452,13 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   //     reports `available: false`) -> the browser lives in another process and
   //     only streamed frames can show it, so the mirror is the FALLBACK.
   //
-  // `agentActEnabled: browseOn` wires the Globe toggle ("Let the agent use the
-  // browser") to the native view's agent-control gate: on -> acquire (LIGHT),
-  // off -> release. Scoped by sessionKey: each Browser panel owns its own view
-  // and authorization. `enabled` is just `active` now (native no longer yields
-  // to streaming frames), so switching side-panel tabs hides — never destroys —
-  // the view.
-  const native = useNativeBrowser(sessionKey || '', active, {
-    agentActEnabled: browseOn,
-  })
+  // Scoped by sessionKey: each Browser panel owns its own native view. `enabled`
+  // is just `active` (native no longer yields to streaming frames), so switching
+  // side-panel tabs hides — never destroys — the view. Authorization for the
+  // agent to drive the view is Browser Mode itself (the Settings toggle),
+  // enforced in the Electron main process (browser-control.js `canAgentControl`);
+  // the panel no longer carries a per-session agent-act toggle.
+  const native = useNativeBrowser(sessionKey || '', active)
   // Native wins when available. Its view is "open" once a page has been loaded
   // into it; until then the panel shows the ordinary iframe preview.
   const nativeOpen = native.available && !!native.state?.open
@@ -425,13 +470,6 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // view had nothing to show -- a blank panel. `!nativeOpen` is the real
   // condition: a native view that is open owns the surface, otherwise mirror.
   const showMirror = isLive && !nativeOpen
-  const requestInteraction = useCallback(() => {
-    // Target the session whose page is on screen — which is THIS panel's
-    // session, since isLive required a session_key match — never a global or
-    // active-slot fallback. Carrying the slot keeps the grant attributed to the
-    // browsing session even if the active slot differs.
-    window.dispatchEvent(new CustomEvent(PREVIEW_ENABLE_BROWSE_EVENT, { detail: { slot: sessionKey } }))
-  }, [sessionKey])
 
   const persist = useCallback((u: string) => {
     if (storageKey && u) safeSetItem(storageKey, u)
@@ -447,7 +485,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     }
     // Isolate defensively in case a legacy same-host value was persisted before
     // isolatePreviewHost existed.
-    saved = saved ? isolatePreviewHost(saved) : ''
+    saved = saved ? isolateFrameTarget(saved) : ''
     let pend = ''
     if (pendingKey) {
       try { pend = localStorage.getItem(pendingKey) || '' } catch { /* ignore */ }
@@ -496,6 +534,27 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     return () => window.removeEventListener(PREVIEW_PENDING_EVENT, onPending)
   }, [sessionKey])
 
+  // Reflect view-initiated navigation (agent browser_navigate, in-page link
+  // clicks, redirects) into the native address bar. `did-navigate` already
+  // updates `native.state.url`, but the input is bound to `draft`, which
+  // otherwise only changes on typing or back/forward — so an agent-opened page
+  // left the bar empty and showing its placeholder. Mirror the live URL into
+  // `draft`, but never while the user is editing the field, so a slow redirect
+  // cannot overwrite what they are typing.
+  //
+  // Display only — deliberately does NOT persist. `native.state` carries no
+  // session tag, and on a slot switch this component instance is reused (its
+  // `sessionKey` changes) while `useNativeBrowser` may still hold the previous
+  // slot's state until `getState` resolves; persisting here would write that
+  // stale URL into the NEW slot's storage. User-typed navigation persists via
+  // `commitNative`; view-initiated navigation stays display-only, as before.
+  useEffect(() => {
+    const u = native.state?.url
+    if (!nativeOpen || !u) return
+    if (document.activeElement === nativeInputRef.current) return
+    setDraft(u)
+  }, [nativeOpen, native.state?.url])
+
   // Close the device menu on outside click.
   useEffect(() => {
     if (!deviceMenuOpen) return
@@ -509,7 +568,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   const commit = useCallback((raw: string) => {
     const norm = normalizeUrl(raw)
     if (!norm) return
-    const isolated = isolatePreviewHost(norm)
+    const isolated = isolateFrameTarget(norm)
     setNav(n => pushNav(n, isolated))
     setDraft(isolated)
     persist(isolated)
@@ -598,6 +657,11 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     [url],
   )
 
+  // A URL pointing back at this gateway is refused by its own frame-ancestors
+  // policy, which the liveness probe below cannot see (the server is up, so the
+  // probe passes) — detect it so we explain instead of framing a blank page.
+  const selfOrigin = useMemo(() => !!url && isDashboardOrigin(url), [url])
+
   // Liveness probe: a cross-origin iframe cannot tell us its server died — it
   // just keeps showing the last document. While a URL is actually framed (loaded,
   // embeddable, tab active) poll it with a no-cors GET; a connection-refused error
@@ -605,7 +669,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // unreachable and unmount the iframe (clearing the stale page). A later success
   // auto-restores it. (Two strikes tolerates a brief HMR/dev-server restart.)
   useEffect(() => {
-    if (!url || mixedContent || pending || !active) return
+    if (!url || mixedContent || selfOrigin || pending || !active) return
     setUnreachable(false)
     let fails = 0
     let cancelled = false
@@ -628,7 +692,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     void probe()
     const id = setInterval(() => { void probe() }, 5000)
     return () => { cancelled = true; clearInterval(id) }
-  }, [url, reloadKey, mixedContent, pending, active])
+  }, [url, reloadKey, mixedContent, selfOrigin, pending, active])
 
   const iconBtn = 'flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text '
     + 'hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 '
@@ -648,20 +712,6 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             <span className="flex-1 min-w-0 truncate text-[12px] text-muted" title={sessionName}>· {sessionName}</span>
           ) : (
             <div className="flex-1" />
-          )}
-          {browseOn ? (
-            <span className="shrink-0 inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-accent/12 text-accent font-medium" title={i18nT('components.webPreviewPanel.the_agent_can_click_type_and_navigate_this_page')}>
-              <MousePointerClick size={12} /> {i18nT('components.webPreviewPanel.agent_can_act')}
-            </span>
-          ) : (
-            <button
-              type="button"
-              onClick={requestInteraction}
-              className="shrink-0 inline-flex items-center gap-1 text-[12px] px-2.5 py-1 rounded-md border border-border text-text hover:bg-bg-hover transition-colors cursor-pointer bg-transparent"
-              title={i18nT('components.webPreviewPanel.lets_the_agent_click_type_and_navigate_this_page')}
-            >
-              <MousePointerClick size={13} /> {i18nT('components.webPreviewPanel.let_the_agent_act')}
-            </button>
           )}
         </div>
         <div className="relative bg-black flex-1 min-h-0 flex items-center justify-center">
@@ -693,25 +743,6 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
         <span className="shrink-0 text-[13px] font-medium text-text">{i18nT('components.webPreviewPanel.browser_live')}</span>
         <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--ok)' }} aria-hidden />
         <div className="flex-1" />
-        {/* Globe toggle ("Let the agent use the browser") wiring: turning it on
-            acquires in-process (LIGHT) agent control of THIS native view; off
-            releases it. `requestInteraction` asks ChatPage to flip the toggle on
-            for this session — the hook (agentActEnabled: browseOn) then drives
-            setControlOwner. Reuses the live-mirror's keys, no new strings. */}
-        {browseOn ? (
-          <span className="shrink-0 inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-accent/12 text-accent font-medium" title={i18nT('components.webPreviewPanel.the_agent_can_click_type_and_navigate_this_page')}>
-            <MousePointerClick size={12} /> {i18nT('components.webPreviewPanel.agent_can_act')}
-          </span>
-        ) : (
-          <button
-            type="button"
-            onClick={requestInteraction}
-            className="shrink-0 inline-flex items-center gap-1 text-[12px] px-2.5 py-1 rounded-md border border-border text-text hover:bg-bg-hover transition-colors cursor-pointer bg-transparent"
-            title={i18nT('components.webPreviewPanel.lets_the_agent_click_type_and_navigate_this_page')}
-          >
-            <MousePointerClick size={13} /> {i18nT('components.webPreviewPanel.let_the_agent_act')}
-          </button>
-        )}
       </div>
       {/* Address bar. The preview subtree below (which owns the other URL form)
           is hidden while the native surface is up, so without this the user
@@ -722,6 +753,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
       >
         <div className="flex-1 min-w-0 flex items-center gap-0.5 h-7 pl-1 pr-1 rounded-md bg-bg-elevated border border-border focus-within:border-accent transition-colors">
           <input
+            ref={nativeInputRef}
             type="text"
             value={draft}
             onChange={e => setDraft(e.target.value)}
@@ -812,7 +844,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
           aria-label={expanded ? i18nT('components.webPreviewPanel.exit_expanded_preview') : i18nT('components.webPreviewPanel.expand_preview')}
           aria-pressed={expanded}
         >
-          {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          {expanded ? <Minimize size={14} /> : <Expand size={14} />}
         </button>
         {/* Divider */}
         <span aria-hidden="true" className="w-px h-5 bg-border shrink-0 mx-0.5" />
@@ -927,15 +959,40 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             <div className="text-[11px] text-muted max-w-[320px] leading-snug">
               {i18nT('components.webPreviewPanel.this_dashboard_is_served_over_https_so_the_brows')}
               <span className="font-mono"> {i18nT('components.webPreviewPanel.http')} </span>
-              {i18nT('components.webPreviewPanel.page_mixed_content_open_it_in_a_new_tab_instead')}
+              {i18nT('components.webPreviewPanel.page_mixed_content')}
             </div>
+            <code className="text-[11px] font-mono px-2 py-1 rounded bg-bg-elevated text-text break-all max-w-[320px]">
+              {url}
+            </code>
             <a
               href={url}
               target="_blank"
               rel="noreferrer"
               className="inline-flex items-center gap-1.5 text-[12px] px-3 py-1.5 rounded-md border border-border text-text hover:bg-bg-hover transition-colors no-underline"
             >
-              <ExternalLink size={13} /> {i18nT('components.webPreviewPanel.open')} {url}
+              <ExternalLink size={13} /> {i18nT('components.webPreviewPanel.open_in_browser')}
+            </a>
+          </div>
+        ) : selfOrigin ? (
+          // Points back at this gateway, which refuses to be framed. The probe
+          // can't surface this (the server is up), so say so here rather than
+          // leaving an unexplained blank frame.
+          <div className="flex flex-col items-center justify-center h-full gap-3 px-6 text-center bg-bg">
+            <Globe size={22} className="text-muted" />
+            <div className="text-[13px] font-medium text-text">{i18nT('components.webPreviewPanel.can_t_preview_this_dashboard_here')}</div>
+            <div className="text-[11px] text-muted max-w-[320px] leading-snug">
+              {i18nT('components.webPreviewPanel.this_url_is_the_dashboard_s_own_server_which_ref')}
+            </div>
+            <code className="text-[11px] font-mono px-2 py-1 rounded bg-bg-elevated text-text break-all max-w-[320px]">
+              {url}
+            </code>
+            <a
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 text-[12px] px-3 py-1.5 rounded-md border border-border text-text hover:bg-bg-hover transition-colors no-underline"
+            >
+              <ExternalLink size={13} /> {i18nT('components.webPreviewPanel.open_in_browser')}
             </a>
           </div>
         ) : unreachable ? (

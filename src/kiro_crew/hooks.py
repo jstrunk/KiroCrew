@@ -96,6 +96,17 @@ class HookResult:
 class ToolHookResult:
     action: str  # TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY
     reason: str = ""
+    #: True when a TOOL_DENY came from a hard security check — the attempt
+    #: itself is the problem. False when it came from policy STATE (the
+    #: governance ceiling ∩ profile), where the same attempt becomes allowed
+    #: once the policy loosens. Callers that count refusals against a durable
+    #: budget must only count the security kind: an unattended cron auto-pauses
+    #: after repeated failures, and a policy denial is not a defect in the job.
+    #: The reason string cannot carry this: most security denies never contain
+    #: ``DENY_REASON_PREFIX`` at all (the sensitive-path, write-protected-config
+    #: and deny-by-default-shell messages do not), so matching on it would
+    #: classify a sensitive-path or exfiltration deny as non-security.
+    security_deny: bool = True
 
     @staticmethod
     def allow() -> ToolHookResult:
@@ -107,7 +118,18 @@ class ToolHookResult:
 
     @staticmethod
     def deny(reason: str) -> ToolHookResult:
-        return ToolHookResult(action=TOOL_DENY, reason=reason)
+        """Deny on a hard security check — the attempt is the problem."""
+        return ToolHookResult(action=TOOL_DENY, reason=reason, security_deny=True)
+
+    @staticmethod
+    def deny_policy(reason: str) -> ToolHookResult:
+        """Deny on policy STATE, which the same attempt can outlive.
+
+        Kept distinct from :meth:`deny` so a caller counting refusals against a
+        durable budget (cron auto-pause) does not treat a governance ceiling as
+        a defect in what it attempted.
+        """
+        return ToolHookResult(action=TOOL_DENY, reason=reason, security_deny=False)
 
 
 # ── Config Types ──
@@ -173,6 +195,11 @@ class UserDeniedPattern:
     id: str = ""
     pattern: str = ""
     enabled: bool = True
+    # Operator-authored explanation shown to the agent when this rule fires,
+    # INSTEAD of leaving it to infer intent from the raw regex. Metadata only —
+    # it never participates in matching. Declared last so existing positional
+    # construction (``UserDeniedPattern("id", "pat", True)``) keeps working.
+    note: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> UserDeniedPattern:
@@ -186,10 +213,19 @@ class UserDeniedPattern:
             # is present because the operator wanted it enforced, so ambiguous
             # junk should keep it ON (fail safe = keep denying).
             enabled=_coerce_bool(data.get("enabled", True), default=True),
+            # A malformed note degrades to "" rather than raising: it is
+            # cosmetic, so junk here must never abort gateway boot nor weaken
+            # the rule it annotates.
+            note=str(data.get("note", "") or ""),
         )
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "pattern": self.pattern, "enabled": self.enabled}
+        return {
+            "id": self.id,
+            "pattern": self.pattern,
+            "enabled": self.enabled,
+            "note": self.note,
+        }
 
 
 @dataclass
@@ -575,12 +611,16 @@ class HookManager:
         ctx = current_context()
         authority = ctx.security
         denied_regexes = self._effective_denied(ctx)
+        denied_notes = self._denied_notes()
         deny_targets = [normalized, tool_name]
         if command:
             deny_targets.append(command)
         for target in deny_targets:
             reason = authority.is_denied(
-                target, self._config.auto_deny_tools, denied_regexes=denied_regexes
+                target,
+                self._config.auto_deny_tools,
+                denied_regexes=denied_regexes,
+                reason_notes=denied_notes,
             )
             if reason:
                 return ToolHookResult.deny(reason)
@@ -597,7 +637,7 @@ class HookManager:
             ctx, tool_name, session_key, agent, app, tool_kind, raw_params
         )
         if gov_reason:
-            return ToolHookResult.deny(gov_reason)
+            return ToolHookResult.deny_policy(gov_reason)
 
         # App-own MCP server auto-approve — a FIRST-PARTY (builtin) app agent
         # calling its OWN app-scoped MCP server is intra-app, not a host surface.
@@ -688,6 +728,7 @@ class HookManager:
                     canonical_mcp_name,
                     self._config.auto_deny_tools,
                     denied_regexes=denied_regexes,
+                    reason_notes=denied_notes,
                 )
                 if deny_reason:
                     return ToolHookResult.deny(deny_reason)
@@ -695,7 +736,7 @@ class HookManager:
                     ctx, canonical_mcp_name, session_key, agent, app, tool_kind, raw_params
                 )
                 if gov_reason:
-                    return ToolHookResult.deny(gov_reason)
+                    return ToolHookResult.deny_policy(gov_reason)
                 return ToolHookResult.auto_approve()
 
         # Auto-approve — match against both the original title (preserves
@@ -784,7 +825,16 @@ class HookManager:
         """
         return resolve_effective_denied_regexes(self._config, ctx)
 
-    def effective_denied_regexes(self) -> list[str]:
+    def _denied_notes(self) -> dict[str, str]:
+        """Operator notes for the user patterns in the effective denied set.
+
+        Passed alongside ``denied_regexes`` so a refusal can carry the operator's
+        own remediation line. Empty dict when nothing is annotated, which is the
+        pre-existing behavior (reason = the bare pattern).
+        """
+        return resolve_denied_notes(self._config)
+
+    def effective_denied_regexes(self, *, include_governance_pins: bool = True) -> list[str]:
         """Public accessor for the effective regex-tier denied set.
 
         Resolves the platform context itself, so callers outside the tool-call
@@ -792,8 +842,14 @@ class HookManager:
         workflow / heartbeat surfaces) can honor the SAME user opt-out +
         governance-pin state that ``on_tool_call`` enforces, instead of failing
         closed to all built-ins and re-introducing "disabled but still blocked".
+
+        Pass ``include_governance_pins=False`` only to CLASSIFY a deny that has
+        already been decided by the pinned set — never to decide one. See
+        ``resolve_effective_denied_regexes``.
         """
-        return self._effective_denied(current_context())
+        return resolve_effective_denied_regexes(
+            self._config, current_context(), include_governance_pins=include_governance_pins
+        )
 
 
 # ACP semantic tool kinds treated as read-only for the non-shell auto-approve
@@ -876,21 +932,64 @@ def hooks_config_from_config_dict(hooks_section: dict) -> HooksConfig:
     return HooksConfig.from_dict(merged)
 
 
-def resolve_effective_denied_regexes(config: "HooksConfig", ctx: object = None) -> list[str]:
+def resolve_effective_denied_regexes(
+    config: "HooksConfig", ctx: object = None, *, include_governance_pins: bool = True
+) -> list[str]:
     """Effective regex-tier denied set from a HooksConfig (module-level).
 
     Same resolution as ``HookManager._effective_denied`` but usable by callers
     that hold a config rather than a HookManager (e.g. cron command vetting in
     ``mcp_cron``). Honors the user opt-out (disable_all / disabled_ids /
     user_added) with governance pins force-re-added (tightest-wins).
+
+    ``include_governance_pins=False`` resolves the set the USER's own opt-out
+    state would produce on its own. Enforcement must never use it — dropping
+    pins is exactly the opt-out a pin exists to refuse. It answers a different
+    question: comparing a deny against both sets tells a caller whether the
+    match came ONLY from a pin, i.e. whether the block is policy state (which a
+    later loosening reverses) or a rule the user is enforcing themselves.
     """
     return security.compute_effective_denied(
         security.BUILTIN_DENIED_RULES,
         config.denied_commands_disabled_ids,
         config.denied_commands_disable_all,
         [p.pattern for p in config.denied_commands_user_added if p.enabled],
-        _governance_pinned_command_ids(ctx),
+        _governance_pinned_command_ids(ctx) if include_governance_pins else (),
     )
+
+
+def resolve_denied_notes(config: "HooksConfig") -> dict[str, str]:
+    """Map each annotated, enabled user pattern to its operator note.
+
+    The note is what the refusal shows INSTEAD of leaving the agent to infer
+    intent from a raw regex — e.g. "use --maxdepth, or rg/fd" rather than a
+    40-character character-class soup. Keyed by pattern because that is the only
+    identity the matcher carries into ``security.is_denied``; ids are not
+    threaded through the regex tier.
+
+    Only enabled rules with a non-blank note appear. Built-in rules are absent
+    on purpose: their ``description`` is catalog documentation aimed at the
+    Settings reader, not remediation aimed at the caller, so promoting it into
+    every refusal would change the text of rules the operator never annotated.
+
+    A note containing :data:`security.DENY_REASON_MATCH_PREFIX` is DROPPED. The
+    note is emitted on its own line, and ``RecoveryCard.tsx`` parses refusals with
+    a GLOBAL per-line regex, so such a note would be read as a second, fabricated
+    deny pattern. The guard uses the COLON-terminated form, not the emitted prefix:
+    the regex treats the space after the colon as optional, so
+    ``"Blocked by security policy:forged"`` parses as a refusal line without
+    containing the emitted prefix. The add endpoint rejects this at write time;
+    this guard is the one that holds for a keystone file the operator edited by
+    hand. Fail-safe direction: lose the note, keep the pattern.
+    """
+    return {
+        p.pattern: p.note.strip()
+        for p in config.denied_commands_user_added
+        if p.enabled
+        and p.pattern
+        and p.note.strip()
+        and security.DENY_REASON_MATCH_PREFIX not in p.note
+    }
 
 
 def effective_denied_regexes_from_config() -> list[str]:
@@ -2423,6 +2522,9 @@ async def run_script_hook(
             "KIROCREW_HOOK_CONTEXT": env_context,
         }
         # Shell per platform: POSIX /bin/sh -c, Windows cmd /c (no /bin/sh there).
+        # The argv is what the sandbox/cgroup chokepoints below vet, on BOTH
+        # platforms — only the eventual spawn form differs (see the Windows
+        # branch under the spawn).
         if platform_compat.IS_WINDOWS:
             argv = ["cmd", "/c", hook.command]
         else:
@@ -2434,15 +2536,41 @@ async def run_script_hook(
         # on the build fleet): start_new_session=True is a no-op on Windows,
         # creationflags resolves to 0 (no-op) on POSIX. The Windows flag makes the
         # tree taskkill /T-reapable; POSIX setsid -> killpg.
-        proc = await create_subprocess_limited(
-            *wrapped_argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-        )
+        if platform_compat.IS_WINDOWS and wrapped_argv == argv:
+            # cmd.exe must receive the operator's command line VERBATIM. Spawning
+            # ``["cmd", "/c", command]`` as an argv routes it through
+            # ``subprocess.list2cmdline``, which backslash-escapes every quote the
+            # operator wrote — so a command as ordinary as
+            # ``"C:\Program Files\Python\python.exe" -c "print(1)"`` arrives as
+            # ``\"C:\Program Files\...\"`` and cmd.exe answers "is not recognized
+            # as an internal or external command". ``create_subprocess_shell``
+            # formats ``%ComSpec% /c "<command>"`` with no argv escaping, which is
+            # the same parse the operator gets typing the line at a prompt (and
+            # the only form under which ``%VAR%`` and a literal ``%`` both behave
+            # as written — a temp ``.cmd`` wrapper would eat both).
+            #
+            # Guarded on the wrap being a no-op: Windows has no sandbox or cgroup
+            # backend, so neither chokepoint can prepend anything today. Should
+            # one ever appear, the wrapper MUST own the spawn — that case falls
+            # through to the argv path below, choosing isolation over quoting.
+            proc = await asyncio.create_subprocess_shell(
+                hook.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            proc = await create_subprocess_limited(
+                *wrapped_argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(input=stdin_data), timeout=hook.timeout

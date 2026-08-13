@@ -18,8 +18,29 @@ export interface StatusData {
   update_checked?: boolean
   /** Upgrade command for an install that cannot replace itself ("" when it can). */
   update_command?: string
+  /**
+   * The release channel this INSTALL follows (the `channel` file `cli.sh` wrote).
+   * "" when the layout has no channel at all — a git checkout tracks a remote, a
+   * desktop bundle and a container are updated by something else — which is what
+   * gates the gateway channel switcher. Distinct from `release_channel` below,
+   * which says which lane the RUNNING BYTES were built on; the two legitimately
+   * diverge between a channel switch and the new lane's build landing.
+   */
+  update_channel?: string
   update_progress?: { step: string; detail: string } | null
   version?: string
+  /**
+   * Which release lane these bytes came from. The gateway resolves it (see
+   * `src/kiro_crew/release_channel.py`) rather than leaving the dashboard to
+   * parse `version`: the same release is stamped as SemVer for the desktop app
+   * and PEP 440 for wheels, and neither PEP 440 prerelease spelling
+   * (`1.2.3rc4`, `1.2.3.dev<stamp>`) contains a `-`, so a mirror of the rule
+   * here would drift and quietly call a prerelease build stable.
+   *
+   * Optional because an older gateway does not send it — treat a missing value
+   * as "unknown", never as "stable".
+   */
+  release_channel?: 'nightly' | 'insider' | 'stable'
   branch?: string
   commit?: string
   platform?: string
@@ -56,6 +77,114 @@ export interface SystemData {
   ollama_running?: boolean; ollama_pid?: number; ollama_mem_mb?: number; ollama_remote?: boolean
 }
 
+/** One age band of the storage report. The labels come from the server so the
+ *  buckets the UI offers can never disagree with the ones it measures. */
+export interface SessionStorageBucket {
+  label: string; sessions: number; bytes: number
+}
+
+export interface SessionStorageBatch {
+  batch_id: string; created_at: number; reason: string
+  sessions: number; bytes: number
+}
+
+/**
+ * What sessions cost on disk, and what may be reclaimed.
+ *
+ * Deliberately carries NO per-store breakdown: a session is one unit to the
+ * person reading this, and the fact that it is written in two places is an
+ * implementation detail the product does not surface.
+ */
+export interface SessionStorageReport {
+  total_bytes: number; total_sessions: number
+  active_sessions: number; active_bytes: number
+  reclaimable_sessions: number; reclaimable_bytes: number
+  /** Non-empty when this instance must not reclaim — show it instead of the action. */
+  reclaim_blocked_reason: string
+  buckets: SessionStorageBucket[]
+  trash: {
+    bytes: number
+    /** Staged bytes are still occupying the disk until the trash is emptied. */
+    still_on_disk: boolean
+    /** True when the trash shares a filesystem with the stores, so moves are renames. */
+    instant: boolean
+    batches: SessionStorageBatch[]
+  }
+}
+
+export interface SessionStorageCleanup {
+  sessions: number; bytes: number; remaining: number
+  /** Empty on a dry run — nothing was staged, so there is no batch to undo. */
+  batch_id?: string
+  dry_run?: boolean
+}
+
+/* ── Session inventory (contract §1–§3) ── */
+
+/** One session row in the inventory list. */
+export interface SessionInventoryItem {
+  uid: string
+  title: string
+  origin: string
+  bytes: number
+  mtime: number
+  active: boolean
+  /** A turn is in flight. Narrower than `active`: everything live is active,
+   *  but an idle session that the product could still resume is not live. */
+  live: boolean
+  background: boolean
+}
+
+/** GET /api/system/session-storage/sessions */
+export interface SessionInventoryList {
+  total_bytes: number
+  total_sessions: number
+  reclaimable_bytes: number
+  reclaim_blocked_reason: string
+  /** Every conversation, plus only the LARGEST replay-only sessions — see `background`. */
+  sessions: SessionInventoryItem[]
+  /** The replay-only group as a whole. `listed` is how many of `sessions` it
+   *  contributed, so the difference is what the list does not name. Never derive
+   *  the group's size or total by filtering `sessions`: on a long-lived install
+   *  the group holds six figures of rows and the list carries a capped sample. */
+  background: { sessions: number; bytes: number; listed: number }
+  /** What an age sweep would reclaim at each offered threshold, cumulative
+   *  ("older than `days`") and already excluding anything in use — so an option
+   *  can be labelled with real numbers before any dry run. */
+  age_options: { days: number; sessions: number; bytes: number }[]
+  trash: {
+    bytes: number
+    still_on_disk: boolean
+    instant: boolean
+    batches: SessionStorageBatch[]
+  }
+}
+
+/** GET /api/system/session-storage/sessions/{uid} — lazy detail */
+export interface SessionInventoryDetail {
+  uid: string
+  first_message: string
+  turns: number
+  images: number
+  bytes: number
+  mtime: number
+}
+
+/** One uid the server refused in POST .../trash */
+export interface SessionTrashRefusal {
+  uid: string
+  /** `resumable` is the common one: idle, but the product could still resume it. */
+  reason: 'in_use' | 'resumable' | 'too_fresh' | 'unknown'
+}
+
+/** POST /api/system/session-storage/trash response */
+export interface SessionTrashResult {
+  sessions: number
+  bytes: number
+  batch_id: string
+  refused: SessionTrashRefusal[]
+}
+
 export interface CronJob {
   id: string; name: string; message: string
   enabled: boolean; schedule: string; last_status: string
@@ -73,6 +202,7 @@ export interface CronJob {
   skip_dates?: string[] | null
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
   is_running?: boolean; running_since?: number | null
+  folder_id?: string
 }
 
 export interface Lesson {
@@ -105,6 +235,28 @@ export interface Skill {
    *  SKILL.md path.  Empty list means no agent loads it via kiro-cli's
    *  native ``skill://`` loader (it may still load via KiroCrew text-injection). */
   loaded_by_agents?: string[]
+}
+
+/** Response shape for GET /api/skills/budget — the control-plane cost data. */
+export interface SkillBudgetRow {
+  key: string
+  name: string
+  size_bytes: number
+  deliveries: number | null
+  /** null when the cost is not measurable: an `always: true` skill is injected
+   *  every turn but that injection is never recorded in the usage ledger. */
+  chars: number | null
+  inject_on_trigger: boolean
+  always: boolean
+  owned: boolean
+  source: string
+  folded_from?: string[]
+  idle_days: number | null
+}
+export interface SkillBudgetResponse {
+  window_days: number
+  total_chars: number
+  rows: SkillBudgetRow[]
 }
 
 /** A single entry in a skill folder's tree listing. */
@@ -349,7 +501,7 @@ export interface ConfiguredChannelTarget {
 }
 
 export interface ChatSlot {
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab'; number: number; url: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
@@ -360,6 +512,11 @@ export interface ChatSlot {
   has_options?: boolean; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean; orchestrating?: boolean
   // Soft-stop state machine
   stop_state?: 'idle' | 'soft_pending' | 'killing'
+  /** In-flight `wait` tool sleep, absent when nothing is sleeping. `deadline_ts`
+   * is absolute seconds on the BACKEND clock (Date.now() / 1000 territory), so
+   * the transcript can count down against it and survive a page reload;
+   * `wait_id` is the handle the End-wait button must quote. */
+  wait_state?: { wait_id: string; seconds: number; deadline_ts: number } | null
   /** Agent TODO list. Null/absent = the todo tool was never used in this slot. */
   todo?: TodoList | null
 }
@@ -488,6 +645,8 @@ export interface PullRequestSource {
 
 export interface ChatFolder {
   id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
+  channel?: string
 }
 
 export interface ChatTag {
@@ -545,6 +704,8 @@ export interface ToolActivity {
   approval_type?: string // 'chat' or 'spawn'
   tool_call_id?: string  // for matching tool results
   rejected?: boolean     // true when approval was rejected
+  kind?: string          // ACP tool kind; execute is the legacy shell signal
+  is_shell?: boolean     // shell tools can expose an indeterminate live status
 }
 
 /** Parsed content block produced by the block assembler. */
@@ -739,7 +900,7 @@ export interface RemoteArtifact {
 export interface Artifact {
   slug: string
   name: string
-  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp'
+  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp' | 'image'
   /** Provenance/origin bucket. Carries either a legacy bucket
    * (chat|cron|subagent|manual|import) or the actual session origin
    * (dashboard|slack|cli|task-runner|unknown), so treated as an open string. */
@@ -789,6 +950,23 @@ export interface Artifact {
   auto_registered?: boolean
   /** Metadata for kind="webapp" artifacts (deploy state, architecture, costs). */
   webapp_metadata?: WebAppMetadata
+  /** Metadata for kind="image" artifacts. The bytes themselves are never inlined
+   * here — they are streamed from `/api/artifacts/<slug>/asset` with the
+   * server setting Content-Type. Every field is optional because older payloads
+   * and minimal saves may omit it, so every consumer must degrade gracefully:
+   * `alt` gives the accessible description, `width`/`height` let the UI reserve
+   * the correct aspect ratio before the image loads, and the rest are
+   * informational (shown in details, used to name a download). */
+  image?: {
+    mime: string
+    ext: string
+    size_bytes?: number
+    width?: number
+    height?: number
+    sha256?: string
+    original_filename?: string
+    alt?: string
+  }
 }
 
 /** A non-code document produced during a chat session — the virtual entries

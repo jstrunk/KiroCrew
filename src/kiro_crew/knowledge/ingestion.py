@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import re
+import time as _time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -42,6 +44,104 @@ DUPLICATE_JOB_STATUS = 'skipped_duplicate'
 
 DEFAULT_MAX_INGEST_FILE_MB = 100.0
 _MB = 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Embed rate limiter — token bucket (items/min) applied globally.
+# ---------------------------------------------------------------------------
+
+
+class EmbedRateLimiter:
+    """Token-bucket rate limiter for embedding generation (items/min).
+
+    Thread-safe via asyncio.Lock (all callers are on the event loop).
+    ``rate_limit=0`` disables the limiter (unbounded).
+    """
+
+    def __init__(self, rate_limit: int = 0):
+        self._rate_limit = rate_limit
+        self._tokens: float = float(rate_limit) if rate_limit else 0.0
+        self._last_refill: float = _time.monotonic()
+        self._lock = asyncio.Lock()
+
+    @property
+    def rate_limit(self) -> int:
+        return self._rate_limit
+
+    @rate_limit.setter
+    def rate_limit(self, value: int) -> None:
+        self._rate_limit = max(0, value)
+        # Reset bucket on config change.
+        self._tokens = float(self._rate_limit)
+        self._last_refill = _time.monotonic()
+
+    async def acquire(self) -> None:
+        """Wait until a token is available. No-op when rate_limit is 0."""
+        if self._rate_limit <= 0:
+            return
+        async with self._lock:
+            now = _time.monotonic()
+            elapsed = now - self._last_refill
+            # Refill at rate_limit tokens per 60 seconds.
+            refill = elapsed * (self._rate_limit / 60.0)
+            self._tokens = min(float(self._rate_limit), self._tokens + refill)
+            self._last_refill = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+        # No token available — wait for one to accrue.
+        wait_secs = (1.0 - self._tokens) / (self._rate_limit / 60.0)
+        await asyncio.sleep(max(0.01, wait_secs))
+        async with self._lock:
+            self._tokens = 0.0
+            self._last_refill = _time.monotonic()
+
+
+# Singleton rate limiter — initialized from config on first use.
+_embed_rate_limiter: EmbedRateLimiter | None = None
+
+
+def get_embed_rate_limiter() -> EmbedRateLimiter:
+    """Get or create the global embed rate limiter (reads config live)."""
+    global _embed_rate_limiter
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+        rate = max(0, int(KiroCrewConfig.load().knowledge.embed_rate_limit))
+    except Exception:
+        rate = 0
+    if _embed_rate_limiter is None:
+        _embed_rate_limiter = EmbedRateLimiter(rate)
+    elif _embed_rate_limiter.rate_limit != rate:
+        _embed_rate_limiter.rate_limit = rate
+    return _embed_rate_limiter
+
+
+async def run_to_completion(fn: Callable[[], None]) -> None:
+    """Run ``fn`` on a worker thread, guaranteed to run even if cancelled.
+
+    A bare ``await asyncio.to_thread(fn)`` can drop ``fn`` entirely: when
+    cancellation arrives while the work item is still QUEUED in the executor,
+    the wrapped future is cancelled before ``fn`` ever starts. The ingestion
+    finalizers pair a committed delete with its state finalization, so a
+    skipped finalizer strands committed data (the next scan re-ingests
+    alongside it -> duplicates). Shield the worker task; on cancellation,
+    wait for it to finish, then re-raise.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(fn))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The finalizer is bounded sync DB work: drain it even under repeated
+        # cancellation, then let the cancellation proceed.
+        while not task.done():
+            try:
+                await asyncio.wait([task])
+            except asyncio.CancelledError:
+                continue
+        exc = task.exception()
+        if exc is not None:
+            # Retrieve + surface the failure; the CancelledError still wins.
+            logger.error("Finalizer failed during cancellation: %s", exc)
+        raise
 
 
 class FileTooLargeError(RuntimeError):
@@ -272,13 +372,24 @@ class IngestionPipeline:
         except Exception:
             logger.debug("Post-ingest dedup skipped", exc_info=True)
 
-    async def ingest_file(self, path: str, on_progress=None, original_name: str = "", namespace: str = "default", source_id: str = "", old_item_ids: list[str] | None = None) -> str | None:
+    async def ingest_file(self, path: str, on_progress=None, original_name: str = "", namespace: str = "default", source_id: str = "", old_item_ids: list[str] | None = None, on_committed: Callable[[list[str]], None] | None = None) -> str | None:
         """Full pipeline. Returns job_id, or None if content hash unchanged.
 
         If source_id is provided, ingests into that existing source instead of
         creating a new one (used for remote source sync).
         If old_item_ids is provided, only those items are replaced (folder sources).
         Otherwise all items for the source are replaced (single-file sources).
+
+        ``on_committed`` receives the ids this call created -- collected at each
+        write, never inferred from a before/after comparison of the source, which
+        would also sweep up whatever another writer committed meanwhile. It runs
+        INSIDE the finalize hop, on the success branch and only there, right
+        after the old group is deleted. An aggregate source keyed by document has
+        to record which document owns those ids, and doing it after this
+        coroutine returns puts several awaits between the items becoming durable
+        and the record that makes them replaceable -- each one a cancellation
+        point that strands the items unowned. Passing the write in here gives it
+        the same run-to-completion guarantee as the delete it belongs with.
         """
         p = Path(path)
         display_name = original_name or p.name
@@ -415,6 +526,7 @@ class IngestionPipeline:
                 display_name=display_name, namespace=namespace,
                 existing=existing, old_item_ids=old_item_ids,
                 _old_item_ids=_old_item_ids, path=path, on_progress=on_progress,
+                on_committed=on_committed,
             )
         except Exception:
             try:
@@ -431,7 +543,7 @@ class IngestionPipeline:
     async def _ingest_file_body(self, *, job_id, source_id, props, meta, ext, text,
                                 uri, content_hash, display_name, namespace,
                                 existing, old_item_ids, _old_item_ids, path,
-                                on_progress) -> str | None:
+                                on_progress, on_committed=None) -> str | None:
         """Chunk/extract/store/finalize — split out so ingest_file can mark the
         pre-inserted job row 'failed' on ANY exception in one place."""
         # 4. Chunk (use per-source chunk size if configured)
@@ -459,6 +571,13 @@ class IngestionPipeline:
         chunk_contents = [chunk['content'] for chunk in chunks]
         extractions = await self.extractor.extract_batch(chunk_contents)
 
+        # What THIS call wrote, collected at the write itself rather than
+        # inferred from a before/after comparison of the source. `import_bundle`
+        # writes into the same aggregate in its own transaction and under no
+        # shared lock, so anything it commits while this ingest is awaiting would
+        # be attributed here -- handing a document delete authority over
+        # knowledge it never created.
+        created_item_ids: list[str] = []
         processed = 0
         for i, (chunk, extraction) in enumerate(zip(chunks, extractions)):
             try:
@@ -483,6 +602,7 @@ class IngestionPipeline:
                     tags=item_tags,
                     content_hash=content_hash,
                 )
+                created_item_ids.append(item_id)
                 self.store.add_source_location(
                     item_id=item_id, source_id=source_id,
                     chunk_range=f"{chunk.get('line_start', 0)}-{chunk.get('line_end', 0)}",
@@ -506,29 +626,47 @@ class IngestionPipeline:
 
         # 6. Finalize
         now = datetime.now().isoformat()
+
+        def _finalize() -> None:
+            # Runs OFF the loop as ONE hop: delete_items_batch rebuilds the entire
+            # entity graph (store._load_graph) inside its own BEGIN/COMMIT, which
+            # wedged the event loop past the stall watchdog on large libraries.
+            # The delete and the state finalization travel together so a
+            # cancellation (gateway shutdown) lands entirely before or entirely
+            # after this hop -- a delete that commits while sync_status/job
+            # finalization is skipped would make the next scan re-ingest
+            # alongside the already-committed new items (duplicates). The
+            # worker's thread-local connection is autocommit
+            # (isolation_level=None), so no enclosing transaction spans this,
+            # and WAL + busy_timeout=10000 rides out write-lock contention.
+            if processed == total:
+                self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
+                if on_committed is not None:
+                    on_committed(list(created_item_ids))
+                if existing:
+                    self.store.update_source(source_id, properties=json.dumps({**props, 'content_hash': content_hash, **meta}))
+                self.store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
+                self.store.update_source(source_id, last_synced=now)
+            elif processed < total:
+                # Partial failure: remove only items created during THIS ingestion call
+                after_ids = {r["id"] for r in self.store.db.execute(
+                    "SELECT id FROM items WHERE source_id = ?", (source_id,),
+                ).fetchall()}
+                self.store.delete_items_batch(list(after_ids - _before_ids))
+                self.store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
+            self.store.db.execute(
+                "UPDATE ingestion_jobs SET status = ?, items_processed = ?, updated_at = ? WHERE id = ?",
+                (_job_status(processed, total), processed, now, job_id))
+            self.store.db.commit()
+
+        await run_to_completion(_finalize)
         if processed == total:
-            self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
-            if existing:
-                self.store.update_source(source_id, properties=json.dumps({**props, 'content_hash': content_hash, **meta}))
-            self.store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
-            self.store.update_source(source_id, last_synced=now)
-            # Generate file-level summary from chunk summaries
+            # File-level summary from chunk summaries. Best-effort, and AFTER the
+            # finalize hop so a failure or cancel here cannot strand the job row.
             try:
                 await self.generate_source_summary(source_id)
             except Exception:
                 logger.debug("Source summary generation skipped for %s", source_id, exc_info=True)
-        elif processed < total:
-            # Partial failure: remove only items created during THIS ingestion call
-            after_ids = {r["id"] for r in self.store.db.execute(
-                "SELECT id FROM items WHERE source_id = ?", (source_id,),
-            ).fetchall()}
-            new_ids = list(after_ids - _before_ids)
-            self.store.delete_items_batch(new_ids)
-            self.store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
-        self.store.db.execute(
-            "UPDATE ingestion_jobs SET status = ?, items_processed = ?, updated_at = ? WHERE id = ?",
-            (_job_status(processed, total), processed, now, job_id))
-        self.store.db.commit()
         # Cross-source dedup for whole-source ingests (upload / remote / chat). Folder-file
         # ingests (old_item_ids is a list) are swept by FolderWatcher at end of scan.
         if processed == total and old_item_ids is None:
@@ -642,26 +780,40 @@ class IngestionPipeline:
                 logger.exception("Failed to process chunk %d of text '%s'", i, title)
 
         now = datetime.now().isoformat()
+
+        def _finalize() -> None:
+            # ONE off-loop hop for the delete + state finalization, mirroring
+            # _ingest_file_body: delete_items_batch rebuilds the entity graph and
+            # cannot run on the loop, and splitting it from the finalization
+            # would let a cancellation commit the delete while leaving the job
+            # 'processing' and the source unsynced (re-ingest -> duplicates).
+            # Worker connection is autocommit; WAL + busy_timeout absorb
+            # write-lock contention.
+            if processed == total:
+                self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
+                self.store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
+                self.store.update_source(source_id, last_synced=now)
+            elif processed < total:
+                # Partial failure: remove only items created during THIS call so we
+                # never delete another item group sharing this source_id.
+                after_ids = {r["id"] for r in self.store.db.execute(
+                    "SELECT id FROM items WHERE source_id = ?", (source_id,),
+                ).fetchall()}
+                self.store.delete_items_batch(list(after_ids - _before_ids))
+                self.store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
+            self.store.db.execute(
+                "UPDATE ingestion_jobs SET status = ?, items_total = ?, items_processed = ?, updated_at = ? WHERE id = ?",
+                (_job_status(processed, total), total, processed, now, job_id))
+            self.store.db.commit()
+
+        await run_to_completion(_finalize)
         if processed == total:
-            self.store.delete_items_batch(_old_item_ids, owner_source_id=source_id)
-            self.store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (source_id,))
-            self.store.update_source(source_id, last_synced=now)
+            # Best-effort, and AFTER the finalize hop so a failure or cancel here
+            # cannot strand the job row.
             try:
                 await self.generate_source_summary(source_id)
             except Exception:
                 logger.debug("Source summary generation skipped for %s", source_id, exc_info=True)
-        elif processed < total:
-            # Partial failure: remove only items created during THIS call so we
-            # never delete another item group sharing this source_id.
-            after_ids = {r["id"] for r in self.store.db.execute(
-                "SELECT id FROM items WHERE source_id = ?", (source_id,),
-            ).fetchall()}
-            self.store.delete_items_batch(list(after_ids - _before_ids))
-            self.store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (source_id,))
-        self.store.db.execute(
-            "UPDATE ingestion_jobs SET status = ?, items_total = ?, items_processed = ?, updated_at = ? WHERE id = ?",
-            (_job_status(processed, total), total, processed, now, job_id))
-        self.store.db.commit()
         # Cross-source dedup for whole-source ingests (upload / remote / chat).
         # Group-level replaces (old_item_ids provided -- e.g. a single artifact's
         # group within the aggregate Artifacts source) defer to the folder-scan
@@ -717,9 +869,13 @@ class IngestionPipeline:
 
         Includes chunk ``content`` so vector search matches body text, not just
         the title/summary (which previously left body-only queries unmatchable).
+        Respects the global embed rate limiter (knowledge.embed_rate_limit).
         """
         if not self.embedder:
             return
+        # Rate-limit embedding generation to prevent CPU/memory saturation.
+        limiter = get_embed_rate_limiter()
+        await limiter.acquire()
         # Capture the signature BEFORE the embed, and stamp the row with THAT
         # value — the same discipline _write_item_embedding already follows by
         # taking `sig` as a parameter.

@@ -1,7 +1,8 @@
 # KiroCrew Desktop (Electron)
 
-Desktop shell for the Kiro Crew web dashboard on macOS and Linux. It
-automatically starts `kirocrew gateway` and connects to `localhost:5476`.
+Desktop shell for the Kiro Crew web dashboard on macOS, Linux, and Windows
+(Windows is in preview — see the build note below). It automatically starts
+`kirocrew gateway` and connects to `localhost:5476`.
 
 ## Quick Start
 
@@ -13,22 +14,28 @@ npx electron .
 
 The app will:
 
-1. Reuse an existing gateway if one is already reachable
+1. Reuse an existing gateway if one is already reachable and actually serving
+   (`/api/ready` 200) — a gateway draining after `/api/shutdown` still answers
+   `/api/status`, so it is never adopted; the app waits for the port to clear
+   and spawns fresh instead
 2. Launch `kirocrew gateway` when needed
 3. Show a loading screen while the backend boots
 4. Load the dashboard
-5. Guide the user through Kiro CLI installation and device sign-in on the
-   gateway host when either prerequisite is missing
+5. Point the user at Kiro CLI installation and sign-in on the gateway host when
+   either prerequisite is missing
 
 The Electron shell uses the same gateway-hosted setup screen as every browser;
-it has no separate installer or login runner. On macOS and Linux, **Install Kiro
-CLI** downloads and runs Kiro's official HTTPS installer only after the user
-clicks the button. Native Windows gateways expose the same workflow through the
-browser dashboard. **Sign in to Kiro** starts
-`kiro-cli login --use-device-flow`; the app waits for `kiro-cli whoami` to
-succeed before continuing. Candidate selection is fail-closed: a broken
-higher-priority Kiro CLI is shown as needing repair and is not skipped in favor
-of a later candidate. Remote tunnel sessions check the remote gateway host.
+it has no separate installer or login runner, and it performs neither step. The
+screen links out to <https://kiro.dev/cli/> for the CLI, and names the commands
+the user runs to sign in: `kiro-cli login` for a personal account, or
+`kiro-cli login --use-device-flow --license pro` for organization SSO. Both are
+shown because the portal the bare command opens offers a free Builder ID
+alongside organization SSO, and picking the wrong one still succeeds — the
+mismatch only surfaces later as missing models. The app observes completion
+through the read-only `kiro-cli whoami` probe. Candidate selection is
+fail-closed: a broken higher-priority Kiro CLI is shown as needing repair and is
+not skipped in favor of a later candidate. Remote tunnel sessions check the
+remote gateway host.
 
 ## Install as macOS App
 
@@ -53,6 +60,35 @@ npm run dist
 ```
 
 Output goes to `electron/dist/`.
+
+## Build Windows Installer (NSIS)
+
+The Windows desktop build is wired end to end: `package.json` declares an
+`nsis` target under `build.win`, and `packaging/build-desktop.sh` has a full
+Windows branch. Run it from Git Bash (or MSYS/Cygwin — the script normalizes
+those to `windows`) at the repo root:
+
+```bash
+bash packaging/build-desktop.sh
+```
+
+Notes:
+
+- **The build must run natively on Windows**, not cross-built from macOS or
+  Linux: the script provisions a Windows python-build-standalone interpreter
+  via `uv` and executes its `python.exe` to install and verify the bundled
+  backend, then runs `electron-builder --win` to produce the NSIS installer.
+- **Signing is optional for a local build.** The `signtoolOptions.sign` hook
+  (`scripts/sign-windows.js`) skips cleanly when none of the
+  `WINDOWS_SIGNING_*` environment variables are set, so a credential-less
+  build produces a working unsigned installer. (Setting only some of the five
+  variables is treated as a misconfiguration and fails the build.)
+- The result is an assisted (non-one-click, per-user) NSIS installer,
+  `KiroCrew Setup <version>.exe` (nightly builds:
+  `KiroCrew Nightly Setup <version>.exe`), in `website/electron/dist/`.
+
+See `../../docs/guides/windows-install.md` for the CI-built installer and the
+current Windows support status.
 
 ## Updating
 

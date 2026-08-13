@@ -183,9 +183,35 @@ send time.
   onto `self._idle_sweep_enabled`/`self._idle_timeout` by `_cleanup_loop`),
   `orphan_mcp` (maintenance-executor offload), `denied_commands`
   (re-enforcement offloaded to the maintenance executor — deliberate
-  sync→thread change from the old inline block), and `rss_threshold`. The
+  sync→thread change from the old inline block), `rss_threshold`, and
+  `stuck_turn`. The
   orphan-PID / session-root / sandbox-profile sweeps remain inline in
+
   `_cleanup_loop` (CR 2 extracts them).
+- **Stuck-turn reporting** (`_stuck_turn_check`, threshold
+  `_STUCK_TURN_REPORT_SECS` = 300s, not configurable): reports a turn whose
+  consumer has stopped pulling events. Exists because the per-turn watchdog in
+  `acp-client.md` cannot report on itself — it is the `TimeoutError` arm of an
+  async generator, so a consumer awaiting inside its own `async for` body
+  freezes the generator and that arm never runs again for the turn, which is why
+  such a turn emits no stall WARNING at all. This loop has its own timer and no
+  dependency on any consumer. Considers only sessions whose semaphore is held
+  (the only in-flight signal at this layer), reads `parked_for_secs()` /
+  `parked_since` / `awaiting_permission` duck-typed off `provider._handle` so any
+  transport growing those accessors is covered, and latches on the park's
+  monotonic start so a park outliving the tick is reported once rather than every
+  pass. **Detection only**, deliberately: a turn awaiting a human is excluded
+  because `agent.tool_approval_timeout_secs` already bounds that wait; ending a
+  live turn stays with the in-band path that owns the terminal-event seam and the
+  non-lethal continue-nudge; and what the park is blocked on is not knowable from
+  here. Logs at WARNING and fires the optional `on_stuck_turn(key, parked_secs)`
+  callback — a seam so a surface that can reach the user decides what to do,
+  keeping the session layer free of any dashboard import. Swallows its own errors
+  like its sibling hooks. The reasoning behind putting this check here rather
+  than in the read loop — the placement criterion, what a hook may honestly read
+  at this layer, and how out-of-band action stays clear of the in-band recovery
+  path — is recorded in
+  `../../architecture/design-notes/tool-stall-watchdog-placement.md`.
 - **RSS-threshold recycle** (`_rss_threshold_check`, config
   `session.watchdog_rss_max_mb`, default 0 = disabled): recycles non-busy
   sessions whose `/proc` process-tree RSS (MiB) exceeds the ceiling. Skips
@@ -212,14 +238,16 @@ send time.
 | Method | Purpose |
 |--------|---------|
 | `start_pool(blocking=True)` | Pre-spawn warm + background sessions. `blocking=False` for non-blocking mode. |
-| `get_or_create(key, agent=None, approval_policy="")` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. |
+| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.is_new` marker is registered ARMED and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers with the one-shot `resumed_armed` marker armed alongside `is_new` when the load restored the transcript. Both markers are consumed together by the first real claimant under the per-session semaphore (fast path and won-race path alike), so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself — preserving its history-injection decision. |
 | `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 90%), warns at 75%. |
 | `record_success(key)` / `record_failure(key)` | Circuit breaker tracking. |
 | `release(key)` | Release per-session semaphore (must call in `finally`). |
 | `cancel_current(key, *, wait_ack_timeout=0.0)` | Cancel in-flight operation without destroying session. Returns `CancelOutcome`. Default `wait_ack_timeout=0.0` preserves fire-and-forget behavior for internal callers (taskrunner, subagent, llm_helpers). |
 | `stop_turn(key, *, force=False, on_soft=None, on_hard=None)` | Cooperative stop with kill fallback. Returns `StopOutcome` (`"soft"`, `"hard"`, or `"idle"`). Clears queue unconditionally, then sends `session/cancel` and waits up to `agent.soft_stop_budget_secs`; falls back to `reset()` + eager respawn on timeout or error. `force=True` skips cancel and goes straight to hard kill. `on_soft`/`on_hard` callbacks fire before return. |
 | `reset(key, *, expect_session=None, skip_if_busy=False)` | Kill session; returns `bool` (True iff a session was actually torn down). Does NOT delete session map entry (kiro-cli file persists for future resume). Optional guards evaluated atomically under the lock with the pop, used by the RSS-recycle watchdog: `expect_session` only resets if that exact session object still occupies the key (guards against recycling a reset+recreated session on a stale off-lock RSS reading); `skip_if_busy` skips when the current session's semaphore is held so a live stream is never cut mid-turn. |
-| `remove(key)` | Kill session AND delete session map entry (explicit tab delete — no resume expected). |
+| `discard_conversation(key)` | Kill session AND clear only the resume sid (`SessionMap.clear_sid`) — the map ENTRY survives, preserving Slack thread/channel linkage and the reverse thread→session index. The cleared sid is stashed as `discarded_sid` in the entry, so the discard is diagnosable and manually reversible (the native conversation persists on disk; only the pointer is dropped). The next turn cold-starts a fresh native conversation instead of `session/load`-ing the old one. Used by the poisoned-conversation escalation in `chat_runner` (canary-verified backend rejection of a specific persisted conversation): the conversation is unusable but the session's channel identity must persist. Sits between `reset` (sid kept, resume expected) and `remove` (entry deleted, no resume). |
+| `remove(key)` | Shut down a session but PRESERVE the session map entry — the kiro-cli session files remain on disk, so a future `get_or_create` restores the conversation losslessly via `session/load`. For revivable teardown (tab close, agent switch, idle kill). Permanent deletion is `destroy(key)`. |
+| `remove_if_unclaimed(key)` | Conditional `remove` for the resume-prefetch TTL: removes the session only if the one-shot `is_new` marker is still armed (no real turn claimed it) AND the per-session semaphore is unheld, checked atomically under the manager lock. Preserves the session map (mirrors `remove`'s revivable shape), so the next focus or first message resumes normally. Returns `True` iff a session was removed. A claimant handed the session object but not yet holding the semaphore loses benignly: its re-validate fails and it cold-starts. |
 | `close_all(drain_timeout=None)` | Pre-shutdown **drain** of in-flight turns (via `drain_active_turns`), then save all active session mappings, shut down every session, and drain the warm pool. `drain_timeout` bounds that drain (`None` = full default budget); a caller wrapping `close_all()` in its own hard deadline (Slack's restart wraps it in `wait_for(..., 5s)`) passes a smaller budget (e.g. `2.0`) so the kill path still fits inside the deadline. A cancel that fires mid-drain (outer deadline) **propagates** (CancelledError is deliberately not caught) so the caller's hard deadline stays honest; recovery of a still-held native-session lock is the next-startup orphan reaper's job. |
 | `drain_active_turns(timeout=None)` | Best-effort co-operative drain that brings in-flight prompts to a safe turn boundary **before** teardown, so kiro-cli closes its native turn and releases its session lock (`~/.kiro/sessions/cli/<uuid>.json`) on the subsequent SIGTERM — otherwise the next gateway's `session/load` hits "active in another process" and the slot returns empty completions (the Make-Live empty-response incident, #200). For each registered session with an **unfinished** turn (native turn-done not yet acked — independent of cancel state, so an already-cancelled-but-not-acked turn is still drained), it issues a graceful `session/cancel` and waits (bounded) for the ack; a turn already cancelled (`cancel()` → `"no_turn"`) is waited on directly via `wait_turn_done`. The whole operation is bounded by `timeout` (`None` → `_DRAIN_ACTIVE_TURNS_TIMEOUT_SECS`, default 5.0s; internal cap is `timeout+1.0`); on timeout it logs and returns so the caller falls through to the SIGTERM-first kill path — never hangs teardown, never raises. `timeout <= 0` disables the drain. Returns the count of unfinished turns (observability/tests). Only registered user sessions are drained; the warm pool holds never-prompted processes. |
 | `begin_turn(key)` | **Synchronous** pre-dispatch gate against the lease-dispatch race (#200 / Codex HIGH). A caller holds the per-session semaphore *lease* from `get_or_create` through the whole turn, but the native turn only opens on the first `provider.stream(...)` iteration; the `get_or_create` `_closing` gate cannot revoke a lease already issued before `close_all` set `_closing`. Callers (dashboard `chat_runner`, Slack handler) MUST call `begin_turn` synchronously — **no `await` between it and the `async for` stream drive** — so the `_closing` read and the stream's turn registration (`AcpClient.stream_events` clears `_turn_done` before its first `await`) form one yield-free span, strictly ordered w.r.t. `close_all`'s `_closing` set: the turn is either registered before the drain snapshot (and drained) or the caller aborts. Raises `SessionClosingError` (a `RuntimeError`) when closing; the caller's `finally` releases the lease. Deliberately NOT `async`/lock-guarded (an `await` would reopen the race). |
@@ -341,6 +369,14 @@ stored and new provider names for observability.
 no longer exists. `SessionMap.prune()` bulk-removes all stale entries at
 startup.
 
+**Mapped-session enumeration:** `SessionMap.mapped_sids_by_key()` returns session
+key → kiro-cli session ID for every entry that has one. Disk accounting
+([session-storage](session-storage.md)) needs both halves of that relation: the IDs
+to exclude from reclaiming (a mapped session is resumable), and the key each ID
+belongs to so a session's transcript can be paired with its replay log. Returning
+the mapping rather than only the ID set is what lets a caller reclaim a session
+whole instead of leaving one half behind.
+
 **Dashboard history key round-trip:** Session keys use `:` (e.g.
 `dashboard:chat-1-xxx`) but JSONL filenames use `_safe_key()` which replaces
 `:` with `_`. When a session is resumed from history, the slot name comes from
@@ -369,7 +405,10 @@ original pretty form is preserved as the slot's initial title
 
 Sessions can be linked to Slack threads via `SessionMap` fields
 `slack_thread_ts` and `slack_channel_id`. This enables bidirectional sync
-between dashboard chat and Slack.
+between dashboard chat and Slack. Slack is the legacy special case: other
+channels link through the generic ChannelLink mirror map (see
+[messaging.md](messaging.md)). The `slack_*` fields are retained for backward
+compatibility.
 
 **API:**
 - `SessionManager.set_slack_link(key, thread_ts, channel_id)` — persists to session map

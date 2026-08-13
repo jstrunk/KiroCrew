@@ -96,14 +96,15 @@ Set via `kirocrew config set agent.sandbox auto`.
     "history_max_days": 365
   },
   "skills": {
-    "max_triggered": 3
+    "max_triggered": 0
   },
   "knowledge": {
-    "auto_ingest_artifacts": true,
-    "auto_add_documents": true,
-    "auto_register_project_docs": true,
+    "auto_ingest_artifacts": false,
+    "auto_add_documents": false,
+    "auto_register_project_docs": false,
     "auto_ingest_artifact_kinds": ["markdown", "text", "html", "json"],
     "auto_ingest_chunk_budget": 150,
+    "folder_ingest_chunk_budget": 300,
     "dedup_every_n_sweeps": 12
   },
   "auto_update": true,
@@ -172,6 +173,9 @@ Only the owner (`KIROCREW_OWNER_ID`) is authorized to interact over Slack.
 Multi-user access and open channels are refused regardless of what these lists
 contain, so treat them as bookkeeping rather than an access grant.
 
+Other channels (Discord, Telegram, Teams, Webex, WeCom, WeChat) are configured
+from the dashboard — see each channel's doc for keys and credentials.
+
 ### Speech-to-text
 
 | Key | Description | Default |
@@ -205,18 +209,19 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `skills.max_triggered` | Maximum skills loaded per message (at least 1) | `3` |
+| `skills.max_triggered` | Maximum skills loaded per message (>=0) | `0` |
 | `skills.lazy_load` | Inject only a usage-ranked top-K of on-demand skills at session start and leave the long tail discoverable via search, so a large skills set cannot crowd out memory and lessons | `false` |
 
 ### Knowledge Library
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `knowledge.auto_ingest_artifacts` | Auto-ingest content-bearing local artifacts into the Knowledge Library as a searchable "Artifacts" source, kept in sync and removed when the artifact is deleted (see [Knowledge Library](knowledge-library-how-it-works.md)) | `true` |
+| `knowledge.auto_ingest_artifacts` | Auto-ingest content-bearing local artifacts into the Knowledge Library as a searchable "Artifacts" source, kept in sync and removed when the artifact is deleted (see [Knowledge Library](knowledge-library-how-it-works.md)). Opt-in: enabling it backfills the artifacts you already have | `false` |
 | `knowledge.auto_ingest_artifact_kinds` | Artifact kinds eligible for auto-ingest. `widget` is excluded as UI rather than a document; `svg` is excluded because the file reader has no support for it | `["markdown", "text", "html", "json"]` |
-| `knowledge.auto_add_documents` | Let the agent add documents it reads while working to the Knowledge Library (one aggregate "Auto-added" source). The agent fetches the content with its own tools under your approval; Kiro Crew fetches nothing, so `doc_ingest_hosts` does not apply. Renamed from `auto_ingest_doc_links`, which is still accepted on read | `true` |
-| `knowledge.auto_register_project_docs` | Register the documents of each project you work in as a Knowledge source automatically. Documents only (`.md`/`.pdf`/`.docx`/`.org` above a size floor, excluding agent instructions, generated files and repository boilerplate) — never source code | `true` |
-| `knowledge.auto_ingest_chunk_budget` | Chunks an automatically-registered source may ingest per watcher sweep. Each chunk is one LLM extraction call, so this bounds the cost; newest documents land first and the rest follow on later sweeps. 0 removes the bound. Folders you add by hand are never budgeted | `150` |
+| `knowledge.auto_add_documents` | Let the agent add documents it reads while working to the Knowledge Library (one aggregate "Auto-added" source). The agent fetches the content with its own tools under your approval; Kiro Crew fetches nothing, so `doc_ingest_hosts` does not apply. Renamed from `auto_ingest_doc_links`, which is still accepted on read | `false` |
+| `knowledge.auto_register_project_docs` | Register the documents of each project you work in as a Knowledge source automatically. Documents only (`.md`/`.pdf`/`.docx`/`.org` above a size floor, excluding agent instructions, generated files and repository boilerplate) — never source code. Opt-in: once on it applies to every project you open, with no per-project confirmation | `false` |
+| `knowledge.auto_ingest_chunk_budget` | Chunks an automatically-registered source may ingest per watcher sweep. Each chunk is one LLM extraction call, so this bounds the cost; newest documents land first and the rest follow on later sweeps. 0 removes the bound | `150` |
+| `knowledge.folder_ingest_chunk_budget` | Chunks a folder you add by hand may ingest per watcher sweep, including the first scan started by confirming the source. Nothing is skipped — newest files land first and the rest continue on later sweeps — so this paces spend rather than limiting what is ingested. Higher than the auto-ingest budget because you asked for the folder explicitly. 0 removes the bound; a per-source `chunk_budget` property overrides it for one folder | `300` |
 | `knowledge.dedup_every_n_sweeps` | Run a full duplicate-collapsing pass every Nth watcher sweep (the per-write gate only catches byte-identical documents). 0 disables | `12` |
 | `knowledge.auto_discover_folder` | Watch for a documents folder inside the active workspace and register it as a Knowledge source automatically, so files dropped there become searchable without adding the source by hand. The folder is never created for you, and deleting or pausing the auto-added source persists so it does not reappear on the next sweep. Off by default because ingestion spends LLM extraction on every supported file | `false` |
 | `knowledge.auto_discover_dirname` | Folder name inside the workspace that auto-discovery looks for. A single path segment: separators and traversal are rejected so the source cannot be redirected outside the workspace. Avoid `knowledge`, which is where the Library's own store lives and always exists | `"knowledge-docs"` |
@@ -254,7 +259,8 @@ A per-job `timezone` on a cron job wins over this global value.
 
 ## Credentials
 
-`~/.kiro/crew/.env` holds the Slack tokens and owner ID:
+`~/.kiro/crew/.env` holds messaging-channel credentials and the owner ID. For
+Slack:
 
 ```
 SLACK_APP_TOKEN=xapp-...

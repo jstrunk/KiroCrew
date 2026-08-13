@@ -33,6 +33,7 @@ mint, diagnostics, injection validation, run-marker) plus
 - [11. Input validation (`validation.py`)](#11-input-validation-validationpy)
 - [12. The gateway run-marker (`run_marker.py`)](#12-the-gateway-run-marker-run_markerpy)
 - [13. The SSM connection method (`connection_method`)](#13-the-ssm-connection-method-connection_method)
+- [14. Session transfer (send a session to another instance)](#14-session-transfer-send-a-session-to-another-instance)
 
 ---
 
@@ -347,7 +348,8 @@ it is reachable only by an authenticated owner driving the API directly.
   `ExitOnForwardFailure=yes` so a forward that cannot bind is a detected failure
   rather than a silent hang. `-N` without `-f` is deliberate: `-f` would fork ssh
   into the background and leave the gateway unable to supervise or kill the real
-  forwarder.
+  forwarder. The multiplexing pins in §9 close the same hole from the
+  ssh_config side.
 - **No local shell.** `ssh` is always spawned with an argv list, so `ssh_host`
   cannot inject local shell syntax; `ssh_host`/`remote_bin` are
   injection-validated immediately before every command line is built (§11).
@@ -411,10 +413,32 @@ it is reachable only by an authenticated owner driving the API directly.
 The only thing that varies per remote is the **SSH host** you configure: the hub
 always runs a fixed `ssh <ssh_host> ...` argv (`BatchMode=yes`,
 `ExitOnForwardFailure=yes`, `ServerAliveInterval=30`, `ServerAliveCountMax=3`,
-`AddressFamily=inet`, `-L`/`-N`, plus `-C` when compression is on). Anything
-`ssh` can reach **non-interactively** works. `ssh_host` accepts `host`,
-`host.fqdn`, an `~/.ssh/config` alias, or `user@host`, and rejects any segment
-starting with `-` (ssh option-injection guard).
+`AddressFamily=inet`, `ControlPath=none`, `ControlMaster=no`, `-L`/`-N`, plus `-C` <!-- wokeignore:rule=master -->
+when compression is on). Anything `ssh` can reach **non-interactively** works.
+`ssh_host` accepts `host`, `host.fqdn`, an `~/.ssh/config` alias, or
+`user@host`, and rejects any segment starting with `-` (ssh option-injection
+guard).
+
+**Multiplexing is pinned off; everything else is inherited.** A tunnel is a
+supervised foreground child, and a forward the gateway cannot supervise or kill
+reports as `ssh exited with code 0` while it is in fact still serving. A
+multiplexed session does exactly that — ssh hands the forward to an existing
+shared connection and exits. `ControlPath=none` is the enforcement: with no path
+resolved there is no socket to join. `ControlMaster=no` states the policy, and <!-- wokeignore:rule=master -->
+is not sufficient alone — an inherited `ControlPath` still routes into a shared
+connection.
+
+Everything else per-host — `User`, `IdentityFile`, `Port`, `ProxyJump`,
+`ProxyCommand` — is still inherited from `~/.ssh/config`; the registry carries no
+inline equivalents and depends on that. **Pinning a directive the user may also
+set is not free**: ssh takes the first value obtained and reads the command line
+first, so a pinned `-o` silently discards theirs. The two multiplexing pins are
+safe because a supervised tunnel must never share a connection, but the same
+move on, say, `IgnoreUnknown` would drop the pattern a cross-platform config
+relies on and turn a working setup into `Bad configuration option`.
+
+The diagnostics probes are a different case and are left alone: they are
+one-shot commands whose exit status is the whole result, with no forward to own.
 
 ### Dev host / home server (primary)
 
@@ -468,6 +492,53 @@ why `cloud/connect.py` cites this section, and why its numbering must not move.
 The legacy `ssm_proxy_ssh_host` helper (registering the id as `ssh_host` behind an
 `~/.ssh/config` `ProxyCommand`) is retained for reference only and is no longer
 used by the managed path.
+
+### Provisioning from the dashboard (`/api/cloud/*`)
+
+The Remote Crew settings page can create an EC2 crew in the user's own AWS
+account without dropping to the CLI. `dashboard/handlers_cloud.py` exposes the
+launcher behind the same owner-only guard as `/api/instances/*`: an
+authenticated owner (`request["user"]`), non-Slack, POSIX only, `403` otherwise.
+
+| Method and path | Purpose |
+|---|---|
+| `GET /api/cloud/preflight?profile=&region=` | AWS reachability + the prerequisite checklist (the doctor checks as JSON). |
+| `GET /api/cloud/iam-policy` | The minimum IAM policy document to paste into the user's account. |
+| `GET /api/cloud/launch` | List launch jobs, in progress and finished. |
+| `POST /api/cloud/launch` | Start a launch job; returns the job immediately. `409` when one is already in flight. |
+| `GET /api/cloud/launch/{id}` | Poll one job: per-step state plus the device-code prompt while signing in. |
+| `POST /api/cloud/launch/{id}/cancel` | Request cancellation; honored between steps and inside the sign-in wait. A cancel during provisioning is acted on when the deploy returns, and the stack it created is rolled back. |
+| `POST /api/cloud/launch/{id}/signin` | Acknowledge the device-code prompt (`409` when none is pending). |
+| `POST /api/cloud/{tag}/stop` | Stop the instance behind a stack tag. |
+| `POST /api/cloud/{tag}/start` | Start it again. |
+| `DELETE /api/cloud/{tag}` | Terminate the stack (`wait=False`; a denied human-action check surfaces as `403`). |
+
+**A launch is a durable job, not a request.** It outlives both the HTTP call and
+the browser tab: `cloud/launch_job.py` writes one JSON file per job under
+`<config_dir>/run/cloud-launch-jobs/` (the `run/` tree is on the sensitive-path
+floor, so an awaiting-sign-in job's device code is not readable by agent file
+tools) and rewrites it after **every** state
+transition, so progress survives navigating away and a reload. The steps are
+`preflight → provision → signin → connect`, and
+`RealLaunchEngine` (`cloud/launch_engine.py`) binds them to the existing
+`iam.reachability_check`, `ec2.deploy`, `login.start_device_login` and
+`connect.register_instance` — the dashboard path adds no AWS logic of its own,
+and registration lands in this registry exactly as the CLI's does.
+
+**A restart does not resume a launch — it terminalizes it.** The worker is a
+daemon thread, so a gateway restart takes it with the process while the job file
+still reads `running`. `LaunchJobStore.reap_orphans()` runs on first store use in
+a new process and marks every non-terminal job it does not own as `failed`
+("interrupted"), because the alternative is worse than an error: a progress card
+that can never advance, and a `cancel` that returns 200 while signalling a thread
+that no longer exists. Ownership is tracked (`adopt()`) so a live process never
+reaps its own in-flight jobs. The CloudFormation stack may well have completed in
+AWS, so the message points the user at their crew list rather than implying
+nothing was created.
+
+Because the gateway cannot answer the device login on the user's behalf, a job
+parks in `awaiting_signin` with the verification URL and user code exposed as
+job state until the owner confirms it in the browser.
 
 ### What is reachable through which mechanism
 
@@ -603,7 +674,7 @@ marker is inert there, but the *filename* still matters to consumer 2.
 
 The marker's filename advertises which port a gateway serves, so `marker_ports()`
 lets a local client command (`token` / `status` / `logout` / `stop`, via
-`cli_server.resolve_client_port`) find a gateway on a non-default port with no
+`port_resolution.resolve_client_port`) find a gateway on a non-default port with no
 configuration. That path reads only the filename and ignores marker *contents*
 entirely. Resolution order is `--port`, then `KIROCREW_PORT`, then a port named
 by `dashboard.url`, then the sole gateway-owned marker, then the default 5476.
@@ -612,7 +683,7 @@ by `dashboard.url`, then the sole gateway-owned marker, then the default 5476.
 graceful shutdown, so a crash or SIGKILL leaves the file behind and an unrelated
 process may since have bound that port. Because client commands send the local
 secret (`X-Local-Secret`) to whatever answers, the consumer must verify the
-listener before trusting a discovered port. `cli_server._gateway_owns_port()`
+listener before trusting a discovered port. `port_resolution._gateway_owns_port()`
 does that in four fail-closed steps: the recorded pid must exist, must be among
 `platform_compat.find_listening_pids(port)`, must be owned by the caller's uid
 (which closes pid recycling into another user's process), and must look like a
@@ -754,3 +825,156 @@ the reachability lives in ssh config and Kiro Crew is unaware of it.
 key on the remote — and it is now what `cloud/connect.py`'s registry integration
 uses (`register_instance` sets `connection_method="ssm"`, `ssm_target=<instance-id>`).
 The legacy `ssm_proxy_ssh_host` helper is kept for reference only.
+
+---
+
+## 14. Session transfer (send a session to another instance)
+
+Copies one dashboard session from this instance to a connected peer. The user
+picks it from any session menu: **Send a copy to ▸ `<instance>`**.
+
+Code: `src/kiro_crew/dashboard/session_transfer.py` (bundle + importer),
+`SshTunnelManager.send_session_bundle` (delivery),
+`handlers_instances.api_instances_send_session` (control plane), and the frontend
+`SendToInstanceSubmenu` mounted inside the shared `SessionActionsMenu`.
+
+### 14.1 Why it needs no new transport
+
+A session is a portable JSONL transcript (`<data-home>/sessions/<key>.jsonl`:
+a metadata line then `{role, content, ts}` records) and the receiving side
+already knows how to turn one into a live tab — that is what
+`chat_persistence` does on every gateway restart. So a transfer reuses two
+things that exist: the tunnel from §4 and the rehydrate path.
+
+The gateway binds loopback unconditionally (`dashboard/urls.py:is_local_only`
+always returns `True` in the public build), so an instance tunnel is the only
+sanctioned way to reach a peer. Nothing here opens a socket.
+
+### 14.1a Two layers — and why Layer B is what makes resume real
+
+The transcript above is only the **display** copy (*Layer A*). The context the
+model actually holds — the compaction/turn state, keyed by a kiro-cli session id
+— lives in a **second store outside the crew home**:
+`kiro_sessions_dir()/<sid>.json` + `<sid>.jsonl`, joined to a slot through
+`session_map.json`. Call it *Layer B*.
+
+This split is the whole fidelity story. Ship Layer A alone and the peer has a
+browsable history but no resumable context: `SessionMap.get` finds no usable sid
+and the next turn falls back to `_build_history_prefix()`, a condensed ~8K-char
+text prefix — no tool state, no real context window. Ship Layer B too and the
+peer resumes through `session/load` under its own fresh sid, which is the same
+fidelity a local gateway restart gives.
+
+So `bundle_version` 2 carries an optional `layer_b`. It is **optional by
+design**: a v1 sender, or a session that never opened a kiro-cli context, ships
+Layer A only and the peer degrades to the prefix. Both versions stay accepted so
+a newer instance can still receive from an older one.
+
+On import Layer B's **host-naming fields** are rewritten — a fresh `sid`
+(so copy-never-move holds and a repeat send cannot collide), `cwd` and the
+filesystem `allowed_*_paths` cleared (matching the `project` decision below —
+the session arrives unscoped), `agent_name` set to the target-resolved agent —
+while the **conversation payload travels byte-exact**. That distinction is
+forced, not stylistic: thinking blocks inside `conversation_metadata` carry a
+provider `signature` over their own content, which is validated when the
+conversation is replayed, so rewriting any covered byte makes the peer's *next
+turn* fail — long after the import reported success. An earlier revision scrubbed
+Layer B on both boundaries and, measured against one developer machine's 704 real
+sessions, altered a signature in **41%** of them. Redacting this artifact and
+transplanting it cannot both hold; what bounds the exposure is the destination
+(the operator's own peer, over a tunnel they authenticated, stored `0600`), not a
+scrub of the payload. **Layer A keeps its redaction** — that text is rendered and
+re-read as context. Inbound Layer B is validated structurally (parse-only, never
+rewritten) and refused whole if any record fails to parse. Materialisation is
+**best-effort**: if it fails, the import still succeeds as the transcript-only
+copy rather than failing an already-persisted session.
+
+Sub-agent conversations deliberately do **not** travel. Their results were
+already injected into the parent conversation, so they are inside Layer B
+already; only `spawn_continue` against one specific sub-agent is lost on the
+peer.
+
+### 14.2 Copy, never move
+
+Import **always allocates a new slot key** and never mutates or deletes an
+existing session, on either side. Consequences worth stating:
+
+- the source tab is untouched, so a failed transfer costs nothing;
+- a repeat click sends a second copy rather than erroring, so the action needs
+  no confirm step and no idempotency key;
+- there is no "move" verb and nothing in this feature can destroy a
+  conversation.
+
+### 14.3 What travels, and what deliberately does not
+
+| Field | Travels? | Why |
+|---|---|---|
+| transcript (`user` / `assistant` turns) | yes | Layer A — the portable display copy. Tool and system frames are dropped from it: they reference local tool state. |
+| **`layer_b`** (kiro-cli context: envelope + events) | **yes (v2)** | Layer B — the real context window, so the session RESUMES rather than replaying a lossy ~8K prefix. Only host-naming fields are rewritten on arrival (fresh `sid`, cleared `cwd`/`allowed_*_paths`, target agent); the conversation payload travels **byte-exact and unredacted**, because its thinking-block signatures are validated on replay. Optional, and best-effort on import. |
+| sub-agent conversations | no | Their results are already inside Layer B as injected context. Only `spawn_continue` on one specific sub-agent is lost. |
+| memory (preferences, semantic KV, lessons) | no | A workspace's memory is a per-instance scope, and copying it across hosts is the risky, hard-to-undo part of a transfer. The peer keeps its own. |
+| `title` | yes | Prefixed `⇄ ` and suffixed `(from <origin>)` on arrival, so a transferred tab is never mistaken for a locally-born one. The prefix is stripped before re-bundling so a session bounced back and forth does not accumulate one prefix per hop. |
+| `agent` | hint only | Applied only if the target has an agent by that name, else dropped. An agent template is a local object; carrying the name blindly would leave the slot pointing at nothing. |
+| **`project`** | **no** | The headline decision. The source's checkout path almost never exists on the target (a Mac worktree path on a Linux dev desk), and a slot pointing at a missing directory scopes file search and steering to nothing. The session arrives **unscoped** and the user re-picks a project. |
+| `model` | no | Accounts differ in entitlement, so an id the source is served can fail at runtime on the target. The target resolves its own default (AGENTS.md § Model selection). |
+| `workspace` | no | Workspaces are per-instance memory scopes; a matching name still means a different memory. |
+| `folder_id`, `tags`, `pinned`, `artifact`, `app`, `linked_session_key`, `forked_from` | no | Local-graph references that would dangle. |
+
+`bundle_version` is refused when **outside the supported set** (`{1, 2}`) rather
+than best-effort parsed: the two ends are independently-updated installs, and a
+silently misread field would land as corrupted conversation. Accepting both
+versions is what lets a v2 instance still receive a copy from a v1 one.
+
+### 14.4 API
+
+| Method and path | Purpose |
+|---|---|
+| `POST /api/instances/{id}/send-session` | Sending side. Body `{"slot": "<local slot key>"}`. Bundles the local session and delivers it over that instance's open tunnel. |
+| `POST /api/chat/slots/import` | Receiving side. Accepts a bundle and materialises a new slot. |
+
+`send-session` goes through the same `_guard()` as every other route in §6
+(owner-only, never Slack, feature-gated, SEL-audited as
+`instances_send_session`). It returns `{ok, instance, remote_key, messages}`.
+
+Status codes: `404` unknown instance or unknown local slot, `400` a
+non-persistent source session or a malformed body, `503` the manager is not
+running or the source could not be persisted first, `502` the peer refused or
+was unreachable (the peer's own `code` is forwarded).
+
+**`send-session` is NOT a third token-crossing route.** §6's invariant holds:
+`connect` and `refresh-token` remain the only two routes whose response carries a
+minted token. The transfer needs the credential but the browser does not, so the
+request is issued **inside `SshTunnelManager.send_session_bundle`** — the token
+never leaves the manager, is sent as a cookie (so it cannot land in the peer's
+access log), and is never logged. Any audit of where tokens leave the gateway
+still finds exactly two routes.
+
+### 14.5 Trust model for an inbound session
+
+An imported transcript is untrusted input that later becomes context an agent
+re-reads, so:
+
+- reaching `/api/chat/slots/import` requires a valid dashboard credential, which
+  in practice means a token this hub minted on that host — a peer cannot push a
+  session into an instance it has no credential for;
+- bundles are size-bounded before anything is written (5,000 messages, 1 MB per
+  message, 20 MB of content total) and every message's role is checked against
+  `user`/`assistant`;
+- assistant content is credential- and exfiltration-redacted on the way in,
+  matching the fork path. User turns are left verbatim: redacting what the human
+  typed would corrupt their own words;
+- **import does not drive a turn.** The session lands as a tab and waits for the
+  user to type. This is the feature's main security advantage over an
+  agent-facing "send a message to a peer" tool: no inbound text can make a
+  remote agent act.
+
+### 14.6 Direction and topology
+
+The submenu on a given dashboard lists **that** gateway's registry, so a push
+runs hub → peer. Because each remote dashboard is embedded as an iframe (§3), a
+"send" driven from inside a remote pane would need that remote to reach back to
+the hub — usually impossible (a dev desk cannot SSH to a laptop). Sending in the
+other direction is therefore done by registering the peers you want on each host
+that should originate a transfer, and a hub-initiated **pull** (read a peer's
+session over the same forward) is the natural follow-on that would make
+remote → hub and remote → remote work without any reverse reachability.

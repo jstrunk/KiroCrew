@@ -69,6 +69,11 @@ ones (e.g. `typeof Notification !== 'undefined'`).
 
 ## Rules that must not wait for a pointer
 
+- **Settings primitives: pass `configKey` on every new `SettingsToggle`/`SettingsField`**
+  that writes a config path. It flows into the generated settings registry and makes
+  `<SettingRef configKey="...">` chips deep-link to the control; omit it and the chip
+  silently degrades to a CLI popover even though a toggle exists. Backend drift guards
+  catch bad keys, not missing ones — this rule is the only gate for the missing case.
 - **Icons: `lucide-react` only, with `className="lucide-inline"`.** Never an emoji,
   never a hand-rolled SVG, never `size={N}`. Enforced by `AUTOSDE.yaml`
   (`use-lucide-icons`, `no-emoji-as-icons`).
@@ -78,7 +83,7 @@ ones (e.g. `typeof Notification !== 'undefined'`).
 - **Never format a date, number, or sort order without naming a locale.** Route
   through the `src/i18n/format.ts` seam; naming a locale explicitly IS the opt-out.
   CI-gated, and the failure (a Chinese UI rendering `7/30/2026`) ships silently.
-- **Never hardcode a user-facing English string.** The dashboard ships in 11
+- **Never hardcode a user-facing English string.** The dashboard ships in 12
   languages; add a catalog key. CI-gated.
 - **Data fetching is React Query**, never `useState` + `useEffect`. Follow the
   existing query-key convention.

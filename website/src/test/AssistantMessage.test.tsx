@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import AssistantMessage, { parseOptions, fmtTurnElapsed, fmtCredits } from '../pages/chat/AssistantMessage'
+import AssistantMessage, { fmtTurnElapsed, fmtCredits } from '../pages/chat/AssistantMessage'
+import { parseOptions } from '../app-sdk/protocol'
 
 // Mock MarkdownRenderer to avoid complex markdown parsing in tests
 vi.mock('../components/MarkdownRenderer', () => ({
@@ -32,6 +33,22 @@ describe('AssistantMessage', () => {
     expect(screen.queryByText('Alpha')).not.toBeInTheDocument()
     expect(screen.queryByText('Beta')).not.toBeInTheDocument()
     expect(screen.queryByText(/Send/)).not.toBeInTheDocument()
+  })
+
+  // Regression: OPTION_MARKER_RE anchors on a closing bracket that ends the line,
+  // so a half-arrived marker can't match it and used to type itself out as prose
+  // for the width of the marker line before flipping to pills at turn end.
+  it('hides a half-streamed [OPTIONS: marker from the streamed text', () => {
+    render(<AssistantMessage content={'All done.\n\n[OPTIONS: Merge it now | Show me the d'} isStreaming={true} slotRunning={true} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('All done.')
+    expect(screen.getByTestId('md').textContent).not.toMatch(/\[OPTION/i)
+  })
+
+  // …but on a FINISHED message an unterminated marker is real content (prose about
+  // the syntax, or a truncated turn), so it must render as written.
+  it('keeps an unterminated marker once the message is no longer streaming', () => {
+    render(<AssistantMessage content={'The tag looks like [OPTIONS: A | B'} isStreaming={false} slotRunning={false} />)
+    expect(screen.getByTestId('md')).toHaveTextContent('[OPTIONS: A | B')
   })
 
   it('shows "Use as Plan" button for valid plan JSON', () => {
@@ -223,6 +240,27 @@ describe('AssistantMessage', () => {
     expect(forkBtn).not.toBeDisabled()
   })
 
+})
+
+describe('action footer on touch devices', () => {
+  // The footer is opacity-0 until group-hover, and a touch pointer never
+  // hovers — without the hover:none override the actions (copy, speak,
+  // regenerate, fork) are permanently invisible on phones. happy-dom does not
+  // evaluate media queries, so pin the utility class itself.
+  const footer = () => screen.getByTitle('Copy').closest('div') as HTMLElement
+
+  it('reveals the footer where the pointer cannot hover', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    expect(footer().className).toContain('[@media(hover:none)]:opacity-100')
+  })
+
+  it('keeps the footer hover-revealed for hover-capable pointers', () => {
+    render(<AssistantMessage content="Hello world" isStreaming={false} slotRunning={false} />)
+    const cls = footer().className
+    expect(cls).toContain('opacity-0')
+    expect(cls).toContain('group-hover/msg:opacity-100')
+    expect(cls).toContain('group-focus-within/msg:opacity-100')
+  })
 })
 
 describe('parseOptions', () => {
@@ -461,5 +499,25 @@ describe('turn stats footer (elapsed time + credits)', () => {
   it('fmtCredits trims to 2 decimals under 10, 1 above', () => {
     expect(fmtCredits(0.25)).toBe('0.25')
     expect(fmtCredits(12.53)).toBe('12.5')
+  })
+})
+
+describe('action footer touch sizing', () => {
+  // happy-dom does not evaluate media queries, so the hover-none utility
+  // classes themselves are pinned, the same way the footer reveal is.
+  it('enlarges the actions to 40px touch targets where the pointer cannot hover', () => {
+    render(<AssistantMessage content="Hi" isStreaming={false} slotRunning={false} onRegenerate={() => {}} />)
+    const footer = screen.getByTitle('Regenerate').parentElement!
+    expect(footer.className).toContain('[@media(hover:none)]:[&_button]:p-2.5')
+    expect(footer.className).toContain('[@media(hover:none)]:[&_svg]:h-5')
+    expect(footer.className).toContain('[@media(hover:none)]:[&_svg]:w-5')
+    // The grown row exceeds a phone's width, so it must wrap rather than
+    // crush the timestamp and clip the trailing actions.
+    expect(footer.className).toContain('[@media(hover:none)]:flex-wrap')
+  })
+
+  it('keeps the compact sizing on the buttons for pointer devices', () => {
+    render(<AssistantMessage content="Hi" isStreaming={false} slotRunning={false} onRegenerate={() => {}} />)
+    expect(screen.getByTitle('Regenerate').className).toContain('p-0.5')
   })
 })

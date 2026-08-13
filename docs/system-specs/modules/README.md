@@ -16,6 +16,9 @@ agent loads only the one it needs.
 | [providers.md](providers.md) | The `LLMProvider` interface and the KiroACP-only provider surface. |
 | [session.md](session.md) | Sessions, slots, session keys, the warm pool, and PID tracking. |
 | [history.md](history.md) | Conversation persistence, JSONL rotation, and transcript search. |
+| [session-summary.md](session-summary.md) | Intent-level session summaries: the sidecar cache, extraction, and the turn-end pass. |
+| [file-search.md](file-search.md) | The `@`-mention file/folder search: index, ranking, `kinds` filter, and the sensitive-path symmetry. |
+| [session-storage.md](session-storage.md) | What sessions cost on disk, and the user-initiated trash that reclaims it. |
 | [config.md](config.md) | The config schema, defaults, loading, and live reload. |
 | [cli.md](cli.md) | Every CLI command, the gateway flags, and the test harness. |
 | [heartbeat.md](heartbeat.md) | The liveness heartbeat and its restricted tool allowlist. |
@@ -82,6 +85,8 @@ agent loads only the one it needs.
 | [issue-radar.md](issue-radar.md) | Issue triage and grouping. |
 | [ops-mission-control.md](ops-mission-control.md) | Autonomous ops first responder: alarms, pages and monitors. |
 | [mochi.md](mochi.md) | The Mochi app. |
+| [auto-improvement.md](auto-improvement.md) | Measurement-first self-improvement loop: ruler calibration, keep-or-revert cycles, draft PRs. |
+| [auto-improvement-test-plan.md](auto-improvement-test-plan.md) | Integration test plan for auto-improvement (all endpoints + UI + full loop), against a real GitHub repo. |
 
 ## Operations
 

@@ -11,6 +11,7 @@ to auto-sync newly discovered servers into the agent config.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import ntpath
@@ -30,8 +31,13 @@ from kiro_crew import platform_compat
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.env import augmented_path
 from kiro_crew.hooks import safe_read_file
-from kiro_crew.mcp_utils import mcp_server_alias
-from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
+from kiro_crew.mcp_provenance import ABSENT, resolve_write
+from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes, mcp_server_alias
+from kiro_crew.sandbox import (
+    SandboxUnavailableError,
+    create_subprocess_limited,
+    sandboxed_spawn_argv,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -114,6 +120,70 @@ def _warn_unresolvable_once(name: str, command: str) -> None:
     logger.warning("MCP probe failed [%s]: command not found: %s", name, command)
 
 
+#: Servers whose probe has already reported a missing sandbox backend. Keyed by
+#: name only (not by command): the cause is the HOST lacking a backend, not
+#: anything about the server, so it recurs identically for every server on every
+#: discovery cycle. Without this ledger a four-server config logged four
+#: identical multi-line remedy paragraphs per cycle, forever.
+_probe_sandbox_warned: set[str] = set()
+
+
+#: Managed servers already served from the in-process declaration. Same shape and
+#: reason as _probe_sandbox_warned: the trigger is the HOST having no backend, so
+#: it recurs for every managed server on every discovery cycle.
+_managed_in_process_warned: set[str] = set()
+
+
+def _warn_managed_in_process_once(name: str) -> None:
+    """Record the in-process fallback once per managed server.
+
+    Logged rather than silent because it is a security-relevant substitution: the
+    listing is served WITHOUT the handshake that proves the server can start, so
+    ``ok`` here means "this package declares these tools", not "the server
+    answered". An operator reading the dashboard should be able to find out which
+    of the two they are looking at.
+    """
+    if name in _managed_in_process_warned:
+        logger.debug("MCP probe [%s]: still serving the declared tool list", name)
+        return
+    _managed_in_process_warned.add(name)
+    # WARNING, not info: `ok` on this path does not mean the handshake succeeded,
+    # and the default log level is WARNING — at info the substitution would be
+    # invisible on exactly the hosts where it always happens.
+    logger.warning(
+        "MCP probe [%s]: the tool list is read from this package's own "
+        "declaration instead of a handshake. The tools are correct (it is the "
+        "same declaration the server serves), but this does NOT verify the "
+        "server can start. A self-derived managed command is normally probed "
+        "for real even with no sandbox backend (the first-party carve-out), so "
+        "reaching this fallback means that probe could not run here: a "
+        "transient sandbox failure, a foreign outer sandbox, a governance "
+        "sandbox floor, or a customized command/args for this server.",
+        name,
+    )
+
+
+def _warn_probe_sandbox_unavailable_once(name: str) -> None:
+    """WARNING on first sight per server, DEBUG thereafter.
+
+    Mirrors :func:`_warn_unresolvable_once`. The message names the PROBE as the
+    thing that could not run, so a reader is not sent debugging a server that
+    kiro-cli is launching successfully from the agent config.
+    """
+    if name in _probe_sandbox_warned:
+        logger.debug("MCP probe [%s]: still no sandbox backend (already reported)", name)
+        return
+    _probe_sandbox_warned.add(name)
+    logger.warning(
+        "MCP probe skipped [%s]: no OS-level sandbox backend on this host, so "
+        "Kiro Crew cannot spawn the server to enumerate its tools. The server "
+        "itself is unaffected — kiro-cli launches it from the agent config "
+        "without this probe. Set agent.sandbox_allow_unsandboxed_exec=true to "
+        "enable probing (the dashboard will otherwise show it with 0 tools).",
+        name,
+    )
+
+
 def _clear_unresolvable(name: str, command: str) -> None:
     """Forget a command that now resolves, so a later outage is reported afresh."""
     _unresolvable_warned.discard((name, command))
@@ -146,6 +216,9 @@ def reset_unresolvable_warnings() -> None:
 # source of truth for the ``presence`` field on each server.
 SCOPE_KIROCREW = "kirocrew"
 SCOPE_KIRO_GLOBAL = "kiroGlobal"
+# Surface label carried into the provenance decision so a declined rewrite names
+# the file it declined to touch.
+_CC_SIDECAR_SURFACE = "~/.mcp.json"
 # Well-known label for a provider global (e.g. Claude Code's ~/.claude.json).
 # The core does not scan it directly — a companion edition contributes it
 # via the extra_mcp_scopes() CPP seam (see :func:`_extra_scope_sources`), so
@@ -299,6 +372,11 @@ class McpServerInfo:
     env: dict[str, str] = field(default_factory=dict)
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
+    # Remote-only OAuth hints carried verbatim to the runtime, which owns the
+    # authorization exchange. Kiro Crew never enforces scopes and never registers
+    # a client — it only refuses to lose these fields while syncing.
+    scopes: list[str] = field(default_factory=list)
+    client_id: str = ""
     status: str = "unknown"  # unknown | ok | error | probing | outdated | disabled
     tools: list[str] = field(default_factory=list)
     error: str = ""
@@ -340,6 +418,17 @@ class McpServerInfo:
             d["url"] = self.url
             if self.headers:
                 d["headers"] = self.headers
+            # Not redacted: requested scopes and a public OAuth client id are
+            # non-secret configuration the user needs to see.
+            #
+            # These are the INTERNAL key names, matching the dashboard's
+            # ``McpServer`` type. This dict is an API response, never a file
+            # kiro-cli reads, so it must NOT be translated to the wire names —
+            # ``kiro_oauth_wire_entry`` is applied on the emit paths instead.
+            if self.scopes:
+                d["scopes"] = list(self.scopes)
+            if self.client_id:
+                d["clientId"] = self.client_id
         if self.disabled_tools:
             d["disabledTools"] = self.disabled_tools
         if self.disabled:
@@ -519,6 +608,29 @@ def _load_mcp_json() -> dict[str, Any]:
     return merged
 
 
+def _spec_scopes(spec: dict) -> list[str]:
+    """Requested OAuth scopes from a spec, dropping anything malformed.
+
+    On-disk specs are untrusted (hand-edited files, other tools), so a
+    non-list or a list with non-string members degrades to "no scopes"
+    rather than propagating a bad shape into the agent config.
+
+    Reads kiro-cli's ``oauthScopes`` as well as Kiro Crew's internal ``scopes``:
+    files we emit for kiro-cli carry the former, so a discovery pass that knew
+    only the latter would report a scoped server as unscoped.
+    """
+    return kiro_entry_scopes(spec)
+
+
+def _spec_client_id(spec: dict) -> str:
+    """Public OAuth client id from a spec, or "" when absent/malformed.
+
+    Accepts kiro-cli's nested ``oauth.clientId`` as well as the internal
+    top-level key, for the same round-trip reason as ``_spec_scopes``.
+    """
+    return kiro_entry_client_id(spec)
+
+
 def _server_from_spec(name: str, spec: dict, source: str) -> McpServerInfo:
     return McpServerInfo(
         name=name,
@@ -527,6 +639,8 @@ def _server_from_spec(name: str, spec: dict, source: str) -> McpServerInfo:
         env=spec.get("env", {}),
         url=spec.get("url", ""),
         headers=spec.get("headers", {}),
+        scopes=_spec_scopes(spec),
+        client_id=_spec_client_id(spec),
         source=source,
     )
 
@@ -538,6 +652,58 @@ _MANAGED_SERVER_SUBCOMMANDS = {
     "kirocrew-computer": "mcp-computer",
 }
 _MANAGED_SERVER_NAMES = set(_MANAGED_SERVER_SUBCOMMANDS)
+
+# Managed server name -> the module whose ``_list_tools()`` declares its tools.
+# These are the SAME functions the stdio shim serves ``tools/list`` from, so
+# calling them in-process returns exactly what a spawn would have returned.
+_MANAGED_SERVER_TOOL_MODULES = {
+    "kirocrew-core": "kiro_crew.mcp_core",
+    "kirocrew-cron": "kiro_crew.mcp_cron",
+    "kirocrew-computer": "kiro_crew.mcp_computer",
+}
+
+
+def _managed_tools_in_process(name: str) -> list[str] | None:
+    """Tool names for a managed server, read WITHOUT spawning it.
+
+    A managed server's tool list is a static declaration in this package —
+    ``mcp_core._list_tools()`` and friends, the very functions the stdio shim
+    answers ``tools/list`` from. Spawning a child to ask ourselves what we
+    ourselves declare is pure overhead, and it made the listing depend on a
+    sandbox backend: ``sandboxed_spawn_argv`` fail-closes where none exists (any
+    Windows host, macOS >= 26), so the built-in tools showed as 0 on the dashboard
+    even though kiro-cli was serving them fine.
+
+    Reading them in-process removes that dependency outright — no subprocess, so
+    no sandbox to be unavailable and no unsandboxed-execution question to answer.
+    That is the whole point: the alternative designs either require an
+    ``agent.sandbox_allow_unsandboxed_exec`` opt-in for a read-only listing, or
+    exempt an agent-writable package from the sandbox. This needs neither.
+
+    Imported lazily: these modules pull in the validation/artifacts graph, which
+    cannot be imported at this module's import time (circular). ``_list_tools`` is
+    a pure read of schemas plus config — no I/O of its own, no side effects, and
+    cheap enough for a discovery cycle.
+
+    Returns ``None`` when *name* is not managed or the read fails, so the caller
+    falls back to the ordinary spawn-and-handshake path rather than reporting a
+    wrong answer. An EMPTY list is a real result, not a failure:
+    ``mcp_computer._list_tools()`` returns ``[]`` by design while the keystone
+    enable is off — which is also what a spawned probe reports.
+    """
+    module_name = _MANAGED_SERVER_TOOL_MODULES.get(name)
+    if module_name is None:
+        return None
+    try:
+        module = importlib.import_module(module_name)
+        tools = module._list_tools()
+    except Exception:
+        logger.debug("in-process tool read failed for %s; will probe", name, exc_info=True)
+        return None
+    if not isinstance(tools, list):
+        return None
+    return [n for t in tools if isinstance(t, dict) and (n := t.get("name"))]
+
 
 # Cached resolved (command, args) — avoids subprocess.run on every list_servers() call.
 _resolved_managed_invocation: dict[str, tuple[str, list[str]]] = {}
@@ -585,6 +751,62 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
         )
         spec["command"] = command
         spec["args"] = args
+
+
+def _is_first_party_managed_argv(
+    name: str, command: str | None, args: list[str], env: dict[str, str] | None
+) -> bool:
+    """True when (*command*, *args*, *env*) IS the self-derived managed invocation.
+
+    Gates the ``first_party_fixed_argv`` carve-out on the probe spawn. The
+    managed NAME alone is deliberately not enough: only agent-config entries are
+    force-re-resolved through :func:`_fix_stale_managed_command`, so a row
+    introduced from an mcp.json scope could carry user-config command text under
+    a managed name. Requiring equality against the freshly re-resolved
+    invocation (:func:`kiro_crew.agent._kirocrew_mcp_invocation`, the single
+    source of truth) makes "the argv is derived inside this package" a checked
+    property rather than an assumption — any customized command or args compares
+    unequal and keeps the full fail-close + opt-in behavior.
+
+    *env* must equal the package-derived managed env too
+    (:func:`kiro_crew.agent._managed_mcp_env` — ``{}`` on a default install, the
+    ``KIROCREW_HOME`` pin under an override home). ``probe_server`` merges the
+    spec's ``env`` into the child environment, and env is an execution vector in
+    its own right (``LD_PRELOAD``/``LD_LIBRARY_PATH`` change WHAT CODE runs for
+    the same argv), so a spec carrying any key this package did not derive is
+    not first-party — it keeps the full fail-close + opt-in behavior.
+    """
+    subcommand = _MANAGED_SERVER_SUBCOMMANDS.get(name)
+    if subcommand is None:
+        return False
+    invocation = _resolved_managed_invocation.get(name)
+    try:
+        # circular import: agent is loaded during package init
+        from kiro_crew.agent import _kirocrew_mcp_invocation, _managed_mcp_env
+
+        expected_env = _managed_mcp_env()
+        if invocation is None:
+            invocation = _kirocrew_mcp_invocation(subcommand)
+            _resolved_managed_invocation[name] = invocation
+    except Exception:
+        # Fail toward "not first-party": the spawn then keeps the ordinary
+        # fail-close path, which is the safe direction.
+        logger.debug("managed MCP invocation resolution failed", exc_info=True)
+        return False
+    expected_command, expected_args = invocation
+    # Refuse the interpreter fallback (`<python> -m kiro_crew <sub>`): `python
+    # -m` prepends the child's CWD to sys.path (this package supports 3.10, so
+    # `-P`/PYTHONSAFEPATH cannot be assumed), and the probe child inherits the
+    # gateway's cwd — a planted `kiro_crew/` tree there would shadow the
+    # installed package and run unconfined. Only a resolved console-script
+    # binary, whose entrypoint imports from its own install, qualifies.
+    if expected_args[:2] == ["-m", "kiro_crew"]:
+        return False
+    return (
+        command == expected_command
+        and list(args) == list(expected_args)
+        and dict(env or {}) == expected_env
+    )
 
 
 def list_servers() -> list[McpServerInfo]:
@@ -986,11 +1208,23 @@ async def probe_server(server: McpServerInfo) -> McpServerInfo:
         # credential-scrubbed environment (on top of the augmented PATH built
         # above). ``strip_python_env`` keeps KiroCrew's PYTHONPATH/PYTHONHOME out
         # of a foreign Python MCP server. See the related security-review finding.
+        #
+        # ``first_party_fixed_argv`` is True ONLY when command+args+env EQUAL
+        # the invocation this package derives for its own managed servers
+        # (``agent._kirocrew_mcp_invocation`` + ``agent._managed_mcp_env`` via
+        # ``_is_first_party_managed_argv``) — self-derived, not user-config text
+        # — so on a host with genuinely no sandbox backend the "can the server
+        # start?" probe runs for real instead of fail-closing. Third-party
+        # probes (and any customized managed command/args/env) pass False and
+        # keep the full fail-close + opt-in behavior.
         wrapped_argv, env, sandbox_cleanup = sandboxed_spawn_argv(
             [resolved, *(server.args or [])],
             mode="standard",
             env=env,
             strip_python_env=True,
+            first_party_fixed_argv=_is_first_party_managed_argv(
+                server.name, server.command, server.args or [], server.env or {}
+            ),
         )
         proc = await create_subprocess_limited(
             *wrapped_argv,
@@ -1109,6 +1343,73 @@ async def probe_server(server: McpServerInfo) -> McpServerInfo:
         server.status = "error"
         server.error = f"command not found: {server.command}"
         _warn_unresolvable_once(server.name, server.command)
+    except SandboxUnavailableError as exc:
+        # The PROBE could not run — this says nothing about the server, and the
+        # two must not be reported alike. Ahead of the generic clause, which would
+        # render this as a server fault.
+        #
+        # For one of OUR OWN managed servers there is a better answer than an
+        # error: its tool list is a static declaration in this package
+        # (``mcp_core._list_tools()`` and friends — the very functions the stdio
+        # shim answers ``tools/list`` from), so read it directly. That is what
+        # keeps the built-in tools listed on a host with no sandbox backend (any
+        # Windows host, macOS >= 26) without asking the operator for an
+        # ``agent.sandbox_allow_unsandboxed_exec`` opt-in for a read-only
+        # listing. A managed server whose command+args are self-derived normally
+        # never reaches here on such a host — the first-party carve-out lets its
+        # probe spawn for real — so this fallback covers the residual cases: a
+        # transient sandbox failure, a foreign outer sandbox, a governance
+        # sandbox floor, or a customized command.
+        #
+        # Deliberately a FALLBACK, not the primary path. Two reasons:
+        #   * the spawn is the only thing that proves the server can actually
+        #     START. `_fix_stale_managed_command` exists because that invocation
+        #     does go stale ("command not found: kirocrew; the built-in cron/core
+        #     tools then never load"), and short-circuiting on the name alone would
+        #     report `ok` for a managed server that cannot run — changing what `ok`
+        #     means in the shared `_cache_probe` store, silently, for the one
+        #     surface that used to catch it.
+        #   * importing these modules runs package code IN THE GATEWAY PROCESS,
+        #     which the gateway does not otherwise do (they are absent from
+        #     sys.modules at boot). The package dir is writable by the same uid the
+        #     agent runs as and is not on the sensitive-path floor, so on a host
+        #     where the sandbox DOES work, importing beats the isolation the spawn
+        #     provides. Reaching here means the sandbox could not confine anything
+        #     anyway, so the import adds no exposure the refused spawn had not
+        #     already conceded — and it is the only way to serve the listing there.
+        managed_tools = _managed_tools_in_process(server.name)
+        if managed_tools is not None:
+            server.status = "ok"
+            server.tools = managed_tools
+            server.error = ""
+            _warn_managed_in_process_once(server.name)
+            return server
+        #
+        # The wrap is deliberately KEPT rather than skipped for Kiro Crew's own
+        # managed servers. "It is our own code" is not the same claim as "the code
+        # is unmodified": the package directory is writable by the same uid the
+        # agent runs as and is not on the sensitive-path floor, so a prompt-injected
+        # agent can edit an editable checkout (or the console script) and an
+        # unwrapped probe would then execute it outside the sandbox on the next
+        # automatic probe_all(). Skipping the wrap for a managed server would make
+        # this the one unsandboxed spawn path in the codebase; the sibling paths
+        # (script crons, script hooks, Papyrus compile/git) all keep the wrap and
+        # require the opt-in on a backendless host, and this now matches them.
+        #
+        # So what changes is the REPORTING. The `mcp_probe_` prefix is
+        # machine-readable, mirroring the `code` field on the dashboard's JSON error
+        # bodies, so a presentation layer can tell an unfixable-by-retry probe
+        # limitation apart from a genuine handshake failure without parsing prose.
+        server.status = "error"
+        server.error = (
+            f"mcp_probe_sandbox_unavailable: Kiro Crew could not probe this server "
+            f"because no OS-level sandbox backend is available on this host. The "
+            f"server itself may be fine — kiro-cli launches it from the agent "
+            f"config without this probe, so its tools can still work in chat. "
+            f"Set agent.sandbox_allow_unsandboxed_exec=true to enable probing. "
+            f"({_sanitize_probe_error(exc)})"
+        )
+        _warn_probe_sandbox_unavailable_once(server.name)
     except Exception as exc:
         server.status = "error"
         server.error = _sanitize_probe_error(exc)
@@ -1269,16 +1570,77 @@ def _commands_diverged(source_cmd: str, agent_cmd: str) -> bool:
     """
     if source_cmd == agent_cmd:
         return False
+    # Two RESOLVED paths for one binary, differing only in separator flavour or
+    # case (``C:\tools\srv.exe`` vs ``C:/Tools/SRV.exe``). Windows itself treats
+    # those as the same file, so comparing the strings re-syncs forever.
+    if platform_compat.IS_WINDOWS and _names_a_location(source_cmd) and _names_a_location(agent_cmd):
+        if ntpath.normcase(ntpath.normpath(source_cmd)) == ntpath.normcase(
+            ntpath.normpath(agent_cmd)
+        ):
+            return False
     # If one is an absolute resolved path of the other, they match. Test both
     # path flavors regardless of host OS: on Windows ``os.path is ntpath`` and
     # would treat a POSIX-absolute config path (/usr/bin/server) as relative,
     # so a resolved-vs-short pair authored on POSIX would spuriously read as
     # diverged and trigger an endless re-sync.
-    if _is_abs_any(agent_cmd) and _basename_any(agent_cmd) == source_cmd:
+    if _names_a_location(agent_cmd) and _basenames_match(agent_cmd, source_cmd):
         return False
-    if _is_abs_any(source_cmd) and _basename_any(source_cmd) == agent_cmd:
+    if _names_a_location(source_cmd) and _basenames_match(source_cmd, agent_cmd):
         return False
     return True
+
+
+def _names_a_location(cmd: str) -> bool:
+    """True when *cmd* is a path rather than a bare ``PATH`` lookup name.
+
+    Broader than :func:`_is_abs_any` by one Windows case: ``ntpath.isabs``
+    rejects a DRIVELESS root (``\\tools\\srv``) because it is absolute only
+    relative to the current drive — yet such a string still names a location
+    whose basename is meaningful. A relative path (``bin/srv``, ``./srv``) is
+    deliberately NOT a location for this purpose: it designates a specific file
+    relative to the CWD, so it must not match an unrelated rooted path that
+    merely shares a basename.
+    """
+    if _is_abs_any(cmd):
+        return True
+    return platform_compat.IS_WINDOWS and cmd[:1] in ("/", "\\")
+
+
+def _basenames_match(resolved: str, bare: str) -> bool:
+    """True when *resolved*'s basename names the same binary as *bare*.
+
+    On Windows the resolver (``shutil.which``, via ``agent._resolve_command``)
+    appends the extension as ``PATHEXT`` spells it — commonly UPPER case — so
+    ``npx`` resolves to ``...\\npx.CMD``. An exact basename comparison therefore
+    reports every stdio MCP server as diverged forever, and each discovery pass
+    re-syncs it. Fold the executable suffix and the case, both of which Windows
+    itself ignores. POSIX keeps the exact comparison: paths are case-sensitive
+    there and an extension is part of the name.
+    """
+    name = _basename_any(resolved)
+    if name == bare:
+        return True
+    if not platform_compat.IS_WINDOWS:
+        return False
+    name, bare = name.casefold(), bare.casefold()
+    if name == bare:
+        return True
+    stem, ext = ntpath.splitext(name)
+    return bool(ext) and ext in _win_exec_suffixes() and stem == bare
+
+
+# Executable suffixes Windows appends when resolving a bare command name. Read
+# live from ``PATHEXT`` so a host that customizes it is honored; the fallback
+# mirrors the Windows default for the pathological case of it being unset.
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def _win_exec_suffixes() -> frozenset[str]:
+    """Lower-cased ``PATHEXT`` suffixes."""
+    raw = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
+    return frozenset(
+        s for s in (part.strip().casefold() for part in raw.split(os.pathsep)) if s.startswith(".")
+    )
 
 
 def _is_abs_any(cmd: str) -> bool:
@@ -1287,8 +1649,14 @@ def _is_abs_any(cmd: str) -> bool:
 
 
 def _basename_any(cmd: str) -> str:
-    """Basename of ``cmd`` under whichever path flavor treats it as absolute."""
-    if ntpath.isabs(cmd):
+    """Basename of ``cmd`` under whichever path flavor treats it as absolute.
+
+    A backslash-bearing string takes the Windows flavour even when
+    ``ntpath.isabs`` is False, which a DRIVELESS root (``\\tools\\srv``) is.
+    ``posixpath.basename`` does not know ``\\`` is a separator, so it would
+    return the whole string and the basename comparison could never match.
+    """
+    if ntpath.isabs(cmd) or "\\" in cmd:
         return ntpath.basename(cmd)
     return posixpath.basename(cmd)
 
@@ -1297,7 +1665,7 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
     """Find MCP servers in mcp.json that need syncing to the agent config.
 
     Returns new servers not yet in the agent config, plus existing servers
-    whose env, command, or args have diverged from the mcp.json source.
+    whose source-owned transport fields have diverged from mcp.json.
     """
     agent_cfg = _load_agent_config()
     agent_mcp = agent_cfg.get("mcpServers", {})
@@ -1315,18 +1683,39 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
             command=spec.get("command", ""),
             args=spec.get("args"),
             env=spec.get("env") or {},
+            url=spec.get("url", ""),
+            headers=spec.get("headers") or {},
+            scopes=_spec_scopes(spec),
+            client_id=_spec_client_id(spec),
             source="discovered",
         )
         if name not in agent_names:
             out.append(info)
         else:
-            # Include existing local servers with divergent command or env.
             # Args divergence is intentionally excluded: user-customized
             # args (e.g. --include-tools additions) are preserved by
             # install_agent()'s setdefault merge, so triggering a full
             # rebuild on args-only differences is wasted work.
             existing = agent_mcp[name]
-            if not isinstance(existing, dict) or info.is_remote:
+            if not isinstance(existing, dict):
+                continue
+            if info.is_remote:
+                existing_headers = existing.get("headers") or {}
+                # scopes/clientId are source-owned transport fields like url and
+                # headers: a registry Connect that adds or changes them must
+                # re-sync, or the agent config keeps authorizing the old shape.
+                #
+                # Reaching this set is not permission to rewrite anything: each
+                # consumer guards its own surface, so the two that Kiro Crew does
+                # not own -- the kiro-global file and the Claude Code sidecar --
+                # decide for themselves what an existing entry allows.
+                if (
+                    existing.get("url", "") != info.url
+                    or existing_headers != info.headers
+                    or _spec_scopes(existing) != info.scopes
+                    or _spec_client_id(existing) != info.client_id
+                ):
+                    out.append(info)
                 continue
             existing_env = existing.get("env", {})
             if not isinstance(existing_env, dict):
@@ -1452,6 +1841,39 @@ def sync_to_agent_config(servers: list[McpServerInfo]) -> bool:
     return added or bool(servers)
 
 
+def kirocrew_managed_names() -> set[str]:
+    """Server names the dashboard store owns.
+
+    A usable dict under the ``kirocrew`` scope (``<data home>/mcp.json``) is the
+    one signal that Kiro Crew manages a name -- the same discriminator the
+    agent-spec emit path uses for its OAuth hints, so management means one thing
+    everywhere.
+
+    This is the store-side half of the ownership predicate and a NECESSARY
+    precondition for every write to a config surface we do not own -- the
+    kiro-global ``mcp.json``, the Claude Code ``~/.mcp.json`` sidecar. Discovery
+    merges ALL scopes, so a name present only in a user's global file reaches the
+    sync set exactly like a managed one; without the gate a Kiro Crew sync would
+    rewrite a server the user configured by hand.
+
+    It is deliberately NOT sufficient. Managing a NAME says nothing about who
+    wrote a given ENTRY, and the two answers differ per file -- an entry can be
+    ours in the kiro-global file and the user's in the sidecar. That half is
+    :func:`kiro_crew.mcp_provenance.resolve_write`, which reads the marker on the
+    entry itself. Keeping this function name-only is what lets a single set answer
+    for every surface without silently answering for the wrong one.
+
+    A malformed store value is skipped for the same reason the merge skips it: it
+    contributed nothing, so it cannot make the name ours.
+    """
+    by_source = _load_mcp_json_by_source()
+    return {
+        name
+        for name, spec in by_source.get(SCOPE_KIROCREW, {}).items()
+        if isinstance(spec, dict)
+    }
+
+
 def register_servers_for_cc(
     servers: list[McpServerInfo],
     mcp_json_path: Path | None = None,
@@ -1460,6 +1882,10 @@ def register_servers_for_cc(
 
     Adds entries without removing existing ones. CC-side complement
     to sync_to_agent_config() which handles kiro-side registration.
+
+    A remote entry is rewritten only when it carries our authorship marker --
+    see the loop below. So is a stdio entry: the marker records who wrote an
+    entry, which no transport makes knowable on its own.
 
     Returns True if any servers were added or updated.
     """
@@ -1475,16 +1901,45 @@ def register_servers_for_cc(
 
     mcp = existing.setdefault("mcpServers", {})
     changed = False
+    # OAuth hints ride along when a remote is first registered, and only for a
+    # name we own -- see kirocrew_managed_names.
+    _managed = kirocrew_managed_names()
 
     for s in servers:
         if s.is_remote:
             entry: dict = {"url": s.url}
             if s.headers:
                 entry["headers"] = s.headers
+            if s.name in _managed:
+                if s.scopes:
+                    entry["scopes"] = list(s.scopes)
+                if s.client_id:
+                    entry["clientId"] = s.client_id
         else:
             entry = {"command": s.command, "args": s.args or [], "type": "stdio"}
             if s.env:
                 entry["env"] = s.env
+
+        # This writer rebuilds an entry from scratch, so rewriting one we did not
+        # author would drop the fields it does not reconstruct. The marker says
+        # which ones those are: an entry we wrote re-syncs (its url or command
+        # legitimately moves), an unmarked entry is the user's and stays add-only,
+        # exactly as this surface behaved before the marker existed. The gate is
+        # per ENTRY, not per transport -- a ``command`` makes authorship no more
+        # knowable than a ``url`` does, and this loop rewrites a diverging stdio
+        # entry in place, so a user's own server sharing a managed name reaches
+        # the same collision. ``ABSENT`` rather than ``None``: a hand-edited file
+        # can hold ``null`` under a name, and that occupies the name.
+        resolved = resolve_write(
+            name=s.name,
+            on_disk=mcp.get(s.name, ABSENT),
+            candidate=entry,
+            store_managed=s.name in _managed,
+            surface=_CC_SIDECAR_SURFACE,
+        )
+        if resolved is None:
+            continue
+        entry = resolved
 
         if s.name not in mcp or mcp[s.name] != entry:
             mcp[s.name] = entry

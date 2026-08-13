@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.providers.base import LLMProvider
@@ -184,9 +185,51 @@ def _pid_file_lock():  # type: ignore[no-untyped-def]
             yield
 
 
+def _rewrite_pid_file(path: Path, content: str) -> bool:
+    """Replace *path*'s content atomically; log and return ``False`` on failure.
+
+    Atomic (temp file + rename) because a plain ``write_text`` truncates the
+    file to zero BEFORE writing the kept entries: a failure inside that window
+    leaves a SHORT file whose surviving content is perfectly well-formed, and
+    every dropped entry is an agent runtime no reaper can find again.
+
+    A failure here is REPORTED, not propagated. Pruning an entry is idempotent
+    and self-retrying: the next sweep — or the next gateway start — re-reads the
+    file, finds that PID already dead, and prunes it again, so a failed rewrite
+    costs one stale line rather than a runtime. Propagating would be worse than
+    the problem: ``cleanup_orphaned_sessions`` runs unguarded on the gateway's
+    startup path, and on Windows ``replace_with_retry`` deliberately declines to
+    retry a sharing violation while an event loop is running (an indexer or AV
+    scanner holding the temp file is enough), so an escaping error there aborts
+    startup entirely.
+
+    The tracking direction is the opposite case and must NOT be quieted this
+    way: failing to RECORD a freshly spawned PID is unrecoverable, because no
+    reaper can identify that runtime afterwards.
+    """
+    try:
+        atomic_write(path, content)
+        return True
+    except OSError:
+        logger.error(
+            "Could not rewrite PID file %s; its entries stay until the next sweep",
+            path,
+            exc_info=True,
+        )
+        return False
+
+
+# Basenames of agent runtimes whose lifecycle Kiro Crew manages through PID-file
+# tracking (kiro_pids.txt / kiro_session_pids.txt). Used to re-validate tracked
+# PIDs before a kill, and as a NEGATIVE gate in the work-orphan sweep: these
+# runtimes are reclaimed by their own tracked-PID sweep, never by the
+# marker-based work sweep (see _is_sweepable_orphan_work).
+_MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude")
+
+
 def _is_managed_agent_process(pid: int) -> bool:
     """Check if a PID belongs to an agent process managed by KiroCrew (guards against PID recycling)."""
-    return platform_compat.process_matches(pid, ("kiro-cli", "claude"))
+    return platform_compat.process_matches(pid, _MANAGED_AGENT_MARKERS)
 
 
 def _pid_gone_or_unmanaged(pid: int) -> bool:
@@ -300,7 +343,15 @@ def _kill_pid_tree(pid: int) -> tuple[int, bool]:
 
 
 def _write_back_pid_file(killed_or_dead: set[str]) -> None:
-    """Remove *killed_or_dead* entries from the session PID file."""
+    """Remove *killed_or_dead* entries from the session PID file.
+
+    Rewrites via :func:`atomic_write` (temp file + rename). A plain
+    ``write_text`` truncates the file to zero BEFORE writing the kept entries,
+    so a crash or a write failure inside that window leaves a SHORT file whose
+    surviving content is perfectly well-formed — every dropped entry becomes an
+    agent runtime no reaper can ever find again, with nothing raised and
+    nothing logged. Rename makes the file either wholly old or wholly new.
+    """
     with _session_pid_file_lock():
         path = _session_pid_file_path()
         if path.exists():
@@ -308,10 +359,7 @@ def _write_back_pid_file(killed_or_dead: set[str]) -> None:
             keep = [
                 entry for entry in current if entry.strip() and entry.strip() not in killed_or_dead
             ]
-            path.write_text(
-                ("\n".join(keep) + "\n") if keep else "",
-                encoding="utf-8",
-            )
+            _rewrite_pid_file(path, ("\n".join(keep) + "\n") if keep else "")
 
 
 def _sweep_pid_entries(
@@ -630,10 +678,7 @@ def _cleanup_orphaned_mcp_servers() -> int:
 
         if lines_to_remove:
             kept = [ln for ln in lines if ln.strip() not in lines_to_remove]
-            path.write_text(
-                "\n".join(kept) + "\n" if kept else "",
-                encoding="utf-8",
-            )
+            _rewrite_pid_file(path, "\n".join(kept) + "\n" if kept else "")
 
     return killed
 
@@ -904,7 +949,7 @@ def _untrack_child_pids(pids: Mapping[int, object]) -> None:
         lines = [
             ln for ln in lines if ":" not in ln.strip() or ln.strip().split(":")[0] not in to_remove
         ]
-        path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+        _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
 
 
 def _untrack_pid(pid: int) -> None:
@@ -915,7 +960,7 @@ def _untrack_pid(pid: int) -> None:
             return
         lines = path.read_text(encoding="utf-8").splitlines()
         lines = [ln for ln in lines if ln.strip() != str(pid)]
-        path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+        _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
 
 
 def _untrack_session_pid(pid: int) -> None:
@@ -935,7 +980,7 @@ def _untrack_session_pid(pid: int) -> None:
         lines = [
             ln for ln in lines if ln.strip() != prefix and not ln.strip().startswith(prefix + ":")
         ]
-        path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+        _rewrite_pid_file(path, "\n".join(lines) + "\n" if lines else "")
 
 
 # ── Sweep-protected PIDs ──────────────────────────────────────────────────
@@ -974,6 +1019,52 @@ def _protected_pids() -> set[int]:
 
 _ORPHAN_SWEEP_MAX_KILLS = 30
 _ORPHAN_MIN_AGE_SECONDS = 120  # Never reap processes younger than this
+
+# Dedicated, more conservative age floor for the WORK-process orphan class
+# (agent-spawned pytest/build/shim subtrees identified purely by the
+# KIROCREW_SPAWNED environ marker — see _is_sweepable_orphan_work). Work
+# processes get a much more generous grace than the 120s MCP floor: a
+# long-running legitimate build or test run whose agent briefly detaches must
+# not be raced, and the floor also guarantees a just-detached spawn is never
+# swept before its agent could have re-attached tracking.
+_ORPHAN_WORK_MIN_AGE_SECONDS = 600
+
+# Execnet's popen-worker bootstrap: the single ``-c`` payload pytest-xdist
+# workers run under (verified empirically against pytest-xdist 3.x). Matched
+# as an EXACT argv element, never as a substring.
+_XDIST_BOOTSTRAP = b"import sys;exec(eval(sys.stdin.readline()))"
+
+
+def _work_sweep_cmdline_is_test_runner(cmdline: bytes) -> bool:
+    """Structural test-runner match on parsed argv — never substring.
+
+    A test runner is never a legitimate long-lived daemon, unlike other
+    marked-but-detached processes an agent may deliberately leave running
+    (a preview server, for instance) — so this is the positive shape gate for
+    the work-orphan sweep. Matching is structural to avoid path-fragment
+    false positives (``node /work/pytest-dashboard/server.js`` must NOT
+    match). Exactly three shapes qualify:
+
+    * argv0 basename is exactly ``pytest`` (a venv console script), or
+    * an adjacent ``-m pytest`` argument pair (``python -m pytest ...``), or
+    * a ``-c`` argument whose payload is exactly execnet's worker bootstrap
+      (:data:`_XDIST_BOOTSTRAP`).
+    """
+    args = [a for a in cmdline.split(b"\x00") if a]
+    if len(args) <= 1:
+        # Space-joined fallback (ps output); NUL-split is canonical on Linux.
+        args = [a for a in cmdline.split(b" ") if a]
+    if not args:
+        return False
+    if args[0].rsplit(b"/", 1)[-1] == b"pytest":
+        return True
+    for i in range(len(args) - 1):
+        if args[i] == b"-m" and args[i + 1] == b"pytest":
+            return True
+        if args[i] == b"-c" and args[i + 1] == _XDIST_BOOTSTRAP:
+            return True
+    return False
+
 
 # A candidate PID can exit between the /proc (or ps) snapshot and the per-PID
 # probe. Linux surfaces that as FileNotFoundError/ProcessLookupError reading
@@ -1164,6 +1255,98 @@ def _is_sweepable_orphan_mcp(pid: int, cmdline: bytes) -> bool:
     return _is_marked_mcp_launcher(cmdline) and _env_has_kirocrew_marker(pid)
 
 
+def _work_orphan_basename(cmdline: bytes) -> bytes:
+    """argv0 basename from a raw cmdline (NUL-separated Linux, space macOS)."""
+    args = cmdline.split(b"\x00")
+    if len(args) == 1:
+        args = cmdline.split(b" ")
+    return args[0].rsplit(b"/", 1)[-1]
+
+
+def _is_sweepable_orphan_work(pid: int, cmdline: bytes, age_seconds: float) -> bool:
+    """Third positive-identity path: agent-spawned TEST-RUNNER process
+    (pytest coordinator or pytest-xdist/execnet worker) that outlived its
+    agent session.
+
+    The positive identity is the conjunction of:
+
+    1. A structural test-runner argv match
+       (:func:`_work_sweep_cmdline_is_test_runner`). Test runners
+       are never legitimate long-lived daemons, unlike other marked-but-
+       detached processes an agent may deliberately leave running (a preview
+       server started with ``start_new_session=True``, for instance) — those
+       are intentional survivors and MUST NOT be swept, so a marker alone is
+       not sufficient identity.
+    2. The ``KIROCREW_SPAWNED`` environ marker (:func:`_env_has_kirocrew_marker`,
+       Linux-only, fail-closed elsewhere). The marker is only ever injected
+       into environments Kiro Crew itself spawns (sandbox wrapper, ACP client
+       and runtime, MCP gateway backend) and is inherited by every descendant,
+       so it can never identify a user-launched process.
+    3. Reparenting to init/systemd --user — guaranteed by the caller, which
+       only iterates :func:`_our_orphan_pids` — AND the owning session's
+       LEADER being gone (:func:`_work_orphan_session_leader_alive`). Kiro
+       Crew starts every agent runtime with ``start_new_session=True``, so
+       the runtime is a session leader and every descendant inherits its SID
+       — including through ``nohup`` and reparenting. A work process whose
+       session leader still exists belongs to a LIVE agent session that may
+       be polling its output (a backgrounded test run, for instance) and is
+       never swept; only when the leader is gone has the owning session
+       positively ended, making the run unreachable by any agent.
+    4. Age above :data:`_ORPHAN_WORK_MIN_AGE_SECONDS` — deliberately much
+       higher than the 120s MCP floor so a just-detached spawn is never raced
+       and a slow-but-legitimate long test run gets generous grace.
+
+    Two NEGATIVE gates keep the blast radius tight: managed agent runtimes
+    (:data:`_MANAGED_AGENT_MARKERS`) stay owned by their own tracked-PID
+    lifecycle, and gateway/CLI entrypoints (:data:`_GATEWAY_MARKERS`) are
+    excluded so agent-launched peer gateways (e.g. dev pods) are never swept.
+    """
+    if age_seconds < _ORPHAN_WORK_MIN_AGE_SECONDS:
+        return False
+    if not cmdline:
+        return False  # kernel thread / zombie — nothing meaningful to kill
+    normalized = cmdline.replace(b"\x00", b" ")
+    if any(marker in normalized for marker in _GATEWAY_MARKERS):
+        return False
+    if not _work_sweep_cmdline_is_test_runner(cmdline):
+        return False
+    basename = _work_orphan_basename(cmdline)
+    if any(marker.encode() in basename for marker in _MANAGED_AGENT_MARKERS):
+        return False
+    if _work_orphan_session_leader_alive(pid):
+        return False  # owning agent session still live — a backgrounded run
+    return _env_has_kirocrew_marker(pid)
+
+
+def _work_orphan_session_leader_alive(pid: int) -> bool:
+    """True when *pid*'s session LEADER still exists as a session leader.
+
+    The SID of an agent-spawned work process is the PID of the kiro-cli
+    runtime that (transitively) spawned it — the runtime is started with
+    ``start_new_session=True`` and neither ``nohup`` nor reparenting to init
+    changes a process's SID. A live leader means the owning agent session may
+    still be driving or polling the work process, so the sweep must leave it
+    alone. PID-recycling is handled by requiring the leader candidate to
+    itself be a session leader (a leader's SID equals its own PID); a
+    recycled PID that is not a leader does not resurrect ownership.
+
+    FAIL-CLOSED for the sweep: any read failure returns True ("assume
+    alive"), so the work path never kills without positively verifying the
+    owning session ended.
+    """
+    sid = _linux_pid_sid(pid)
+    if sid <= 0:
+        return True  # unreadable — assume the owner is alive, do not sweep
+    if sid == pid:
+        # The work process became its own session leader (setsid'd daemon):
+        # SID carries no ownership information. Assume alive — the shape gate
+        # already restricts this path to test runners, and a coordinator that
+        # setsid'd itself is not distinguishable from an owned one.
+        return True
+    leader_sid = _linux_pid_sid(sid)
+    return leader_sid == sid  # alive AND still a session leader
+
+
 def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
     """Scan process table for orphaned MCP processes not in any active set.
 
@@ -1212,11 +1395,32 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
             continue
         if pid_age < _ORPHAN_MIN_AGE_SECONDS:
             continue
-        if not _is_sweepable_orphan_mcp(pid, cmdline):
+        if not (
+            _is_sweepable_orphan_mcp(pid, cmdline)
+            or _is_sweepable_orphan_work(pid, cmdline, pid_age)
+        ):
             continue
         candidates.append(pid)
 
     return candidates
+
+
+def _linux_pid_sid(pid: int) -> int:
+    """Session id (SID) from /proc/pid/stat (field 6, index 3 after state).
+
+    The SID of an agent-spawned work process points at the kiro-cli session
+    leader that (transitively) spawned it — kiro-cli is started with
+    ``start_new_session=True``, so every descendant inherits its SID even
+    after the direct parent dies and the process reparents to init. Returns
+    -1 when unreadable (caller must fail closed).
+    """
+    try:
+        stat_data = Path(f"/proc/{pid}/stat").read_text()
+        close_paren = stat_data.rfind(")")
+        fields = stat_data[close_paren + 2 :].split()
+        return int(fields[3])  # field 6 (session) = index 3 after state
+    except (OSError, ValueError, IndexError):
+        return -1
 
 
 def _linux_pid_age(pid: int, now: float) -> float:
@@ -1284,25 +1488,33 @@ def kill_orphan_mcps(pids: list[int]) -> int:
                     stderr=subprocess.DEVNULL,
                     timeout=2,
                 )
-            if not _is_sweepable_orphan_mcp(pid, cmdline):
+            if _is_sweepable_orphan_mcp(pid, cmdline):
+                pgid = os.getpgid(pid)
+                if pgid == pid and pgid != my_pgid and pgid > 1:
+                    os.killpg(pgid, signal.SIGKILL)
+                    killed += 1
+                    _sel_orphan_kill(pid, pgid, cmdline, "killpg")
+                else:
+                    # Candidate already passed UID + orphan-ppid + positive MCP
+                    # marker + two-phase active-PID re-verify + cmdline re-check.
+                    # Direct os.kill of the confirmed-orphan PID only — NOT a tree
+                    # walk. _kill_pid_tree is gated by kiro-cli/claude markers that
+                    # MCP processes don't carry. If this orphan shares a pgid (not
+                    # its own group leader) and has children, those children that
+                    # carry an MCP marker are reclaimed on a subsequent sweep; any
+                    # without a marker were never sweep candidates to begin with.
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+                    _sel_orphan_kill(pid, pgid, cmdline, "kill")
                 continue
-            pgid = os.getpgid(pid)
-            if pgid == pid and pgid != my_pgid and pgid > 1:
-                os.killpg(pgid, signal.SIGKILL)
-                killed += 1
-                _sel_orphan_kill(pid, pgid, cmdline, "killpg")
-            else:
-                # Candidate already passed UID + orphan-ppid + positive MCP
-                # marker + two-phase active-PID re-verify + cmdline re-check.
-                # Direct os.kill of the confirmed-orphan PID only — NOT a tree
-                # walk. _kill_pid_tree is gated by kiro-cli/claude markers that
-                # MCP processes don't carry. If this orphan shares a pgid (not
-                # its own group leader) and has children, those children that
-                # carry an MCP marker are reclaimed on a subsequent sweep; any
-                # without a marker were never sweep candidates to begin with.
-                os.kill(pid, signal.SIGKILL)
-                killed += 1
-                _sel_orphan_kill(pid, pgid, cmdline, "kill")
+            # Work-class orphan (KIROCREW_SPAWNED marker, no launcher shape).
+            # Re-verify the full identity — including the age floor — right
+            # before the kill; _is_sweepable_orphan_work fails closed off Linux.
+            work_age = _linux_pid_age(pid, time.time()) if sys.platform == "linux" else 0.0
+            if _is_sweepable_orphan_work(pid, cmdline, work_age):
+                killed += _kill_orphan_work_tree(
+                    pid, cmdline, work_age, budget=_ORPHAN_SWEEP_MAX_KILLS - killed
+                )
         except (
             ProcessLookupError,
             PermissionError,
@@ -1353,6 +1565,93 @@ def _sel_orphan_kill(pid: int, pgid: int, cmdline: bytes, method: str) -> None:
         logger.debug("SEL orphan-kill audit failed", exc_info=True)
 
 
+def _kill_orphan_work_tree(pid: int, cmdline: bytes, age_seconds: float, budget: int) -> int:
+    """SIGKILL a confirmed work-class orphan and its WHOLE subtree, leaf-first.
+
+    Deliberately NOT :func:`_kill_pid_tree`: that helper only reaps
+    descendants that are themselves managed agent runtimes (kiro-cli/claude),
+    which is correct for tracked agent PIDs but wrong here — every descendant
+    of a marked work orphan inherited the ``KIROCREW_SPAWNED`` environment
+    and is sweepable (an orphaned pytest's own python/shim children are
+    exactly the processes that pile up).
+
+    Descendants are enumerated once (preorder) and killed in reverse, so
+    every process dies before its parent — no child is re-parented away
+    mid-kill and the enumeration stays valid. The root goes last. *budget*
+    bounds the total SIGKILLs so the caller's global
+    :data:`_ORPHAN_SWEEP_MAX_KILLS` cap covers subtree members too; if the
+    budget runs out mid-subtree the survivors are re-reaped next sweep cycle.
+
+    Returns the number of processes killed.
+    """
+    if budget <= 0:
+        return 0
+    descendants: list[int] = []
+    try:
+        # circular import: session_pid → acp.client → session → session_pid
+        from kiro_crew.acp.client import _get_child_pids
+
+        descendants = _get_child_pids(pid)
+    except Exception:
+        logger.debug("Error enumerating descendants of work orphan %s", pid, exc_info=True)
+    my_pid = os.getpid()
+    basename = _work_orphan_basename(cmdline).decode("utf-8", errors="replace")
+    killed = 0
+    for target in [*reversed(descendants), pid]:
+        if killed >= budget:
+            break  # global kill cap exhausted; next sweep cycle finishes the job
+        if target <= 0 or target == my_pid:
+            continue
+        try:
+            platform_compat.kill_pid(target, platform_compat.SIGKILL)
+            killed += 1
+            if target == pid:
+                logger.info(
+                    "Orphan work sweep: SIGKILL pid=%d basename=%s age=%ds "
+                    "reason=KIROCREW_SPAWNED work orphan (reparented to init)",
+                    target,
+                    basename,
+                    int(age_seconds),
+                )
+            else:
+                logger.info(
+                    "Orphan work sweep: SIGKILL pid=%d reason=descendant of work orphan %d",
+                    target,
+                    pid,
+                )
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if killed:
+        _sel_orphan_work_kill(pid, basename, age_seconds, cmdline, killed)
+    return killed
+
+
+def _sel_orphan_work_kill(
+    pid: int, basename: str, age_seconds: float, cmdline: bytes, killed: int
+) -> None:
+    """Emit SEL audit event for a work-orphan subtree kill."""
+    try:
+        # Lazy import to avoid a circular import (see kill_orphan_mcps).
+        from kiro_crew.sel import sel
+
+        sel().log_tool_invocation(
+            session_key="gateway",
+            agent="kirocrew",
+            source="background",
+            tool_name="orphan_work_sweep",
+            tool_kind="process_kill",
+            outcome="completed",
+            resources=f"pid={pid} basename={basename} age={int(age_seconds)}s method=work_tree",
+            metadata={
+                "cmdline": cmdline[:200].decode("utf-8", errors="replace"),
+                "killed_in_tree": killed,
+                "reason": "KIROCREW_SPAWNED orphan work process",
+            },
+        )
+    except Exception:
+        logger.debug("SEL orphan-work-kill audit failed", exc_info=True)
+
+
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 
@@ -1365,6 +1664,9 @@ def _read_rss_pages(pid: int, proc_root: Path | None = None) -> int:
     ~1 MiB per process, i.e. the recycle could fire late or never for a tree
     sitting just over the ceiling.) Returns 0 if the process is gone or the
     field can't be read — a missing PID simply contributes nothing to the sum.
+
+    Windows never reaches here: ``get_session_rss_mb`` measures whole trees
+    through ``platform_compat.proc_rss_tree_mb_for_pid`` instead.
 
     *proc_root* overrides the ``/proc`` mount (test seam only).
     """
@@ -1391,6 +1693,14 @@ def _build_child_map(proc_root: Path | None = None) -> dict[int, list[int]]:
 
     A failure to scan ``/proc`` is logged at debug rather than swallowed
     silently, so a degraded reading is diagnosable.
+
+    Windows deliberately has NO branch here and returns an empty map: Toolhelp's
+    ``th32ParentProcessID`` is never cleared when a parent exits and Windows
+    recycles PIDs aggressively, so a raw parent->child walk can attach an
+    unrelated subtree to a recycled PID -- which would let the watchdog recycle a
+    healthy session. ``get_session_rss_mb`` routes Windows through
+    ``platform_compat.proc_rss_tree_mb_for_pid``, which validates every
+    parent->child edge against creation/exit times, instead of coming here.
 
     *proc_root* overrides the ``/proc`` mount (test seam only).
     """
@@ -1466,8 +1776,20 @@ def get_session_rss_mb(
 
     *proc_root* overrides the ``/proc`` mount (test seam only).
 
-    Linux-only (reads ``/proc``); returns 0 on platforms without it.
+    Linux reads ``/proc``. Windows has neither ``/proc`` nor a safe parent->child
+    walk (see ``_build_child_map``), so it delegates to
+    ``platform_compat.proc_rss_tree_mb_for_pid``, which sums only
+    lineage-validated descendants; without that the ceiling measured every tree
+    as 0 MiB there and no session was ever recycled. macOS has no ctypes-only
+    per-pid RSS path, so it returns 0 and the ceiling stays inert.
+
+    *exclude_pids* is honoured on the ``/proc`` route. The Windows route derives
+    its own validated descendant set, so a caller that needs a subtree barrier
+    there must exclude the pid before calling.
     """
+    if platform_compat.IS_WINDOWS and proc_root is None:
+        tree_mb = platform_compat.proc_rss_tree_mb_for_pid(pid)
+        return 0 if tree_mb is None else int(tree_mb)
     if sys.platform != "linux":
         return 0
     child_map = _build_child_map(proc_root)

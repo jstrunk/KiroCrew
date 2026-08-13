@@ -75,6 +75,19 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.agentWorlds.manifest.highlight_5',
     ],
   },
+  'auto-improvement': {
+    displayName: 'apps.autoImprovement.manifest.display_name',
+    description: 'apps.autoImprovement.manifest.description',
+    pageLabel: 'apps.autoImprovement.manifest.page_label',
+    highlights: [
+      'apps.autoImprovement.manifest.highlight_1',
+      'apps.autoImprovement.manifest.highlight_2',
+      'apps.autoImprovement.manifest.highlight_3',
+      'apps.autoImprovement.manifest.highlight_4',
+      'apps.autoImprovement.manifest.highlight_5',
+      'apps.autoImprovement.manifest.highlight_6',
+    ],
+  },
   'auto-research': {
     displayName: 'apps.autoResearch.manifest.display_name',
     description: 'apps.autoResearch.manifest.description',
@@ -248,6 +261,18 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.papyrus.manifest.highlight_5',
       'apps.papyrus.manifest.highlight_6',
       'apps.papyrus.manifest.highlight_7',
+    ],
+  },
+  'personal-shopper': {
+    displayName: 'apps.personalShopper.manifest.display_name',
+    description: 'apps.personalShopper.manifest.description',
+    pageLabel: 'apps.personalShopper.manifest.page_label',
+    highlights: [
+      'apps.personalShopper.manifest.highlight_1',
+      'apps.personalShopper.manifest.highlight_2',
+      'apps.personalShopper.manifest.highlight_3',
+      'apps.personalShopper.manifest.highlight_4',
+      'apps.personalShopper.manifest.highlight_5',
     ],
   },
   'pptx-maker': {

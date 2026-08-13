@@ -303,5 +303,18 @@ export function AppApiProvider({
 
 export { useChatSession } from './useChatSession'
 export { default as ChatPanel } from './ChatPanel'
+// The marker protocol, so an embedding app can interpret `[OPTIONS:]` /
+// `[STEERING …]` without rendering our transcript components.
+export * from './protocol'
 export { default as ChatEmbed } from './ChatEmbed'
 export { default as ChatMessageList } from './ChatMessageList'
+// The transcript's row registry, so an app can add a row type or replace one
+// instead of forking the message list.
+export {
+  defaultMessageRenderers,
+  GROUPED_ROLES,
+  mergeRenderers,
+  resolveRenderer,
+  ToolCallPill,
+} from './messageRenderers'
+export type { MessageRenderer, MessageRenderContext } from './messageRenderers'

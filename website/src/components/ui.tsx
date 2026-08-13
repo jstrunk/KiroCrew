@@ -26,8 +26,8 @@ export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttribute
         primary
           ? 'bg-accent text-accent-fg border-accent hover:bg-accent-hover hover:shadow-[0_0_12px_var(--accent-glow)]'
           : danger
-            ? 'border-border bg-transparent text-muted hover:text-danger hover:border-danger'
-            : 'border-border bg-transparent text-muted hover:text-text hover:border-border-strong hover:bg-bg-hover'
+            ? 'border-border bg-transparent text-text hover:text-danger hover:border-danger'
+            : 'border-border bg-transparent text-text hover:border-border-strong hover:bg-bg-hover'
       }`, className)}
       {...rest}
     >
@@ -338,8 +338,8 @@ export function PanelSectionHeader({ label, count, trailing, className }: {
 
 export function PageHeader({ title, subtitle, actions }: { title: React.ReactNode; subtitle?: string; actions?: React.ReactNode }) {
   return (
-    <div className="flex items-end justify-between gap-4 px-6 pt-2 pb-3" data-testid="page-header">
-      <div>
+    <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-6 pt-2 pb-3" data-testid="page-header">
+      <div className="min-w-0">
         <div className="text-2xl font-bold tracking-tight text-text-strong" data-testid="page-title">{title}</div>
         {subtitle && <div className="text-muted text-sm mt-1" data-testid="page-subtitle">{subtitle}</div>}
       </div>
@@ -348,7 +348,7 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
   )
 }
 
-export function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string }) {
+export function Toggle({ checked, onChange, disabled, label, describedBy, tone = 'accent' }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string; describedBy?: string; tone?: 'accent' | 'muted' }) {
   return (
     <div
       role="switch"
@@ -358,10 +358,18 @@ export function Toggle({ checked, onChange, disabled, label }: { checked: boolea
       // class, neither of which reaches the accessibility tree.
       aria-disabled={disabled || undefined}
       aria-label={label}
+      // Ties a consequence the caller renders NEXT to the switch (rather than as
+      // its description) into the switch's own accessible description, so an AT
+      // user hears it before acting rather than discovering it by exploring.
+      aria-describedby={describedBy}
       tabIndex={disabled ? -1 : 0}
       onClick={() => !disabled && onChange(!checked)}
       onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); onChange(!checked) } }}
-      className={`w-9 h-5 rounded-full relative transition-colors shrink-0 cursor-pointer ${disabled ? 'opacity-40 cursor-not-allowed' : ''} ${checked ? 'bg-accent' : 'bg-border'}`}
+      // `muted` is for a LIST of switches, where an accent fill on every row
+      // shouts and duplicates a state the row's own grouping already carries.
+      // The knob position still reads the state, so nothing is lost by dropping
+      // the hue. Accent stays the default so a lone switch keeps its emphasis.
+      className={`w-9 h-5 rounded-full relative transition-colors shrink-0 cursor-pointer ${disabled ? 'opacity-40 cursor-not-allowed' : ''} ${checked ? (tone === 'muted' ? 'bg-border-strong' : 'bg-accent') : 'bg-border'}`}
     >
       <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${checked ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
     </div>

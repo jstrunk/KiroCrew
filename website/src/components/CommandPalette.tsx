@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
 import { createPortal } from 'react-dom'
-import { Search, X, Pin, MessageSquare, Clock, Plus } from 'lucide-react'
+import { Search, X, Pin, MessageSquare, Clock, Plus, RotateCw } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 
 import { useAppSelector } from '../store'
@@ -21,6 +21,7 @@ import { usePromptsProvider } from './commandPalette/providers/promptsProvider'
 import { useArtifactsProvider } from './commandPalette/providers/artifactsProvider'
 import { useRecentsProvider } from './commandPalette/providers/recentsProvider'
 import { useSettingsProvider } from './commandPalette/providers/settingsProvider'
+import { useAppsProvider } from './commandPalette/providers/appsProvider'
 import { Highlighted } from './commandPalette/Highlighted'
 
 import { i18nT } from '../i18n/t'
@@ -149,12 +150,16 @@ export default function CommandPalette({
   const recents = useRecentsProvider()
   // Settings — instant client-side search over the codegen settings registry.
   const settings = useSettingsProvider()
+  // Apps — launch an installed app by name. Destinations come from the shared
+  // `appNav` derivation the left rail uses, so the two cannot disagree.
+  const apps = useAppsProvider()
 
   // Tab strip order (§1): All · Sessions · Knowledge · Skills ·
-  // Prompts, with Artifacts + Pages + Actions riding along after the v1 corpus.
+  // Prompts, with Artifacts + Apps + Pages + Actions riding along after the v1
+  // corpus. Apps sits next to Pages because both are pure navigation targets.
   const tabs = useMemo<ResourceProvider[]>(
-    () => [all, sessions, knowledge, skills, prompts, artifacts, pages, actions, settings],
-    [all, sessions, knowledge, skills, prompts, artifacts, pages, actions, settings],
+    () => [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
+    [all, sessions, knowledge, skills, prompts, artifacts, apps, pages, actions, settings],
   )
 
   // Make the per-category providers discoverable by the All aggregator, which
@@ -165,14 +170,19 @@ export default function CommandPalette({
   // Promise.all fan-out and drags every other provider's results with it.
   // Both surface only when scoped (sigil or prefix+Tab), reached directly via
   // the tabs list rather than the aggregator. Re-registration is idempotent.
+  //
+  // Apps IS registered: the list is one small cached request on a key the Apps
+  // page already warms, and "type a name, press Enter to launch" is the whole
+  // point of putting apps in the palette — it has to work from the default tab.
   useEffect(() => {
     registerProvider(sessions)
     registerProvider(prompts)
     registerProvider(artifacts)
+    registerProvider(apps)
     registerProvider(pages)
     registerProvider(actions)
     registerProvider(settings)
-  }, [sessions, prompts, artifacts, pages, actions, settings])
+  }, [sessions, prompts, artifacts, apps, pages, actions, settings])
 
   const [query, setQuery] = useState('')
   const [scope, setScope] = useState<string | null>(null)
@@ -347,7 +357,7 @@ export default function CommandPalette({
         : '',
     [activeProvider.id, slots, unreadSlots, slotStatusDetail, simplifiedToolNames],
   )
-  const { data: results = [], isLoading: loading } = useQuery({
+  const { data: results = [], isLoading: loading, isError, refetch } = useQuery({
     queryKey: ['palette', 'search', activeProvider.id, debouncedQuery, liveFingerprint],
     queryFn: () => Promise.resolve(activeProvider.search(debouncedQuery)),
     enabled: open,
@@ -445,7 +455,27 @@ export default function CommandPalette({
 
   if (!open) return null
 
-  const emptyState = loading ? (
+  const emptyState = isError ? (
+    // A provider's search REJECTED. This is distinct from an empty corpus: the
+    // ordinary "No matches" copy below would mislabel a backend failure as
+    // "nothing found", so a rejection gets its own message plus a retry that
+    // re-runs the query (React Query `refetch`). The All aggregator never lands
+    // here — it guards each provider and always RESOLVES with a blended list
+    // (see allAggregator.search) — so this branch only ever shows on a scoped
+    // tab (or the recents quick-switcher), leaving the All tab's swallow
+    // untouched.
+    <div className="px-3 py-6 text-center text-[12px] flex flex-col items-center gap-2">
+      <span className="text-muted">{i18nT('components.commandPalette.search_failed')}</span>
+      <button
+        type="button"
+        onClick={() => { void refetch() }}
+        className="inline-flex items-center gap-1 rounded-md border border-border bg-transparent px-2 py-1 text-[12px] text-text cursor-pointer hover:bg-bg-hover"
+      >
+        <RotateCw size={12} className="lucide-inline" />
+        {i18nT('components.commandPalette.retry')}
+      </button>
+    </div>
+  ) : loading ? (
     <div className="px-3 py-6 text-center text-[12px] text-muted">{i18nT('components.commandPalette.searching')}</div>
   ) : (
     <div className="px-3 py-6 text-center text-[12px] text-muted">
@@ -527,7 +557,10 @@ export default function CommandPalette({
 
         {/* Result list */}
         <div className="overflow-y-auto py-1" role="listbox">
-          {results.length === 0
+          {/* An errored query takes precedence over any stale placeholder rows
+              React Query keeps from the previous key: a failed search must read
+              as failed, not silently show the last query's results. */}
+          {isError || results.length === 0
             ? emptyState
             : results.map((r, i) => {
                 // Section header whenever the group changes — the recents view

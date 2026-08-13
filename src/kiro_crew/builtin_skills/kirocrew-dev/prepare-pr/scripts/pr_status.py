@@ -43,6 +43,61 @@ PASS_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 CTX_PASS = {"SUCCESS"}
 CTX_RUNNING = {"PENDING", "EXPECTED"}
 DEFAULT_READINESS_CONTEXT = "PR Readiness"
+
+# A host closes an issue on merge ONLY for these verbs. "Related: #n", "Part of
+# #n" and a bare "#n" render as links and close nothing, which is how finished
+# work merges while its issue stays open forever.
+_CLOSING_KW_RE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+#\d+",
+    re.IGNORECASE,
+)
+# Any issue-ish reference at all, used to tell "forgot the verb" from
+# "genuinely closes nothing".
+_BARE_REF_RE = re.compile(r"(?<![\w/])#\d+\b")
+# Explicit opt-out so an issue-less PR can say so once instead of being asked
+# every round. Anchored at column 0 and requires the colon, because an
+# UNANCHORED substring is satisfied by any prose that merely discusses this
+# check — including the instruction block of our own body template, which would
+# make an author who copies the template and skips that section look like they
+# declared something. A declaration is a trailer, not a mention.
+_NO_ISSUE_RE = re.compile(r"^no issue closed[ \t]*:", re.IGNORECASE | re.MULTILINE)
+
+
+def closing_link_reason(body, closing_refs):
+    """Return an advisory reason when no issue will close, else None.
+
+    ADVISORY ONLY — the caller prints this, it never changes the exit code. An
+    issue-less PR is legitimate, and a green PR should not be held on
+    bookkeeping.
+
+    ``closing_refs`` is the host's OWN resolution of the body (the
+    ``closingIssuesReferences`` field), so it is the truth about what will
+    actually close. The body regexes only classify *why* it resolved to
+    nothing, which is what makes the message actionable.
+    """
+    if closing_refs:
+        return None
+    body = body or ""
+    if _NO_ISSUE_RE.search(body):
+        return None
+    if _CLOSING_KW_RE.search(body):
+        # Verb is present but the host resolved nothing: wrong repo prefix, a
+        # code fence, or an issue that is already closed/nonexistent.
+        return (
+            "body has a closing keyword but the host resolved no issue "
+            "(check the number and that it is not inside a code fence)"
+        )
+    if _BARE_REF_RE.search(body):
+        return (
+            "body references an issue with no closing keyword - use "
+            "'Fixes #<n>' so it closes on merge, or state 'no issue closed: <why>'"
+        )
+    return (
+        "no issue link - add 'Fixes #<n>', or state 'no issue closed: <why>' "
+        "to record that the omission is deliberate"
+    )
+
+
 # Page cap so a pathological PR can't make us loop unbounded (100 * 50 = 5000).
 _MAX_THREAD_PAGES = 50
 
@@ -193,6 +248,88 @@ def unresolved_thread_count(number):
     return None  # hit the page cap with more pages left -> uncertain (fail-closed)
 
 
+def decide(
+    state,
+    mergeable,
+    merge_state,
+    decision,
+    draft,
+    readiness_kind,
+    n_running,
+    n_fail,
+    n_checks,
+    readiness_context,
+):
+    """Resolve PR state to (exit_code, status line). Fail-closed.
+
+    Exit codes: 0 = clean, 10 = wait (nothing to do yet), 20 = act.
+
+    Precedence is the load-bearing part, and it is ordered by "can waiting
+    change this answer?" rather than by how the fields arrive:
+
+    1. A non-open PR is terminal, and must be decided BEFORE any wait: GitHub
+       reports mergeable=UNKNOWN for merged/closed PRs forever, so waiting on
+       it returns 10 on every poll and a loop never stops.
+    2. Conditions waiting CANNOT fix outrank "still running". A conflicted PR is
+       the case that matters: the host cannot build a merge ref for it, so it
+       dispatches no pull_request workflows at all and every check visible
+       belongs to the old head. Ranking in-flight checks first reports "running"
+       forever while nothing can complete -- a stall only a human notices.
+       BEHIND, draft and CHANGES_REQUESTED behave the same way: each survives
+       any amount of waiting and needs the author to act.
+    3. Only then is "still running" a wait, and an uncomputed mergeability too.
+    4. Everything left is a check-result verdict.
+    """
+    if state != "OPEN":
+        return 20, "STATUS: BLOCKED - PR state is {} (not OPEN; terminal)".format(state or "?")
+
+    blocked_now = []
+    if mergeable == "CONFLICTING" or merge_state in ("DIRTY", "CONFLICTING"):
+        blocked_now.append("merge conflict / not mergeable")
+    if merge_state == "BEHIND":
+        blocked_now.append("branch is BEHIND base - re-sync onto the latest base")
+    if draft:
+        blocked_now.append("PR is a draft")
+    if decision == "CHANGES_REQUESTED":
+        blocked_now.append("review decision is CHANGES_REQUESTED")
+    if blocked_now:
+        return 20, "STATUS: BLOCKED - " + "; ".join(blocked_now)
+
+    # Once published, the aggregate is authoritative over stale duplicate
+    # checks in the rollup. Legacy PRs without it still use the full rollup.
+    if readiness_kind == "running" or (readiness_kind is None and n_running > 0):
+        return 10, "STATUS: RUNNING (round not complete)"
+    if mergeable not in ("MERGEABLE", "CONFLICTING"):
+        return 10, "STATUS: RUNNING (mergeability not yet computed: {})".format(
+            mergeable or "UNKNOWN"
+        )
+
+    reasons = []
+    if readiness_kind == "fail":
+        reasons.append("{} reported action required".format(readiness_context))
+    elif readiness_kind is None and n_fail > 0:
+        reasons.append("{} check(s) failed".format(n_fail))
+    if n_checks == 0:
+        reasons.append("no CI checks reported - cannot confirm CI (fail-closed)")
+    if merge_state and merge_state not in (
+        "CLEAN",
+        "HAS_HOOKS",
+        "UNSTABLE",
+        "BLOCKED",
+        "DIRTY",
+        "CONFLICTING",
+        "DRAFT",
+        "BEHIND",
+    ):
+        # BLOCKED = pending required review (expected for a review-ready PR);
+        # anything unrecognized is fail-closed.
+        reasons.append("unrecognized merge state '{}' (fail-closed)".format(merge_state))
+
+    if reasons:
+        return 20, "STATUS: BLOCKED - " + "; ".join(reasons)
+    return 0, "STATUS: CLEAN (readiness passed, mergeable, no blocking review decision)"
+
+
 def main(argv):
     if run(["gh", "auth", "status"])[0] != 0:
         err("ERROR: gh not found or not authenticated. Run: gh auth login")
@@ -209,7 +346,8 @@ def main(argv):
 
     fields = (
         "number,title,state,isDraft,mergeable,mergeStateStatus,"
-        "reviewDecision,url,headRefName,statusCheckRollup"
+        "reviewDecision,url,headRefName,statusCheckRollup,"
+        "body,closingIssuesReferences"
     )
     rc, out, _ = run(["gh", "pr", "view", pr, "--json", fields])
     if rc != 0 or not out:
@@ -254,6 +392,21 @@ def main(argv):
         print("  - {}: {}  [{}]".format(name, shown, kind))
     print("  rollup: total={} running={} failing={}".format(len(rollup), n_running, n_fail))
     print("  aggregate readiness: {}".format(readiness_kind or "not published"))
+    _closes = d.get("closingIssuesReferences") or []
+    print(
+        "  closes on merge: {}".format(
+            ", ".join("#{}".format(i.get("number")) for i in _closes) if _closes else "nothing"
+        )
+    )
+    # Advisory, never a gate. The measured failure was that nobody was ever
+    # ASKED for a trailer, not that authors refuse to write one: across 600
+    # merged PRs the host's auto-close worked every time it had a keyword to
+    # act on. So report the gap where the author will see it and let them
+    # decide -- blocking a green PR on bookkeeping costs more than it saves,
+    # and an issue-less PR is legitimate.
+    _closing = closing_link_reason(d.get("body"), _closes)
+    if _closing:
+        print("  NOTICE: " + _closing)
 
     n_unresolved = unresolved_thread_count(d.get("number"))
     print("-- Review threads " + "-" * 35)
@@ -262,57 +415,20 @@ def main(argv):
     )
     print("=" * 54)
 
-    # ---- Decision (fail-closed) --------------------------------------------
-    # A non-open PR is terminal, and must be decided BEFORE the mergeability
-    # wait: GitHub reports mergeable=UNKNOWN for merged/closed PRs forever, so
-    # waiting on it would return 10 on every poll and a loop would never stop.
-    if state != "OPEN":
-        print("STATUS: BLOCKED - PR state is {} (not OPEN; terminal)".format(state or "?"))
-        return 20
-    # Once published, the aggregate is authoritative over stale duplicate
-    # checks in the rollup. Legacy PRs without it still use the full rollup.
-    if readiness_kind == "running" or (readiness_kind is None and n_running > 0):
-        print("STATUS: RUNNING (round not complete)")
-        return 10
-    # Mergeability not yet computed by GitHub -> unknown -> wait, don't pass.
-    if mergeable not in ("MERGEABLE", "CONFLICTING"):
-        print("STATUS: RUNNING (mergeability not yet computed: {})".format(mergeable or "UNKNOWN"))
-        return 10
-
-    reasons = []
-    if readiness_kind == "fail":
-        reasons.append("{} reported action required".format(readiness_context))
-    elif readiness_kind is None and n_fail > 0:
-        reasons.append("{} check(s) failed".format(n_fail))
-    if len(rollup) == 0:
-        reasons.append("no CI checks reported - cannot confirm CI (fail-closed)")
-    if draft:
-        reasons.append("PR is a draft")
-    if mergeable == "CONFLICTING" or merge_state in ("DIRTY", "CONFLICTING"):
-        reasons.append("merge conflict / not mergeable")
-    if merge_state == "BEHIND":
-        reasons.append("branch is BEHIND base - re-sync onto the latest base")
-    elif merge_state and merge_state not in (
-        "CLEAN",
-        "HAS_HOOKS",
-        "UNSTABLE",
-        "BLOCKED",
-        "DIRTY",
-        "CONFLICTING",
-        "DRAFT",
-    ):
-        # BLOCKED = pending required review (expected for a review-ready PR);
-        # anything unrecognized is fail-closed.
-        reasons.append("unrecognized merge state '{}' (fail-closed)".format(merge_state))
-    if decision == "CHANGES_REQUESTED":
-        reasons.append("review decision is CHANGES_REQUESTED")
-
-    if reasons:
-        print("STATUS: BLOCKED - " + "; ".join(reasons))
-        return 20
-
-    print("STATUS: CLEAN (readiness passed, mergeable, no blocking review decision)")
-    return 0
+    code, status = decide(
+        state=state,
+        mergeable=mergeable,
+        merge_state=merge_state,
+        decision=decision,
+        draft=draft,
+        readiness_kind=readiness_kind,
+        n_running=n_running,
+        n_fail=n_fail,
+        n_checks=len(rollup),
+        readiness_context=readiness_context,
+    )
+    print(status)
+    return code
 
 
 if __name__ == "__main__":

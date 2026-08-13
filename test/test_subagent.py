@@ -204,6 +204,32 @@ class TestSpawnWithoutApprovalCallback:
         assert manager._queue[0]["_preassigned_id"] == second.id
         assert first.queued is False
 
+    @pytest.mark.asyncio
+    async def test_queued_spawn_counts_as_pending_work(self) -> None:
+        """A spawn waiting behind the concurrency cap is in `_queue`, not
+        `running` — the reset-deferral predicates must see it anyway, or a
+        parent session is reset while its wave is still ramping and the queued
+        agent's completion lands on a cold-started replacement session."""
+        approval_callback = AsyncMock(return_value=True)
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+            on_spawn_approval=approval_callback,
+        )
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            manager.spawn("task one", parent_session_key="cron:j1")
+            queued = manager.spawn("task two", parent_session_key="cron:j1")
+
+        assert queued is not None and queued.queued is True
+        # The queued member is invisible to `running`-based checks...
+        assert not any(a.parent_session_key == "cron:j1" and a.queued is False and a.id == queued.id for a in manager.running)
+        # ...but the pending-work predicates must still report it.
+        assert manager.queued_count_for("cron:j1") == 1
+        assert manager.has_pending_work_for("cron:j1") is True
+        assert manager.queued_count_for("cron:other") == 0
+
 
 class TestSpawnWithApprovalCallback:
     """When on_spawn_approval is set, spawns are gated behind approval."""
@@ -641,7 +667,7 @@ class TestSubagentReaper:
         manager._agents["hang0001"] = info
         manager._running_count = 1
 
-        # _sigkill_session is async (Mesh-2801 offloaded the Windows taskkill
+        # _sigkill_session is async (offloaded the Windows taskkill
         # to subprocess_executor via kill_process_tree_async), so callers now
         # await it — the patch must be AsyncMock or asyncio complains.
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
@@ -674,7 +700,7 @@ class TestSubagentReaper:
         manager._agents["slow0001"] = info
         manager._running_count = 1
 
-        # _sigkill_session is async (Mesh-2801) — patch with AsyncMock.
+        # _sigkill_session is async — patch with AsyncMock.
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"), patch(
             "kiro_crew.subagent._RESET_TIMEOUT", 0.1
         ), patch.object(manager, "_sigkill_session", new_callable=AsyncMock):

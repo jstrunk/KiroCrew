@@ -50,12 +50,20 @@ class TestStatusSnapshot:
         state.subagents = None
         assert state.status_snapshot()["subagents"] == 0
 
-    def test_slack_connected_reflects_client(self, state: DashboardState) -> None:
+    def test_slack_connected_reflects_socket_outcome(self, state: DashboardState) -> None:
         # No Slack client wired up (pure-dashboard / Slack disabled).
         assert state.slack_client is None
         assert state.status_snapshot()["slack_connected"] is False
-        # Gateway wires up a live Slack client once Socket Mode connects.
+        # Tokens were present at boot (client wired) but the socket connect
+        # failed, e.g. invalid_auth or a network error. The badge must NOT show
+        # green: slack_client alone only proves tokens existed, not that Socket
+        # Mode came up. This is the reported bug (#1770): a green "Connected"
+        # over a Slack that never received an event.
         state.slack_client = MagicMock()
+        state.slack_socket_connected = False
+        assert state.status_snapshot()["slack_connected"] is False
+        # Socket Mode actually connected this session.
+        state.slack_socket_connected = True
         assert state.status_snapshot()["slack_connected"] is True
 
     def test_new_fields_propagate_to_all_callers(self, state: DashboardState) -> None:
@@ -80,6 +88,37 @@ class TestStatusSnapshot:
         snap = state.status_snapshot()
         assert snap["branch"] == ""
         assert snap["commit"] == ""
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("0.1.4", "stable"),
+            ("0.1.4-nightly.20260807t061500", "nightly"),
+            ("0.1.4-insider.2", "insider"),
+            # PEP 440 spellings — what a CLI/wheel install actually reports,
+            # because build-wheel.yml rewrites __version__ to the wheel version.
+            ("0.1.4rc4", "insider"),
+            ("0.1.4.dev20260807061500", "nightly"),
+        ],
+    )
+    def test_ships_the_resolved_release_channel(
+        self, state: DashboardState, monkeypatch, version: str, expected: str
+    ) -> None:
+        """The dashboard is told the LANE, not left to parse the version itself.
+
+        The prerelease bug-report chip in the header keys off this field, so a
+        wrong answer here means a nightly user silently loses their obvious way
+        to report a bug — or a stable user gets an affordance implying the build
+        is expected to break.
+        """
+        monkeypatch.setattr("kiro_crew.release_channel.__version__", version)
+        assert state.status_snapshot()["release_channel"] == expected
+
+    def test_release_channel_is_always_present(self, state: DashboardState) -> None:
+        """Never omitted: the frontend must not have to distinguish absent-from-
+        old-gateway from absent-because-stable within one payload version."""
+        snap = state.status_snapshot()
+        assert snap["release_channel"] in ("nightly", "insider", "stable")
 
     def test_cached_overrides_skip_expensive_calls(self, state: DashboardState) -> None:
         """Passing cron_jobs/lessons skips list_jobs()/load_all()."""

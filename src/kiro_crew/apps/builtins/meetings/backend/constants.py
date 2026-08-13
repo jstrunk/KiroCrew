@@ -21,6 +21,11 @@ API_BASE = f"/api/apps/{APP_NAME}"
 MAX_SESSION_DURATION = 4 * 3600  # a single meeting may run at most 4 hours
 MAX_CONCURRENT_MEETINGS = 1
 MAX_TRANSCRIPT_CHARS = 4000  # per dispatched transcription line
+#: A four-hour meeting normally produces only a few megabytes of text. This
+#: ceiling prevents an unbounded app-owned file while leaving generous headroom
+#: for unusually dense speech and typed interventions. Reaching it is a loud
+#: 413; accepted segments are never silently truncated.
+MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_BATCH_CHARS = 60_000  # per flushed agent batch
 MAX_ATTACHMENTS = 25
 MAX_DICTIONARY_TERMS = 500
@@ -87,10 +92,34 @@ DICTIONARY_FILE = "dictionary.toml"
 CALENDAR_CACHE_FILE = "calendar-cache.json"
 SESSION_META_FILE = "session.json"
 TASKS_FILE = "tasks.json"
+TRANSCRIPT_FILE = "transcript.jsonl"
+
+# Durable transcript entry sources. Speech is a finalized STT segment; typed is
+# a line submitted through the broadcast bar.
+TRANSCRIPT_SOURCE_SPEECH = "speech"
+TRANSCRIPT_SOURCE_TYPED = "typed"
+VALID_TRANSCRIPT_SOURCES = (TRANSCRIPT_SOURCE_SPEECH, TRANSCRIPT_SOURCE_TYPED)
 
 # The always-on system agent that maintains ``tasks.json``. Not a configurable
 # entry in ``meeting_agents`` — it is a core feature of the app.
 TASK_EXTRACTOR_ID = "task-extractor"
+
+#: The task extractor's DISPATCHABLE agent name — the ``name`` field from
+#: ``agents/meetings-task-extractor.json``.
+#:
+#: Not ``f"{APP_NAME}/meetings-task-extractor"``. The namespaced form is a
+#: display/tracking id; what can actually be dispatched is the declared name,
+#: because that is what kiro-cli enumerates and what
+#: ``bridges._register_agents`` hands to ``publish_materialized_agents``. The
+#: namespaced form produced ``Mode '…' not found`` and no agent ever started.
+#:
+#: A constant rather than two f-strings so the two call sites cannot drift.
+TASK_EXTRACTOR_AGENT = "meetings-task-extractor"
+
+#: The namespaced prefix older builds wrote into ``config.json`` under
+#: ``meeting_agents[].agent``. Those values are not dispatchable, so
+#: :func:`store.read_config` strips this prefix from builtin rows on read.
+LEGACY_AGENT_NAMESPACE = f"{APP_NAME}/"
 
 # Slot-name prefix for the per-agent background chat sessions this app drives.
 SLOT_PREFIX = "meetings"

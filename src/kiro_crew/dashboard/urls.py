@@ -20,6 +20,7 @@ import ipaddress
 import logging
 import os
 import socket
+from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,27 @@ def is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def dashboard_socket_path(port: int) -> Path:
+    """Path of the dashboard internal-API unix socket for *port*.
+
+    Both the server (``dashboard/server`` binds a ``web.UnixSite`` here) and
+    the client (``mcp_core`` prefers this transport when the file exists) must
+    agree on the path, so it is computed in exactly one place. The name is
+    port-suffixed because the data home can be shared by multiple gateway
+    instances on different ports (the instances feature): each instance binds
+    its own socket, and a client resolving its port from ``dashboard.url``
+    reaches the same logical endpoint it would have reached over TCP.
+
+    The ``config`` import is deliberately lazy: this module is a stdlib-only
+    leaf on the hot CLI / MCP-stdio import path (see the module docstring),
+    and only callers that actually use the unix transport should pay for
+    config resolution.
+    """
+    from kiro_crew.config.loader import config_dir
+
+    return config_dir() / f"dashboard-{int(port)}.sock"
 
 
 # ---------------------------------------------------------------------------
@@ -380,13 +402,25 @@ def format_dashboard_urls(
 
 
 def build_allowed_origins(
-    port: int, local_only: bool, configured_host: str = "", dashboard_url: str = ""
+    port: int,
+    local_only: bool,
+    configured_host: str = "",
+    dashboard_url: str = "",
+    tailnet_host: str = "",
 ) -> set[str]:
     """Compute the set of allowed origins for the dashboard.
 
     When *dashboard_url* is provided, its origin (scheme + host + port)
     is added as-is so that reverse-proxy setups (e.g. Caddy with TLS on
     a custom domain) pass the CSRF check without code changes.
+
+    *tailnet_host* is this machine's MagicDNS name when tailnet access is
+    enabled, and adds ``https://<name>`` — no port, because ``tailscale serve``
+    fronts the dashboard on 443. Kept as a **parameter rather than a lookup** so
+    this function stays pure and testable: the caller owns the daemon call and
+    the validation (``dashboard/tailnet.py``), and passes "" when Tailscale is
+    disabled, absent, or produced nothing trustworthy. Nothing here re-validates
+    it, so nothing may pass an unvalidated value in.
     """
     origins: set[str] = {
         f"http://127.0.0.1:{port}",
@@ -402,6 +436,11 @@ def build_allowed_origins(
         origin = dashboard_origin(dashboard_url)
         if origin:
             origins.add(origin)
+    # Tailnet origin (§4). Already validated by dashboard/tailnet.py — see the
+    # docstring: this function must not be the place that decides whether a
+    # subprocess-derived hostname is trustworthy.
+    if tailnet_host:
+        origins.add(f"https://{tailnet_host}")
     if not local_only:
         mh = machine_hostname()
         if mh:

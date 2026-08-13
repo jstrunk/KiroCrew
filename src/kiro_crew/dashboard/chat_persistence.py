@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
-from collections import deque
-from collections.abc import Iterator
+from collections import OrderedDict, deque
+from collections.abc import Iterator, Mapping
 
 from kiro_crew import model_registry
 from kiro_crew.agent import kiro_agents_dir_path
@@ -21,14 +23,16 @@ from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
     _redact_meta_for_role,
     _sync_dashboard_slots,
-    effective_session_key,
+    slot_history_key,
     slot_transcript_key,
 )
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot, _normalize_slot_key
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.history import (
+    SLOT_OWNED_META_KEYS,
     _archive_lines,
     carry_provenance,
+    carry_unowned_metadata,
     latest_transcript_ts,
     transcript_sort_key,
     update_metadata_off_loop,
@@ -38,6 +42,60 @@ from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import ARTIFACT_SLUG_RE
 
 logger = logging.getLogger(__name__)
+
+
+# Recognized title-origin values (mirrors chat_title._TITLE_ORIGINS; duplicated
+# here rather than imported to avoid dragging the chat_title import graph into
+# the persistence module's load path).
+_TITLE_ORIGINS = ("auto", "user")
+
+
+def _rehydrate_title_origin(titled: bool, stored: object) -> str:
+    """Resolve a rehydrated slot's title origin from persisted metadata.
+
+    Mirrors how ``_titled`` is derived from the presence of a persisted title,
+    so "a manual rename is final" survives a reload. A recognized stored
+    ``title_origin`` is used verbatim. A titled slot with NO stored origin is a
+    LEGACY session written before the field existed: treat it conservatively as
+    ``"user"`` so the background title refresh never rewrites what might be a
+    manual rename. An untitled slot has no origin.
+    """
+    if not titled:
+        return ""
+    if isinstance(stored, str) and stored in _TITLE_ORIGINS:
+        return stored
+    return "user"
+
+
+def _rehydrate_title_refresh_mark(stored: object) -> int:
+    """Resolve the persisted refresh mark; unknown/invalid values mean 0."""
+    if isinstance(stored, int) and not isinstance(stored, bool) and stored > 0:
+        return stored
+    return 0
+
+
+def _rehydrate_slot_title(
+    slot: _ChatSlot,
+    raw_title: str,
+    *,
+    titled: bool,
+    metadata: Mapping[str, object],
+) -> None:
+    """Restore the complete persisted title state through one contract.
+
+    Titles may be model-authored, so display redaction must happen before the
+    value reaches the slot. Keeping provenance and refresh-budget restoration
+    beside that assignment prevents hydration paths from restoring only part
+    of the title state.
+    """
+    safe_title, _ = redact_exfiltration_urls(raw_title)
+    safe_title, _ = redact_credentials(safe_title)
+    slot.title = safe_title
+    slot._titled = titled
+    slot._title_origin = _rehydrate_title_origin(titled, metadata.get("title_origin"))
+    slot._title_refresh_mark = _rehydrate_title_refresh_mark(
+        metadata.get("title_refresh_mark")
+    )
 
 
 _MAX_HISTORY_CHARS = 8000
@@ -200,6 +258,11 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
     if not isinstance(keys, list):
         return
     restored = 0
+    # Rebound each pass so it reflects only THIS restore: a key that becomes
+    # readable later must stop being carried, and a fresh set() keeps mutation
+    # off the class-level frozenset baseline.
+    unrestored: set[str] = set()
+    state.unrestored_slot_keys = unrestored
     # Built once and shared across every tab — it is identical per slot.
     kiro_model_map = _build_kiro_model_map()
     for raw in keys:
@@ -226,17 +289,46 @@ def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
         if raw in state._slots:
             continue
         try:
-            slot = _rehydrate_slot_from_history(state, raw, kiro_model_map=kiro_model_map)
+            # Ask whether the metadata READ succeeded, not just whether it came
+            # back empty. get_metadata() reports {} for both "never persisted"
+            # and "could not be read after retries", and treating the second as
+            # the first is what silently discards a live tab. Key it exactly as
+            # _rehydrate_slot_from_history does, so the prefetch below is a hit.
+            #
+            # This read MUST stay inside the per-tab guard. restore_open_slots_async
+            # has no except at its call site, so anything escaping here aborts
+            # dashboard startup and costs every LATER tab too, not just this one.
+            meta, readable = state.conversation_log.get_metadata_status(
+                slot_transcript_key(raw)
+            )
+            if readable:
+                slot = _rehydrate_slot_from_history(
+                    state, raw, kiro_model_map=kiro_model_map, _prefetched_meta=meta
+                )
+                if slot is not None:
+                    restored += 1
+            else:
+                unrestored.add(raw)
+                logger.warning(
+                    "restore_open_slots: metadata unreadable for %s; keeping it "
+                    "in the reopen seed for the next restore instead of "
+                    "dropping it",
+                    raw,
+                )
         except Exception:
             logger.debug("restore_open_slots: rehydrate failed for %s", raw, exc_info=True)
+            # Same epistemic position as an unreadable read: the session was not
+            # shown to be gone, so keep its key rather than erasing the seed.
+            unrestored.add(raw)
             # No rollback here: _rehydrate_slot_from_history undoes its own
             # partial slot and restricted key, so every caller gets it rather
             # than only the ones that remembered to compensate.
-            continue
-        if slot is not None:
-            restored += 1
-        # One yield point per tab. The async driver turns this into a real event-loop
-        # yield; the sync driver just spins through it.
+        # One yield point per tab, reached on EVERY outcome. A failing tab still
+        # costs real I/O (the metadata read retries, and _pause_for_transient_retry
+        # deliberately does not sleep while on the loop), so a run of failing tabs
+        # that skipped the yield would monopolise the loop and feed the stall
+        # watchdog. The async driver turns this into a real event-loop yield; the
+        # sync driver just spins through it.
         yield restored
     if restored:
         logger.info("Restored %d open tab(s) from open_slots.json", restored)
@@ -390,7 +482,22 @@ def _rehydrate_slot_from_history(
     restricted_key = f"dashboard:{slot_name}"
     preexisting_restricted = restricted_key in state._restricted_keys
     try:
-        slot = state.get_or_create_slot(slot_name, app=meta.get("app", ""))
+        slot = state.get_or_create_slot(
+            slot_name,
+            app=meta.get("app", ""),
+            # PERSISTED provenance only. A name is not evidence: main supports a
+            # dashboard slot a caller happened to name ``slack_notes`` (see
+            # test_slack_dashboard_live_sync's "the guard must not be a name
+            # heuristic"), so inferring channel origin from the stem would let a
+            # fresh dashboard conversation adopt a real thread's transcript.
+            # A legacy channel transcript carrying neither marker is surfaced by
+            # ``channel_slot_reconciler`` instead, which sets the flag -- and the
+            # first save then persists it, so later boots need no inference.
+            channel_origin=(
+                bool(meta.get("channel_origin"))
+                or bool(meta.get("linked_session_key"))
+            ),
+        )
         # Title comes from the metadata line we already read above. We deliberately
         # do NOT consult ``list_sessions()`` here: that call globbed + stat'd + read
         # the first line of EVERY session file in the history dir (O(all sessions))
@@ -413,10 +520,12 @@ def _rehydrate_slot_from_history(
         # is user content, so a prompt injection could craft a title with an
         # exfiltration URL or leaked credential.
         raw_title = meta.get("title") or slot_name
-        raw_title, _ = redact_exfiltration_urls(raw_title)
-        raw_title, _ = redact_credentials(raw_title)
-        slot.title = raw_title
-        slot._titled = bool(meta.get("title"))
+        _rehydrate_slot_title(
+            slot,
+            raw_title,
+            titled=bool(meta.get("title")),
+            metadata=meta,
+        )
         if meta.get("created_at"):
             slot.created_at = meta["created_at"]
         if meta.get("agent"):
@@ -447,6 +556,8 @@ def _rehydrate_slot_from_history(
             slot.mode = meta["mode"]
         if meta.get("folder_id"):
             slot.folder_id = meta["folder_id"]
+        if meta.get("channel_folder_filed"):
+            slot._channel_folder_filed = True
         if meta.get("app"):
             slot._app = meta["app"]
         # Re-validate the companion binding against the slug grammar on restore
@@ -463,6 +574,25 @@ def _rehydrate_slot_from_history(
         raw_tags = meta.get("tags")
         if isinstance(raw_tags, list):
             slot.tags = [str(t) for t in raw_tags if isinstance(t, str) and t]
+            # Prune ids missing from the vocabulary: tag deletion commits the
+            # vocab write first (crash-atomic), so a crash mid-delete can
+            # leave dangling ids on the persisted slot line. load_tags() runs
+            # before any slot restore, so state._tags is authoritative here.
+            # FAIL-OPEN only when the vocabulary is UNKNOWN (tags.json parse
+            # or I/O failure): pruning then would wipe EVERY assignment and
+            # the next save persists the loss. A legitimately-empty vocabulary
+            # (user deleted the last tag) IS authoritative and must prune —
+            # otherwise a crash mid-delete resurrects the dangling id forever.
+            if getattr(state, "_tags_authoritative", True):
+                known = {t.get("id") for t in state._tags}
+                slot.tags = [t for t in slot.tags if t in known]
+        if meta.get("auto_tagged"):
+            slot._auto_tagged = True
+        if meta.get("human_seen"):
+            # Attendance survives the restart, so an app-owned tab a person has
+            # been working in keeps the full approval window instead of silently
+            # dropping to the unattended deny-fast (state._ChatSlot.unattended).
+            slot._human_seen = True
         mm = meta.get("memory_mode", "persistent")
         slot.memory_mode = mm
         if mm != "persistent":
@@ -483,13 +613,9 @@ def _rehydrate_slot_from_history(
         tab_id = meta.get("tab_id")
         if not tab_id:
             tab_id = uuid.uuid4().hex[:12]
-            # _rehydrate_slot_from_history runs on the event-loop thread (cold-slot
-            # resolution in api_send_message). update_metadata enters _locked
-            # (flock + os.close), a blocking-on-loop-prohibited op, so backfill the
-            # tab_id off the loop rather than on it.
-            update_metadata_off_loop(
-                state.conversation_log, history_key, {"tab_id": tab_id}
-            )
+            needs_tab_id_backfill = True
+        else:
+            needs_tab_id_backfill = False
         slot._tab_id = tab_id
         # Use read_messages_chained (not read_messages) so the loaded window walks
         # the tab_id ancestry across forks, matching restore_recent_sessions.
@@ -501,6 +627,28 @@ def _rehydrate_slot_from_history(
             if _prefetched_messages is not None
             else state.conversation_log.read_messages_chained(history_key)
         )
+        if needs_tab_id_backfill:
+            # Persist the freshly-minted tab_id AFTER reading the transcript above,
+            # never before. update_metadata_off_loop dispatches an os.replace() of
+            # THIS session file to a worker thread; scheduling it before the read
+            # let that replace race the loop-thread transcript read of the very
+            # same file. On Windows a concurrent replace makes the reader's open()
+            # fail with a sharing violation (PermissionError, an OSError subclass),
+            # and the on-loop read retry cannot pause (a loop sleep would starve the
+            # LoopStallWatchdog heartbeat), so the immediate retries expire while the
+            # replace is still in flight, _read_messages re-raises, and the
+            # except-BaseException arm below rolls the whole tab back — the
+            # intermittent `restored == N-1` open-tabs drop on restart
+            # (test_restore_open_slots_async_yields_between_tabs, Windows shard).
+            # Reading first removes the self-inflicted race: the file is quiescent
+            # for the read, and the backfill lands once nothing is reading it. The
+            # id is freshly minted with no on-disk siblings, so read_messages_chained
+            # returns the identical window whether it is written before or after.
+            # Kept off the loop because update_metadata enters _locked (flock +
+            # os.close), a blocking-on-loop-prohibited op.
+            update_metadata_off_loop(
+                state.conversation_log, history_key, {"tab_id": tab_id}
+            )
         # Only the recent window is loaded into memory; older on-disk lines become
         # the FROZEN PREFIX that saves never rewrite. _disk_older_count must
         # therefore count those older lines so the save model preserves them.
@@ -718,15 +866,23 @@ def _restore_recent_sessions_steps(
         if not has_folder and not has_pin:
             if cutoff is not None and s.get("modified", 0) < cutoff:
                 continue
-        slot = state.get_or_create_slot(slot_name, app=meta.get("app", ""))
+        slot = state.get_or_create_slot(
+            slot_name,
+            app=meta.get("app", ""),
+            # No channel_origin here: this loop `continue`s above for every
+            # non-dashboard key, so a channel-born session never reaches it --
+            # ``channel_slot_reconciler`` owns surfacing those.
+        )
         # Titles can be LLM-generated (auto-title) and are surfaced on the
         # dashboard — apply the same redaction as assistant content. Matches
         # the treatment in _rehydrate_slot_from_history above.
         raw_title = s.get("title", slot_name)
-        raw_title, _ = redact_exfiltration_urls(raw_title)
-        raw_title, _ = redact_credentials(raw_title)
-        slot.title = raw_title
-        slot._titled = bool(s.get("title"))
+        _rehydrate_slot_title(
+            slot,
+            raw_title,
+            titled=bool(s.get("title")),
+            metadata=meta,
+        )
         if meta.get("created_at"):
             slot.created_at = meta["created_at"]
         if meta.get("agent"):
@@ -758,6 +914,8 @@ def _restore_recent_sessions_steps(
             slot.mode = meta["mode"]
         if meta.get("folder_id"):
             slot.folder_id = meta["folder_id"]
+        if meta.get("channel_folder_filed"):
+            slot._channel_folder_filed = True
         if meta.get("app"):
             slot._app = meta["app"]
         # Same tamper gate as _rehydrate_slot_from_history: re-validate the
@@ -775,6 +933,25 @@ def _restore_recent_sessions_steps(
         raw_tags = meta.get("tags")
         if isinstance(raw_tags, list):
             slot.tags = [str(t) for t in raw_tags if isinstance(t, str) and t]
+            # Prune ids missing from the vocabulary: tag deletion commits the
+            # vocab write first (crash-atomic), so a crash mid-delete can
+            # leave dangling ids on the persisted slot line. load_tags() runs
+            # before any slot restore, so state._tags is authoritative here.
+            # FAIL-OPEN only when the vocabulary is UNKNOWN (tags.json parse
+            # or I/O failure): pruning then would wipe EVERY assignment and
+            # the next save persists the loss. A legitimately-empty vocabulary
+            # (user deleted the last tag) IS authoritative and must prune —
+            # otherwise a crash mid-delete resurrects the dangling id forever.
+            if getattr(state, "_tags_authoritative", True):
+                known = {t.get("id") for t in state._tags}
+                slot.tags = [t for t in slot.tags if t in known]
+        if meta.get("auto_tagged"):
+            slot._auto_tagged = True
+        if meta.get("human_seen"):
+            # Attendance survives the restart, so an app-owned tab a person has
+            # been working in keeps the full approval window instead of silently
+            # dropping to the unattended deny-fast (state._ChatSlot.unattended).
+            slot._human_seen = True
         mm = meta.get("memory_mode", "persistent")
         slot.memory_mode = mm
         if mm != "persistent":
@@ -926,7 +1103,143 @@ def _archive_dropped_lines(
     _archive_lines(history_key, dropped, reason="compact", base=base)
 
 
+# Memoisation for :func:`_build_message_entry`. ``_save_slot_to_history``
+# re-serializes the WHOLE in-memory window on every flush (see the comment inside
+# the uncached builder), so each save re-runs redaction over every message in the
+# window -- including the overwhelming majority that have not changed since the
+# previous flush. Redaction is the expensive part: two passes over the content,
+# the same two passes again over EACH variant, plus a meta pass.
+#
+# The key is a content hash of the WHOLE message rather than an identity or a
+# field subset, which is what makes invalidation automatic and total: the slot
+# mutates messages in place (a stop event resolving, a file-change chip landing,
+# a banner completing), and any such edit changes the digest, so the next call
+# misses and recomputes instead of serving a stale entry. There is deliberately
+# no explicit invalidation hook to forget.
+#
+# Bound sizing: a save re-serializes one slot's entire window, so the live
+# working set is roughly ``active_slots x window_size`` and the failure mode past
+# the bound is a cliff rather than a slope -- each save walks its window in
+# order, so with several slots taking turns the LRU evicts each window just
+# before its next save and the hit rate collapses to zero instead of degrading.
+# The entry bound is therefore chosen to hold several concurrent slot windows.
+#
+# The flush site skips the cache for a window longer than the entry bound, which
+# closes that cliff for ONE oversized window and nothing more. Several slots
+# whose COMBINED windows exceed the bound each stay under it individually, so
+# they take the cached path and hit the same zero-hit cliff unguarded. That is
+# accepted rather than fixed: detecting it needs a live view across slots, while
+# the cost of being wrong is only the key derivation on a miss.
+#
+# The entry count alone does NOT bound memory, because an entry is as large as
+# its message: a cache full of megabyte-sized messages would retain gigabytes.
+# That retention outlives the slot, since the entry holds the SAME content string
+# object as the message rather than a copy, so a closed slot's window can be
+# freed while the cache keeps its content alive. Hence two further bounds: a
+# per-entry ceiling above which an entry is computed but never stored (so one
+# huge message cannot evict the whole cache), and a total-byte ceiling evicted
+# alongside the entry count. Worst-case retention is the lesser of
+# ``_ENTRY_CACHE_MAX x _ENTRY_MAX_CACHEABLE_BYTES`` and ``_ENTRY_CACHE_MAX_BYTES``.
+#
+# Size is measured as the length of the key payload, which the front door has
+# already built for hashing, so it costs nothing extra. It measures the input
+# rather than the built entry, but the entry is derived from it and the two track
+# each other within a small factor -- accurate enough for a memory ceiling.
+#
+# Two properties work in our favour: entries are content-keyed, so two slots
+# holding identical message content share one entry; and a cached ``None`` (a
+# transient role) is a legitimate value, so membership -- not truthiness -- is
+# what distinguishes a hit from a miss.
+_ENTRY_CACHE_MAX = 4096
+_ENTRY_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_ENTRY_MAX_CACHEABLE_BYTES = 256 * 1024
+_entry_cache_lock = threading.Lock()
+_entry_cache: OrderedDict[str, tuple[dict | None, int]] = OrderedDict()
+_entry_cache_bytes = 0
+
+
+def _approx_window_payload_bytes(window: list[dict]) -> int:
+    """Cheap LOWER BOUND on what a window would serialize to, in bytes.
+
+    Sums only string ``content`` on each message and on its variants, ignoring
+    keys, meta and JSON escaping, and never serializes anything -- serializing to
+    measure would pay the very cost the caller is deciding whether to avoid.
+
+    Being a lower bound is what makes it safe to gate on: an estimate above the
+    ceiling proves the real payload is above it too, so the bypass it triggers is
+    always justified, while an underestimate merely forgoes the bypass and pays
+    the hashing cost. Either way correctness is unaffected -- only throughput.
+    """
+    total = 0
+    for m in window:
+        content = m.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        variants = m.get("variants")
+        if isinstance(variants, list):
+            for v in variants:
+                if isinstance(v, dict):
+                    vc = v.get("content")
+                    if isinstance(vc, str):
+                        total += len(vc)
+    return total
+
+
 def _build_message_entry(m: dict) -> dict | None:
+    """Memoised front door to :func:`_build_message_entry_uncached`.
+
+    The cached value is the POST-redaction entry, never the raw input, so a hit
+    can never hand a caller unredacted bytes -- that property is the one whose
+    failure would be a security regression rather than a missed optimisation.
+
+    The returned dict is the cached object itself, not a copy: every current
+    caller treats the entry as read-only (it is serialized with ``json.dumps``
+    and read for ordering keys), and copying on every hit would give back the
+    cost the cache exists to avoid. A future caller that mutates an entry in
+    place would need to copy first.
+    """
+    global _entry_cache_bytes
+    try:
+        payload = json.dumps(m, sort_keys=True, default=str)
+    except Exception:
+        # An unserializable message must still persist; fall back to computing it.
+        return _build_message_entry_uncached(m)
+    key = hashlib.sha256(payload.encode()).hexdigest()
+    size = len(payload)
+    with _entry_cache_lock:
+        if key in _entry_cache:
+            _entry_cache.move_to_end(key)
+            return _entry_cache[key][0]
+    entry = _build_message_entry_uncached(m)
+    if size > _ENTRY_MAX_CACHEABLE_BYTES:
+        return entry
+    # Refuse to STORE a pairing whose key and entry may describe different states.
+    # The flush thread shares message dicts with the event loop, so a variant
+    # switch landing between the two reads above would file the new entry under
+    # the old state's key; because a switch restores content AND ts from the
+    # stored variant, switching back reproduces that key exactly and would serve
+    # the wrong variant. Re-reading m here costs one dump on a miss only.
+    try:
+        if json.dumps(m, sort_keys=True, default=str) != payload:
+            return entry
+    except Exception:
+        return entry
+    with _entry_cache_lock:
+        previous = _entry_cache.pop(key, None)
+        if previous is not None:
+            _entry_cache_bytes -= previous[1]
+        _entry_cache[key] = (entry, size)
+        _entry_cache_bytes += size
+        while _entry_cache and (
+            len(_entry_cache) > _ENTRY_CACHE_MAX
+            or _entry_cache_bytes > _ENTRY_CACHE_MAX_BYTES
+        ):
+            _, (_evicted_entry, evicted_size) = _entry_cache.popitem(last=False)
+            _entry_cache_bytes -= evicted_size
+    return entry
+
+
+def _build_message_entry_uncached(m: dict) -> dict | None:
     """Build one persisted JSONL message dict from an in-memory slot message.
 
     Returns None for transient roles that are never persisted. Applies the
@@ -1400,7 +1713,7 @@ def _save_slot_to_history(
         and not rewrite
     ):
         return
-    history_key = effective_session_key(slot)
+    history_key = slot_history_key(slot)
     try:
         # Hold the SAME per-session cross-process lock that ``append`` /
         # ``append_off_loop`` / rotate / rewrite / metadata mutations take, across
@@ -1426,15 +1739,16 @@ def _save_slot_to_history(
                 "last_consolidated": existing_meta.get("last_consolidated", 0),
             }
             # Preserve history-layer-owned metadata this dashboard save does NOT
-            # manage. ``rotation_generation`` (bumped by ``_maybe_rotate``, with
-            # its ``rotated_at`` stamp) lets a concurrent consolidation detect a
-            # rotation and skip applying a stale offset. Reconstructing the
-            # metadata subset here would drop it, resetting the generation to 0
-            # and re-opening the exact consolidation race the rotation-generation
-            # fix closed. Carry these forward verbatim (absent field == no-op).
-            for _meta_key in ("rotation_generation", "rotated_at", "compacted_at"):
-                if _meta_key in existing_meta:
-                    meta_line[_meta_key] = existing_meta[_meta_key]
+            # manage. The save is authoritative only for the slot fields it writes
+            # (SLOT_OWNED_META_KEYS), where an absent field means "cleared"; every
+            # other key is another layer's durable state, and reconstructing the
+            # subset deletes it. That is not hypothetical: it erased the rotation
+            # generation (re-opening the consolidation race the generation check
+            # closed) and then the consolidation retry accounting (resetting the
+            # backoff so billed retries resumed). Carrying unowned keys through by
+            # default closes the class instead of enumerating one more field to
+            # rescue. Applied after the slot fields below so an inherited value can
+            # never shadow the slot's own state.
             if closed:
                 meta_line["closed"] = True
                 # Epoch stamp of WHEN the tab was closed. The channel-slot
@@ -1456,6 +1770,17 @@ def _save_slot_to_history(
             meta_line["memory_mode"] = slot.memory_mode
             if slot.title and slot.title != slot.key:
                 meta_line["title"] = slot.title
+                # Persist the title's provenance next to it (mirrors
+                # _persist_title): without this, the canonical full save would
+                # strip the field and rehydration would conservatively
+                # re-classify an auto title as "user" after restart —
+                # permanently locking the background refresh out.
+                _origin = getattr(slot, "_title_origin", "")
+                if _origin:
+                    meta_line["title_origin"] = _origin
+                _mark = getattr(slot, "_title_refresh_mark", 0)
+                if _mark:
+                    meta_line["title_refresh_mark"] = _mark
             if slot.agent:
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model
@@ -1469,6 +1794,15 @@ def _save_slot_to_history(
                 meta_line["project"] = slot.project
             if slot.folder_id:
                 meta_line["folder_id"] = slot.folder_id
+            if slot._channel_folder_filed or existing_meta.get("channel_folder_filed"):
+                # Sticky, and carried forward from disk rather than only from the
+                # slot: this function rebuilds the metadata line from scratch, so
+                # a restore path that failed to set the in-memory flag would
+                # otherwise ERASE the marker on the next save and the
+                # conversation would be re-filed. Preserving the on-disk value
+                # makes that whole class of omission harmless — same reason
+                # rotation_generation is carried forward above.
+                meta_line["channel_folder_filed"] = True
             if slot._app:
                 meta_line["app"] = slot._app
             # Artifact companion binding — persisted so a bound
@@ -1484,6 +1818,21 @@ def _save_slot_to_history(
                 meta_line["color_theme"] = slot.color_theme
             if slot.tags:
                 meta_line["tags"] = list(slot.tags)
+            if getattr(slot, "_auto_tagged", False):
+                # Once-flag for project auto-tagging: without it a restart
+                # re-runs maybe_auto_tag and silently re-adds a tag the user
+                # removed (see chat_auto_tag.maybe_auto_tag).
+                meta_line["auto_tagged"] = True
+            if getattr(slot, "_human_seen", False):
+                # Once-flag for attendance (state._ChatSlot.unattended). Without
+                # it a restart drops an app-owned tab a person is working in from
+                # the 2h approval window to the 180s deny-fast — a gateway
+                # restart happens on every upgrade and is not evidence the person
+                # left. Monotonic like auto_tagged above, so it is written when
+                # set and never cleared; both are therefore absent from
+                # SLOT_OWNED_META_KEYS and survive via carry_unowned_metadata
+                # even on a save by a slot that has not learned the flag yet.
+                meta_line["human_seen"] = True
             if slot.forked_from is not None:
                 meta_line["forked_from"] = slot.forked_from
             if slot.linked_session_key:
@@ -1493,9 +1842,47 @@ def _save_slot_to_history(
                 # without persisting it the slot rehydrates unbound and
                 # silently reverts to a dashboard-only copy of the thread.
                 meta_line["linked_session_key"] = slot.linked_session_key
+            if getattr(slot, "channel_origin", False):
+                # Durable provenance. Without it the restore has only the slot
+                # name to go on, and a name is not evidence -- persisting the
+                # flag is what lets a later boot know this tab was adopted from
+                # a channel conversation rather than merely named like one.
+                meta_line["channel_origin"] = True
             tab_id = getattr(slot, "_tab_id", None) or existing_meta.get("tab_id")
             if tab_id:
                 meta_line["tab_id"] = tab_id
+            # ``rewrite`` is the structural signal for "this save EDITS the
+            # conversation": the regenerate / rewind / fork paths pass an explicit
+            # window snapshot (or leave ``_pending_rewrite`` set), while a steady
+            # flush re-serializes the same window it already persisted.
+            #
+            # An edit swaps the live window's tail for content no consolidation
+            # turn has read, so it advances the rotation generation — the
+            # session's content-identity counter. That single write covers both
+            # halves of the invariant that a consolidation marker and its retry
+            # budget are bound to the content they measured:
+            #
+            # * An attempt already IN FLIGHT snapshotted the pre-edit generation,
+            #   so its ``mark_consolidated`` write is rejected as stale
+            #   (``ConversationLog.mark_consolidated``) instead of marking the
+            #   REPLACEMENT tail consolidated without ever extracting it. A
+            #   regenerate lands at the same message count, the same generation
+            #   and the same marker, so nothing else about the save distinguishes
+            #   it and the completion write would otherwise apply.
+            # * A charged (or capped) budget stamped against the pre-edit
+            #   generation stops describing the current span, so the replacement
+            #   content earns a fresh budget rather than inheriting an exhausted
+            #   one (``ConversationLog._attempts_describe_current_span``).
+            #
+            # This is the same release a rotation gets, and deliberately the same
+            # in both directions: the armed backoff deadline survives, so a user
+            # repeatedly regenerating a reply cannot re-bill a failing
+            # consolidation turn on each gesture.
+            if rewrite:
+                meta_line["rotation_generation"] = (
+                    int(existing_meta.get("rotation_generation", 0) or 0) + 1
+                )
+            carry_unowned_metadata(meta_line, existing_meta, SLOT_OWNED_META_KEYS)
             meta_str = json.dumps(meta_line) + "\n"
 
             # ── Frozen prefix (never rewritten) + freshly serialized window ──
@@ -1507,8 +1894,23 @@ def _save_slot_to_history(
             # foreign lines so a concurrent cross-process append (landed between
             # this save's pre-lock ``window`` snapshot and the lock) is preserved
             # rather than clobbered by the meta+frozen+window replace.
+            # A window longer than the entry cache cannot hit it: this save walks
+            # the window in order, so the LRU evicts each entry before the next
+            # save reaches it again. Building such a window through the cache
+            # would pay the key-hashing cost for a guaranteed 0% hit rate, so the
+            # largest windows -- where flush cost hurts most -- go uncached. A
+            # window whose payload exceeds the BYTE ceiling self-evicts the same
+            # way at a far smaller message count, so it is gated too, on a cheap
+            # lower-bound estimate rather than on a measurement that would itself
+            # cost what the bypass saves.
+            build_entry = (
+                _build_message_entry_uncached
+                if len(window) > _ENTRY_CACHE_MAX
+                or _approx_window_payload_bytes(window) > _ENTRY_CACHE_MAX_BYTES
+                else _build_message_entry
+            )
             window_entries = [
-                e for m in window if (e := _build_message_entry(m)) is not None
+                e for m in window if (e := build_entry(m)) is not None
             ]
             window_lines = [json.dumps(e) + "\n" for e in window_entries]
             frozen_prefix, foreign_lines, dedup_dropped = (
@@ -1576,7 +1978,7 @@ def _save_slot_to_history(
                     )
 
             _preserve_mtime: float | None = None
-            if closed and slot.linked_session_key:
+            if closed and (slot.linked_session_key or is_channel_session_key(history_key)):
                 # This slot shares its transcript with a channel, and the
                 # reconciler decides whether a close still stands by comparing
                 # the file's mtime against ``closed_at``: activity newer than the
@@ -1585,6 +1987,16 @@ def _save_slot_to_history(
                 # past ``closed_at`` and make the close outrun itself — the tab
                 # would reopen on the next pass. Restore the pre-close mtime so
                 # only a genuine channel append can outrun the close.
+                #
+                # Gated on the TRANSCRIPT, not on ``linked_session_key``: an
+                # UNBOUND channel tab (the session map could not resolve its
+                # stem) writes this very same shared file, so testing the binding
+                # left exactly that tab unprotected — its close bumped the
+                # channel file's mtime and ``_close_stands`` then rejected the
+                # close, resurfacing the tab on the next reconcile. Keeping the
+                # ``linked_session_key`` arm makes this strictly additive for
+                # cron- and workflow-linked slots, whose keys are not channel
+                # keys but which also share a transcript.
                 try:
                     _preserve_mtime = path.stat().st_mtime
                 except OSError:

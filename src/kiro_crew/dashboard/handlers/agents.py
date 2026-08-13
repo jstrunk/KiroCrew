@@ -16,9 +16,11 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
+from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.agent_discovery import (
     clear_list_agents_cache,
     list_agents,
+    project_agent_names,
     spec_model,
     spec_str,
 )
@@ -36,6 +38,7 @@ from kiro_crew.config.loader import (
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
 from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_ordered
 from kiro_crew.dashboard.chat_utils import (
+    _BLOCKED_SLASH_COMMANDS,
     _SLASH_COMMANDS,
     SLASH_COMMAND_DESCRIPTIONS,
     _history_key_for,
@@ -44,6 +47,8 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.handlers._shared import (
     MAX_AGENT_SKILLS,
     _capability_manager,
+    _read_session_key,
+    active_project_dir,
     agent_skill_keys,
     agent_skill_views,
     apply_skill_mapping,
@@ -51,8 +56,14 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.executors import discovery_executor, maintenance_executor
-from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
+from kiro_crew.sandbox import (
+    SandboxUnavailableError,
+    cgroup_scope_argv,
+    configured_sandbox_mode,
+    create_subprocess_limited,
+    wrap_argv,
+)
 
 _MODEL_LIST_STDERR_TAIL_CHARS = 1000
 
@@ -221,6 +232,40 @@ async def api_default_agent(request: web.Request) -> web.Response:
         except Exception:
             return web.json_response({"error": "invalid JSON"}, status=400)
         name = body.get("agent", "")
+        # Reject non-strings before any use: a JSON list/object here would make
+        # the membership check below raise (unhashable) into a 500, and a
+        # non-string must never reach the config write either.
+        if not isinstance(name, str):
+            return web.json_response(
+                {"error": "agent must be a string", "code": "invalid_agent_type"}, status=400
+            )
+        # Only a config alias may become the default: the default is resolved
+        # from cfg.agents on every dispatch, so persisting any other name (a
+        # project-scope discovery, an app agent, a typo) writes a default that
+        # silently resolves to something else. Guarded server-side so EVERY
+        # caller is covered, not just whichever picker currently hides the
+        # action — project-scope rows carry scope="project" in /api/agents
+        # precisely so UIs can disable this, but the config file is the last
+        # line of defense.
+        try:
+            # Config load is stat/read/validation filesystem work; off-loop so
+            # slow storage cannot freeze chat and the liveness heartbeat.
+            known = set((await asyncio.to_thread(KiroCrewConfig.load)).agents.keys())
+        except Exception:
+            known = set()
+        # Fail CLOSED: an unreadable config yields an empty `known`, and that is
+        # precisely when validation is impossible — a non-empty name must be
+        # rejected, not waved through. A valid config always has at least one
+        # agent (load() guarantees default_agent exists in agents), so an empty
+        # set never rejects a legitimate alias.
+        if name and name not in known:
+            return web.json_response(
+                {
+                    "error": f"agent {name!r} is not a configured agent alias",
+                    "code": "default_agent_not_alias",
+                },
+                status=400,
+            )
         path = _h.config_path()
         try:
             data = read_config_for_update(path)
@@ -597,8 +642,17 @@ async def api_agents_installed(request: web.Request) -> web.Response:
     """GET /api/agents/installed — list all installed kiro-cli agents.
 
     kirocrew is always first; kirocrew-lite is excluded.
-    """
 
+    Deliberately GLOBAL-only (no project scope): every frontend consumer of this
+    endpoint is an agent CRUD/editor surface (Agents page, template editor) whose
+    actions persist into the global configuration — "Set as default" writes the
+    selected name into ``cfg.agents``. A project-scope row here would let that
+    action persist a name that exists only inside one checkout, producing a
+    default agent the config cannot resolve. Project-scope discovery instead
+    reaches the surfaces that DISPATCH agents: per-turn resolution
+    (``resolve_agent_bindings(..., project_dir=...)``), spawn validation, and
+    Slack — see ``agent_discovery.project_agent_names``.
+    """
     # list_agents() does glob + per-file resolve(strict=True) + read_bytes +
     # json.loads over ~/.kiro/agents — blocking filesystem work that, on a large
     # agents dir (network home, many project-registry agents), can stall the
@@ -666,6 +720,81 @@ def _advertised_cc_models(request: web.Request) -> list[dict]:
                 if m.get("modelId")
             ]
     return []
+
+
+def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
+    """Narrow the ``--list-models`` catalog to what a live session advertises.
+
+    ``kiro chat --list-models`` is a CATALOG, not an entitlement: it returns the
+    same rows whatever the account's tier, so after a downgrade the picker kept
+    offering (and kept SHOWING as selected) a model no turn can run. The
+    per-session ``session/new`` ``availableModels`` list is the tier-aware one —
+    the same signal ``model_is_unusable`` pre-flights against before the wire —
+    so when a live session has one, it wins here too. Same rule #1549 applied to
+    the claude_code branch in :func:`_cc_models`: advertised is authoritative
+    when present.
+
+    The keep/drop decision delegates to ``model_is_unusable`` rather than
+    comparing ids here, so the picker cannot disagree with the wire about what
+    "this account can run" means. A local comparison would be a second spelling
+    of that question — the exact drift that predicate exists to prevent — and any
+    difference in how the two fold spelling variants shows up as a row the picker
+    offers and the wire then withholds.
+
+    The ``auto`` sentinel is never filtered: it means "inherit whatever the
+    session already resolved", so it stays selectable even on a backend that does
+    not advertise it by name.
+
+    Fails open in every unknowable case — no live session, a backend that
+    advertises nothing, or an advertised set that does not intersect the catalog
+    at all (a namespace mismatch rather than an entitlement, e.g. the claude
+    backend's bare ids). Filtering on any of those would empty the picker, which
+    is worse than listing one model too many.
+    """
+    try:
+        state: DashboardState = request.app["state"]
+        providers = state.sessions.active_providers()
+    except (KeyError, AttributeError):
+        return models
+    advertised: list[str] = []
+    # Newest session first. `active_providers()` walks a dict of live sessions, so
+    # forward order is creation order — and a session that started BEFORE a plan
+    # change still holds the advertised list it captured at its own session/new.
+    # Reading the oldest one would narrow the catalog to pre-downgrade
+    # entitlements, i.e. keep offering exactly the models this narrowing exists to
+    # hide. The most recently started session carries the most recent snapshot.
+    for provider in reversed(providers):
+        getter = getattr(provider, "available_models", None)
+        if not callable(getter):
+            continue
+        try:
+            ids = advertised_model_ids(getter())
+        except Exception:
+            continue
+        if ids:
+            advertised = ids
+            break
+    if not advertised:
+        return models
+    advertises_auto = any(_normalize_model_key(i) == "auto" for i in advertised)
+    kept = [
+        m
+        for m in models
+        if _normalize_model_key(m.get("model_name", "")) == "auto"
+        or not model_is_unusable(m.get("model_name", ""), advertised)
+    ]
+    # Tell "not comparable" apart from "entitled to almost nothing". A backend
+    # that advertises `auto` shares a namespace with the catalog by definition, so
+    # `auto` alone is a real answer — the most restricted tier there is — and must
+    # narrow the picker to it. Only when nothing at all lines up, `auto` included,
+    # is this a namespace mismatch (bare vs prefixed provider ids) where showing
+    # the whole catalog beats emptying the picker. `auto` is always kept, so it can
+    # never serve as the evidence that the two sides are comparable.
+    if not advertises_auto and not any(
+        _normalize_model_key(m.get("model_name", "")) != "auto" for m in kept
+    ):
+        return models
+    return kept
 
 
 def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]:
@@ -776,6 +905,26 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     return merged
 
 
+def _wrap_list_models_argv(argv: list[str]) -> tuple[list[str], str | None]:
+    """Sandbox-wrap the ``--list-models`` argv at the configured tier.
+
+    Runs in an executor, never on the loop: :func:`configured_sandbox_mode` stats
+    (and on a cache miss re-reads and revalidates) ``config.json``, and
+    ``wrap_argv`` -> ``detect_backend`` can cold-probe the sandbox backend with a
+    synchronous ``subprocess.run(..., timeout=5)``. Resolving the mode here rather
+    than passing it in keeps BOTH blocking reads in the worker thread.
+
+    ``is_kiro_cli=True`` is explicit because ``_spawns_kiro_cli``'s basename test
+    only matches a literal ``kiro-cli``: a Windows ``kiro-cli.exe``, a wrapper
+    shim, or a ``KIROCREW_KIRO_BIN`` pointing at a nonstandard launch path all
+    read as "not kiro-cli". On macOS with ``agent.sandbox="off"`` that
+    misclassification skips the delegation branch — and with it the credential-env
+    scrub — so the child would inherit the sensitive environment. Both ACP spawn
+    paths pass this flag for the same reason.
+    """
+    return wrap_argv(argv, mode=configured_sandbox_mode(), is_kiro_cli=True)
+
+
 async def api_models(request: web.Request) -> web.Response:
     """GET /api/models — list available models from the live kiro-cli ACP session."""
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
@@ -809,7 +958,29 @@ async def api_models(request: web.Request) -> web.Response:
         # Note: AcpClient._spawn() is for interactive ACP sessions (stdin/stdout
         # pipes); this is a one-shot read-only command, so we replicate the
         # sandbox setup directly.  See the security-controls rule.
-        argv, cleanup = wrap_argv(argv)
+        #
+        # The configured tier is passed EXPLICITLY rather than left to
+        # wrap_argv's "auto" parameter default, so this endpoint can never ask
+        # for stricter isolation than the chat spawn of the same binary. It
+        # matters wherever the operator set agent.sandbox="off" (deferring
+        # isolation to kiro-cli's own internal sandbox) on a host with no backend
+        # — any Windows host, macOS >= 26: chat runs, while the default-mode wrap
+        # here fail-closed and answered 503 on every 8s poll. The frontend reads
+        # that as "degraded" and serves its auto-only fallback list, so the picker
+        # showed exactly one entry. Same fix, same reason as the `_bg` session in
+        # session.py.
+        #
+        # OFF the loop: `configured_sandbox_mode()` stats (and on a cache miss
+        # re-reads + revalidates) config.json, and `wrap_argv` -> `detect_backend`
+        # can cold-probe the backend with a synchronous
+        # `subprocess.run(..., timeout=5)`. This endpoint is polled every 8s while
+        # the model list is degraded, so leaving either on the loop stalls chat,
+        # cron and the liveness heartbeat on exactly the host where the probe is
+        # slowest. Both reads run in the worker, so the mode is resolved there
+        # too rather than passed in.
+        argv, cleanup = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _wrap_list_models_argv, argv
+        )
         argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
         try:
             env = {**os.environ}
@@ -894,7 +1065,33 @@ async def api_models(request: web.Request) -> web.Response:
                 maintenance_executor(), model_registry.persist_kiro_windows
             )
         models = [m for m in models if not is_deprecated_model(m.get("model_name", ""))]
+        models = _entitled_kiro_models(request, models)
         return web.json_response(models)
+    except SandboxUnavailableError as exc:
+        # Narrower than the generic clause below, and BEFORE it: this is the one
+        # degraded cause that no amount of retrying fixes, so it must not be
+        # reported as an anonymous "model list unavailable". Reached only when the
+        # tier resolved to "auto" (the shipped default) on a host with no
+        # backend, where a configured "off" passes through
+        # configured_sandbox_mode() above and never lands here.
+        #
+        # Still a 503: the client contract for "degraded, keep the last-good list
+        # and poll" is what keeps the picker from caching an empty result, and a
+        # 4xx here would make the frontend treat a host-capability problem as a
+        # bad request. The `code` is what lets the UI tell this apart from a
+        # timeout, and the log carries the sandbox layer's own remedy text (which
+        # names the agent.sandbox_allow_unsandboxed_exec opt-in).
+        logger.warning(
+            "api_models: sandbox refused the --list-models spawn (kind=%s, detail=%s); "
+            "returning 503. Retrying will not clear this — %s",
+            exc.kind,
+            exc.detail,
+            exc,
+        )
+        return web.json_response(
+            {"error": "model list unavailable", "code": "model_list_sandbox_unavailable"},
+            status=503,
+        )
     except Exception:
         # Spawn failure, JSON parse error, etc. — degraded, not "zero models".
         # 503 so the client retries instead of caching an empty picker.
@@ -951,14 +1148,19 @@ async def api_slash_commands(request: web.Request) -> web.Response:
         result = [
             {"name": f"/{c}", "description": SLASH_COMMAND_DESCRIPTIONS.get(f"/{c}", "")}
             for c in cc_commands
+            if f"/{c}" not in _BLOCKED_SLASH_COMMANDS
         ]
         result.append({"name": "/side", "description": SLASH_COMMAND_DESCRIPTIONS.get("/side", "")})
         return web.json_response(result)
 
+    # Blocked commands stay in _SLASH_COMMANDS (typing one still gets the
+    # explicit "not available in the dashboard" rejection in chat_runner), but
+    # the suggestion payload must not advertise them: a menu entry that only
+    # ever produces a warning is an inert affordance.
     return web.json_response(
         [
             {"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")}
-            for c in sorted(_SLASH_COMMANDS)
+            for c in sorted(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
         ]
     )
 
@@ -993,9 +1195,76 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         "kirocrew-lite.json",
                     ):
                         return web.json_response({"error": "cannot delete kirocrew"}, status=400)
-                    f.unlink()
+                    # The dashboard withholds delete for a template that is the
+                    # kiro-cli fallback or is bound to a crew, but a client-side
+                    # check cannot be race-free: its view of the config is a
+                    # cached snapshot, so a crew bound (or the fallback moved)
+                    # between render and click still reaches this handler. Only
+                    # a check that reads config UNDER THE SAME LOCK the writers
+                    # take makes the invariant hold, so this is the authority
+                    # and the UI is now just the early, friendlier signal.
+                    async with _get_config_lock():
+                        # Off-thread: this runs while the config lock is HELD, so a
+                        # synchronous read stalls the event loop AND queues every
+                        # other config writer behind a disk read. `to_thread` is the
+                        # idiom already used for this in core.py / files.py.
+                        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+                        # Every identifier this file answers to. The match above
+                        # accepts EITHER the JSON's own "name" or the filename
+                        # stem, so a request naming one leaves the other out of
+                        # `name` -- and config may well record the one omitted.
+                        #
+                        # `declared` goes through `spec_str`, the helper this file
+                        # already uses on the GET path: `~/.kiro/agents` is a
+                        # SHARED directory and a structured `name` (an ACP-style
+                        # `{"id": ...}`) is observed in the wild. It is reachable
+                        # here via the `f.stem == name` arm of the match, and an
+                        # unhashable set member turns this into a TypeError --
+                        # which the `except (JSONDecodeError, OSError)` below does
+                        # NOT catch, so it escapes as HTTP 500 on a delete that
+                        # should have succeeded or returned a 409.
+                        declared = spec_str(data, "name")
+                        aliases = {name, f.stem}
+                        if declared:
+                            aliases.add(declared)
+                        # Both fields are checked because the two readers disagree:
+                        # `agent.default_agent` is the kiro-cli fallback, while
+                        # top-level `default_agent` is what /api/config/default-agent
+                        # (the picker on this very page) writes. Guarding only one
+                        # leaves the other free to dangle.
+                        if aliases & {cfg.agent.default_agent, cfg.default_agent}:
+                            return web.json_response(
+                                {
+                                    "error": (
+                                        f"Cannot delete '{name}': it is the default agent used "
+                                        "when nothing names a template. Change the default first."
+                                    ),
+                                    "code": "agent_is_default",
+                                },
+                                status=409,
+                            )
+                        bound = sorted(
+                            crew
+                            for crew, crew_cfg in cfg.agents.items()
+                            if crew_cfg.kiro_agent in aliases
+                        )
+                        if bound:
+                            return web.json_response(
+                                {
+                                    "error": (
+                                        f"Cannot delete '{name}': still used by "
+                                        f"{', '.join(bound)}. Repoint or remove them first."
+                                    ),
+                                    "code": "agent_in_use",
+                                },
+                                status=409,
+                            )
+                        f.unlink()
                     clear_list_agents_cache()
-                    agent_state.prune(data.get("name") or name)
+                    # Same reason `declared` goes through `spec_str` above:
+                    # `prune` is typed `str` and a structured `name` would reach
+                    # it through the `or`.
+                    agent_state.prune(declared or name)
                     state.push_refresh("agents")
                     return web.json_response({"ok": True})
                 if request.method == "PATCH" and patch_body is not None:
@@ -1038,6 +1307,7 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 f,
                                 state,
                                 list(patch_body["skills"]),
+                                _read_session_key(request),
                             )
                             if unknown:
                                 return web.json_response(
@@ -1046,7 +1316,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 )
                         else:
                             mapped = await loop.run_in_executor(
-                                discovery_executor(), agent_skill_keys, data, f, state
+                                discovery_executor(),
+                                agent_skill_keys,
+                                data,
+                                f,
+                                state,
+                                _read_session_key(request),
                             )
                         if "model" in patch_body:
                             # Stored verbatim (canonical key); translated to a
@@ -1078,7 +1353,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                 # (kiro-cli rejects unknown fields and drops the agent). One
                 # catalog walk for both, off the event loop (filesystem-heavy).
                 keys, unmanaged_uris = await asyncio.get_running_loop().run_in_executor(
-                    discovery_executor(), agent_skill_views, data, f, state
+                    discovery_executor(),
+                    agent_skill_views,
+                    data,
+                    f,
+                    state,
+                    _read_session_key(request),
                 )
                 return web.json_response(
                     {
@@ -1137,16 +1417,44 @@ async def api_capability_mcp_registry(request: web.Request) -> web.Response:
 
 
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
-    """GET /api/agents — list all KiroCrew agent definitions, most-used first."""
+    """GET /api/agents — list all Kiro Crew agent definitions, most-used first.
+
+    Also surfaces the requesting session's project-scope agents
+    (``<project>/.kiro/agents``, resolved via ``X-Session-Key``) tagged
+    ``scope="project"`` — these dispatch from that slot because kiro-cli runs
+    with the slot's project as cwd, so the picker must offer them (#1684's
+    headline). A config alias of the same name is listed once, as the alias:
+    dispatch resolves aliases first, so the alias is what would answer.
+    """
     cfg = KiroCrewConfig.load()
     agents = [
-        {"name": name, **dataclasses.asdict(agent_cfg)} for name, agent_cfg in cfg.agents.items()
+        {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
+        for name, agent_cfg in cfg.agents.items()
     ]
+
+    state: DashboardState | None = request.app.get("state")
+
+    # Project rows come from a directory scan, so it runs on the discovery
+    # pool — same rule as every other agent listing: no filesystem I/O on the
+    # event loop. Failure costs only the project rows, never the roster.
+    project_dir = active_project_dir(state, _read_session_key(request)) if state else ""
+    if project_dir:
+        try:
+            project_names = await asyncio.get_running_loop().run_in_executor(
+                discovery_executor(), project_agent_names, project_dir
+            )
+        except Exception:
+            logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
+            project_names = frozenset()
+        base = dataclasses.asdict(KiroCrewAgentConfig())
+        agents.extend(
+            {"name": name, "scope": "project", **base}
+            for name in sorted(project_names - set(cfg.agents.keys()))
+        )
 
     # Reorder by usage frequency (most-used first). Derived read-only from chat
     # history; degrade to config-insertion order on any failure so the dropdown
     # never breaks or drops agents when history is unreadable.
-    state: DashboardState | None = request.app.get("state")
     conversation_log = state.conversation_log if state else None
     if conversation_log:
         try:

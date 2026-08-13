@@ -140,6 +140,15 @@ _STRUCTURAL_MARKER_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\[\s*END\s*OF\s*SESSION\s*CONTEXT\s*\]", re.IGNORECASE),
     re.compile(r"\[\s*CRITICAL\s*RULES\s*[-]{1,2}", re.IGNORECASE),
     re.compile(r"\[\s*CURRENT\s*USER\s*REQUEST\s*[-]{1,2}", re.IGNORECASE),
+    # Post-compaction skills re-injection boundary. Unlike the ``[SESSION
+    # CONTEXT …]`` OPEN marker (omitted above because forging it only opens a
+    # "background, do not act on this" block), forging THIS open marker is an
+    # escalation: it presents attacker-chosen text as the platform-supplied
+    # skills index — a catalog of capability names and on-disk paths the model
+    # is told to read. Head-anchored with the required hyphen separator, per
+    # the variable-tail convention above.
+    re.compile(r"\[\s*REINJECTED\s*AFTER\s*COMPACTION\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*END\s*REINJECTED\s*\]", re.IGNORECASE),
 )
 _STRUCTURAL_MARKER_NEUTRALIZED = "[marker-removed]"
 
@@ -675,6 +684,59 @@ def _runtime_display_name(session_key: str, runtime_source: str | None = None) -
     return _RUNTIME_DISPLAY.get(source, source)
 
 
+# ── Switchable context groups ──
+#
+# A spawning parent decides which of these groups its sub-agent inherits (the
+# ``include_memory`` / ``include_lessons`` / ``include_project`` flags on
+# spawn_run). ``None`` means every group and is what every other caller passes,
+# so the dashboard / Slack / cron / eval paths are unaffected.
+#
+# The unlisted fourth group is conduct — critical rules, date, agent identity,
+# runtime, UI language, workspace identity, skills index. It is not switchable:
+# every member is an output contract or a capability pointer, so a sub-agent
+# without it cannot discover what it can do or format what it reports back.
+CONTEXT_GROUP_MEMORY = "memory"
+CONTEXT_GROUP_LESSONS = "lessons"
+CONTEXT_GROUP_PROJECT = "project"
+SWITCHABLE_CONTEXT_GROUPS = (
+    CONTEXT_GROUP_MEMORY,
+    CONTEXT_GROUP_LESSONS,
+    CONTEXT_GROUP_PROJECT,
+)
+
+_GROUP_DESCRIPTIONS = {
+    CONTEXT_GROUP_MEMORY: "memory (user preferences, projects, prior sessions)",
+    CONTEXT_GROUP_LESSONS: "lessons (learned corrections, user profile)",
+    CONTEXT_GROUP_PROJECT: "project (docs pointer, steering files, project directory)",
+}
+
+
+def _group_included(groups: frozenset[str] | None, group: str) -> bool:
+    """True when *group* is in scope; ``None`` ⇒ every group."""
+    return groups is None or group in groups
+
+
+def _build_context_scope_section(groups: frozenset[str] | None) -> str:
+    """Name the groups a parent withheld, or ``""`` when nothing was withheld.
+
+    A sub-agent that silently lacks a group guesses at what it cannot see —
+    inventing user preferences is the specific failure. Naming the gap converts
+    that into an honest "not provided", which is what makes an aggressive
+    opt-out cheap to recover from.
+    """
+    if groups is None:
+        return ""
+    missing = [g for g in SWITCHABLE_CONTEXT_GROUPS if g not in groups]
+    if not missing:
+        return ""
+    return (
+        "[CONTEXT SCOPE] Your parent withheld: "
+        + "; ".join(_GROUP_DESCRIPTIONS[g] for g in missing)
+        + ".\nIf the task needs any of it, say it was not provided and ask the "
+        "parent — do not guess.\n[End of context scope]\n\n"
+    )
+
+
 def _build_docs_section() -> str:
     """Build a lightweight docs pointer for session context.
 
@@ -827,9 +889,35 @@ def _build_user_profile_section(cfg: "KiroCrewConfig") -> str:
 #: tag-shaped is dropped rather than pasted into the system prompt.
 _UI_LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$")
 
+#: The language catalogs the dashboard actually ships — a mirror of the
+#: non-dev-only entries in ``website/src/i18n/languages.ts``
+#: (``SUPPORTED_LANGUAGES``), which stays the single source of truth:
+#: ``test_context_ui_language.py`` parses that file and fails when this set
+#: drifts, so adding a language remains a frontend data change plus the one
+#: mechanical entry here that the drift test names explicitly.
+#:
+#: Membership is exact and case-sensitive because that is precisely how the
+#: frontend restores a PERSISTED choice: ``resolveLanguage()`` accepts a stored
+#: value only via ``isRestorableLanguage()`` → ``SUPPORTED_CODES.includes()``
+#: (no lowering, no primary-subtag fallback — those apply only to *browser*
+#: detection tags, which never reach this field). A stored ``zh-cn`` or
+#: ``zh-TW`` therefore degrades to auto-detect in the SPA, and the backend must
+#: reach the same verdict or the two disagree about the active language —
+#: which is exactly the bug this set exists to prevent (#1130).
+#:
+#: The dev-only ``en-XA`` pseudolocale is deliberately ABSENT: in a production
+#: build ``isRestorableLanguage()`` refuses to restore it (the chrome degrades
+#: to auto-detect), and even in a dev build steering a model to write
+#: pseudolocale prose is meaningless — the accent-and-bracket transform is
+#: generated, not a language a model can write. Treating it as non-catalog
+#: keeps injection behaviour identical across build modes.
+_UI_LANGUAGE_CATALOGS = frozenset(
+    {"en", "zh-CN", "hi", "es", "fr", "bn", "pt", "ru", "de", "ja", "ko", "it"}
+)
+
 
 def ui_language_tag(cfg: "KiroCrewConfig") -> str:
-    """Return ``dashboard.language`` as a validated BCP-47 tag, or ``""``.
+    """Return ``dashboard.language`` as a validated, *shipped* tag, or ``""``.
 
     Public because the UI language now steers more than the session-context block
     below: the dashboard's auto-titler asks a background model for a session name
@@ -838,16 +926,36 @@ def ui_language_tag(cfg: "KiroCrewConfig") -> str:
     value (see ``_UI_LANGUAGE_TAG_RE`` for why the shape is re-checked here even
     though the writer validates it).
 
-    ``""`` means "the backend does not know" — either nothing was chosen (the
-    "follow the browser" sentinel, resolved in the SPA's ``resolveLanguage()``)
-    or the stored value is not tag-shaped. Callers must treat it as unknown
-    rather than as English.
+    Beyond shape, the tag must name a catalog the dashboard actually ships
+    (``_UI_LANGUAGE_CATALOGS``). A shape-valid tag with no catalog — e.g. a
+    persisted ``ar``, or a language later removed from the frontend registry —
+    renders the chrome in English (the SPA falls back to detection), so steering
+    the agent to it would put tool-call purpose pills, and the Slack/Discord task
+    titles derived from them, in a language the UI around them cannot render.
+    Those purposes persist in session history and are inherited by forked
+    sessions, so the mismatch is durable. A non-catalog tag therefore takes the
+    identical path to ``""``: inject nothing, and the model mirrors the
+    conversation instead (#1130).
+
+    ``""`` means "the backend does not know" — nothing was chosen (the
+    "follow the browser" sentinel, resolved in the SPA's ``resolveLanguage()``),
+    the stored value is not tag-shaped, or it names no shipped catalog. Callers
+    must treat it as unknown rather than as English.
     """
     lang = cfg.dashboard.language
     if not isinstance(lang, str):
         return ""
     lang = lang.strip()
     if not lang or not _UI_LANGUAGE_TAG_RE.match(lang):
+        return ""
+    if lang not in _UI_LANGUAGE_CATALOGS:
+        # Debug, not warning: this fires on every context build for as long as
+        # the value stays persisted, and the UI itself already degraded to
+        # auto-detect — but without a line here an operator cannot distinguish
+        # "not configured" from "rejected" when the steer is absent.
+        logger.debug(
+            "dashboard.language %r names no shipped catalog; not steering", lang
+        )
         return ""
     return lang
 
@@ -882,7 +990,8 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
     silently degrade to the tag for anything missing from it anyway).
 
     Raw does not mean unchecked: the value is dropped unless it is genuinely a
-    ``str`` and tag-shaped (``_UI_LANGUAGE_TAG_RE``), so neither a malformed
+    ``str``, tag-shaped (``_UI_LANGUAGE_TAG_RE``), and names a shipped catalog
+    (``_UI_LANGUAGE_CATALOGS``), so neither a malformed
     config nor a stubbed one can paste arbitrary text into the system prompt or
     raise from a prompt builder — this runs on the session-start path, where an
     exception costs the whole turn.
@@ -1268,6 +1377,24 @@ def build_session_replay(
     return replay.translate(_MULTIBYTE_TABLE)
 
 
+def _skills_injection_plan(agent: str | None, *, is_cc: bool) -> tuple[bool, list[str]]:
+    """Whether to inject skills for *agent*, plus the glob restriction to apply.
+
+    THE single source of truth for the agent-scoping rule, shared by the
+    session-start injection and the post-compaction re-injection. Mapped agents
+    (a ``skill://`` resource in their agent JSON) are Claude-Code-only, since
+    kiro loads those natively; an unmapped agent gets skills only when it is the
+    default one.
+
+    Deliberately one function rather than the same expression written twice: a
+    hand-copied second gate is exactly what let the re-injection path ship
+    without scoping, handing a mapped agent the catalog its mapping excludes.
+    """
+    globs = agent_skill_globs(agent) if agent else []
+    is_custom = bool(agent) and agent != "kirocrew"
+    return (is_cc if globs else not is_custom), globs
+
+
 class ContextBuilder:
     """Builds context for injection into ACP prompts.
 
@@ -1370,7 +1497,46 @@ class ContextBuilder:
         # Resolved before the dashboard-only widget branch below so it reaches
         # every session. When "default", nothing is injected (zero prompt bloat).
         verbosity = getattr(cfg.dashboard, "verbosity", "default")
-        if verbosity == "concise":
+        if verbosity == "ultra":
+            verbosity_block = (
+                "## Response Verbosity: Ultra-Brief (ADHD reader)\n\n"
+                "Before responding, simulate the reader: they will read the "
+                "first 2 sentences, scan for bold text and code blocks, then "
+                "close the tab. Anything they won't reach is wasted tokens. "
+                "Structure for THAT reader, not an attentive one.\n\n"
+                "You have a strong bias toward completeness. Override it. The "
+                "reader's time costs more than your thoroughness. An answer "
+                "that's 80% complete in 2 lines beats 100% complete in 20 "
+                "lines. Missing a caveat is acceptable. Missing an edge case "
+                "is acceptable.\n\n"
+                "Rules:\n"
+                "- Open with THE answer in 1–2 sentences. Bold the single most "
+                "critical point.\n"
+                "- Supporting bullets only if the reader would be STUCK without "
+                "them. Max 3. Each bullet is one short sentence.\n"
+                "- Take a position. Name your pick. Resolve \"it depends\" "
+                "immediately.\n"
+                "- Do NOT add: tables, headers, numbered lists > 3 items, "
+                "\"common pitfalls\", \"also consider\", multi-section layouts, "
+                "or any content that fails the test: \"would the reader be "
+                "stuck without this line?\"\n"
+                "- Code blocks and commands are the answer — never cut them.\n"
+                "- Never compress for brevity: security warnings, "
+                "irreversible-action confirmations, and ordered multi-step "
+                "instructions where a dropped step causes a mistake. Those "
+                "stay complete, and code, commands, paths, identifiers and "
+                "error strings stay verbatim.\n"
+                "- When the user ASKS for something long (design doc, tutorial, "
+                "full implementation), ignore these constraints and deliver "
+                "what was asked.\n"
+                "- Required output formats are sacred and never cut: "
+                "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
+                "URLs, security warnings, and any format the rendering surface "
+                "needs. These go in their required position regardless of "
+                "brevity.\n"
+                "- Preserve the user's language."
+            )
+        elif verbosity == "concise":
             verbosity_block = (
                 "## Response Verbosity: Concise\n\n"
                 "Concise mode is on. Reduce length without losing substance:\n"
@@ -1488,6 +1654,8 @@ class ContextBuilder:
         runtime_source: str | None = None,
         exclude_last_n: int = 0,
         model_window: int | None = None,
+        context_groups: frozenset[str] | None = None,
+        query_text: str = "",
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -1519,6 +1687,15 @@ class ContextBuilder:
         duplicate what kiro already loaded; the CC backend (claude-agent-acp)
         does NOT read agent ``resources`` and still needs the explicit load.
         Everything else stays at CC/ACP parity.
+
+        *context_groups* selects which switchable groups are injected (see
+        ``SWITCHABLE_CONTEXT_GROUPS``). ``None`` — every caller except a
+        sub-agent whose parent opted a group out — injects all of them, so the
+        output is unchanged. Omitting a group skips its sections entirely rather
+        than capping them to zero: a zero cap yields a truncation marker, not an
+        empty string. A sub-agent that had a group withheld is told so by name
+        (``_build_context_scope_section``) so it reports the gap instead of
+        guessing.
 
         For custom agents (non-kirocrew), skills and workspace identity
         are skipped — the agent loads its own via kiro-cli. Memory,
@@ -1612,32 +1789,37 @@ class ContextBuilder:
         # never picked a language explicitly.
         parts.append(_build_ui_language_section(_cfg))
 
-        profile_ctx = _build_user_profile_section(_cfg)
-        if profile_ctx:
-            parts.append(profile_ctx)
+        # Name any group the parent withheld, before the sections themselves, so
+        # the sub-agent reads the scope as framing rather than discovering a gap.
+        parts.append(_build_context_scope_section(context_groups))
+
+        if _group_included(context_groups, CONTEXT_GROUP_LESSONS):
+            profile_ctx = _build_user_profile_section(_cfg)
+            if profile_ctx:
+                parts.append(profile_ctx)
 
         # Workspace identity — kirocrew-only (custom agents don't use workspaces)
         if not is_custom:
             ws_name = workspace or "default"
             ws_path = workspace_dir_for(ws_name)
+            # Deliberately does NOT advertise scope="workspace" for lessons. That
+            # scope no longer reaches a prompt (see the lessons block above), so
+            # telling the agent to use it would make it save corrections that
+            # silently never apply — the exact failure the unwire removes.
             parts.append(
                 "[WORKSPACE IDENTITY]\n"
                 f"You are operating in workspace: {ws_name}\n"
                 f"Workspace path: {ws_path}\n"
-                "A workspace is an isolated context with its own memory (preferences, "
-                "projects, daily history) and files. Different workspaces have different "
-                "memory — what you learn in one workspace stays in that workspace.\n\n"
-                "Lessons have two scopes (use learn_add tool to save):\n"
-                "- scope=global (default): shared across ALL workspaces. "
-                "Use for universal preferences (e.g. 'always use dark mode').\n"
-                f"- scope=workspace: only visible in this workspace ({ws_name}). "
-                "Use for project-specific rules "
-                "(e.g. 'this repo uses pytest-asyncio strict mode').\n"
+                "A workspace is a shared space holding your knowledge base, "
+                "preferences, project notes, daily history and files.\n\n"
+                "Lessons saved with the learn_add tool apply across all "
+                "workspaces. Use them for durable corrections and preferences, "
+                "not for one-off facts.\n"
                 "[End of workspace identity]\n\n"
             )
 
         # Documentation pointer — kirocrew-only, lightweight reference
-        if not is_custom:
+        if not is_custom and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             docs_ctx = _build_docs_section()
             if docs_ctx:
                 parts.append(docs_ctx)
@@ -1657,7 +1839,7 @@ class ContextBuilder:
         # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
         # the explicit load. Injecting on the ACP/kiro backend would duplicate
         # what kiro-cli already loaded.
-        if not is_custom and is_cc:
+        if not is_custom and is_cc and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             steering_ctx = _load_steering_resources()
             if steering_ctx:
                 if lazy_skills and len(steering_ctx) > caps.steering:
@@ -1747,7 +1929,7 @@ class ContextBuilder:
         # Temporary sessions skip all memory reads.
         mem_key = memory_store or workspace
         memory = self.get_memory_for(mem_key)
-        if not blocks_reads:
+        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
             memory_ctx = memory.get_context(
                 prefs_cap=caps.prefs,
                 projects_cap=caps.projects,
@@ -1775,9 +1957,9 @@ class ContextBuilder:
         # on-demand skills (plus always:true pinned) and leave the tail to
         # skill_search, keeping the block bounded instead of dumping every
         # skill's summary. The slice below is a defensive backstop only.
-        skill_globs = agent_skill_globs(agent) if agent else []
         # Mapped: CC only (kiro loads them natively). Unmapped: kirocrew only.
-        inject_skills = is_cc if skill_globs else not is_custom
+        # Shared with the post-compaction re-injection in build_message.
+        inject_skills, skill_globs = _skills_injection_plan(agent, is_cc=is_cc)
         if inject_skills:
             # ON: usage-ranked top-K bounded by the skills section cap.
             # OFF (budget=None): legacy full skills dump, unchanged behavior.
@@ -1790,30 +1972,35 @@ class ContextBuilder:
                     skills_ctx = skills_ctx[: caps.skills] + "\n...[skills truncated]\n"
                 parts.append(skills_ctx)
 
-        # Lessons: merge global + workspace-scoped — inject for ALL agents
-        # (skipped for temporary sessions)
+        # Lessons: global only — injected for ALL agents (skipped for temporary
+        # sessions).
+        #
+        # Workspace-scoped lessons are deliberately NOT merged here. The scope
+        # dates from when a workspace WAS a project, so "workspace lessons" meant
+        # "this project's rules"; project identity now lives on the session
+        # (``slot.project``), leaving the scope with nothing to anchor to. The
+        # merge it replaced was also unreachable in practice: it required
+        # ``workspace != "default"`` while every member resolves to ``default``,
+        # so a lesson saved with ``scope="workspace"`` reported success and then
+        # never reached a prompt. Removing the read keeps that silent failure
+        # from looking like a working feature.
+        #
+        # ``LessonStore`` and ``get_lessons_for`` are intentionally left intact:
+        # the per-member memory work re-targets the write side onto them, so the
+        # store is dormant here, not dead.
         lessons_ctx = ""
-        if not blocks_reads:
+        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_LESSONS):
             # One query, not two: get_lessons_context() already returns "" when the
             # store holds no lessons, so a separate get_lessons() existence probe
             # would be a duplicate SELECT * over the same rows (embedding blobs
             # included) whose only use is an emptiness check.
-            lessons_ctx = memory.vector_store.get_lessons_context() if memory.vector_store else ""
+            lessons_ctx = (
+                memory.vector_store.get_lessons_context(query_text=query_text, cap=caps.lessons)
+                if memory.vector_store
+                else ""
+            )
             if not lessons_ctx:
                 lessons_ctx = self.lessons.get_context()
-            # Merge workspace-scoped lessons if workspace differs from default
-            if workspace and workspace != "default":
-                ws_lessons = self.get_lessons_for(workspace)
-                ws_ctx = ws_lessons.get_context()
-                if ws_ctx and lessons_ctx:
-                    # Append workspace lessons inside the same block
-                    lessons_ctx = (
-                        lessons_ctx.rstrip().removesuffix("[End of learned corrections]").rstrip()
-                        + "\n"
-                        + ws_ctx.split("]", 1)[-1].lstrip()
-                    )
-                elif ws_ctx:
-                    lessons_ctx = ws_ctx
             if lessons_ctx:
                 if len(lessons_ctx) > caps.lessons:
                     over = len(lessons_ctx) - caps.lessons
@@ -1842,7 +2029,12 @@ class ContextBuilder:
                 parts.append(lessons_ctx)
 
         # Provenance-tagged entries from recent sessions (skipped for temporary)
-        if session_key and self.conversation_log and not blocks_reads:
+        if (
+            session_key
+            and self.conversation_log
+            and not blocks_reads
+            and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
+        ):
             provenance = self.conversation_log.recent_with_provenance(
                 session_key, exclude_last_n=exclude_last_n
             )
@@ -1904,6 +2096,8 @@ class ContextBuilder:
         model_window: int | None = None,
         user_text_range: tuple[int, int] | None = None,
         user_span_out: list[int] | None = None,
+        needs_reinjection: bool = False,
+        context_groups: frozenset[str] | None = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -1987,6 +2181,8 @@ class ContextBuilder:
                 runtime_source=runtime_source,
                 exclude_last_n=exclude_last_n,
                 model_window=model_window,
+                context_groups=context_groups,
+                query_text=text,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -2037,6 +2233,40 @@ class ContextBuilder:
                 "authoritative for this turn, even if the session originated on "
                 "another interface.\n\n"
             )
+
+        # Post-compaction re-injection: the skills index was lost when the
+        # session-start context was compacted. Re-inject it so the model can
+        # still discover skills by name/$token/skill_search.
+        #
+        # Gate and glob restriction come from the SAME helper the session-start
+        # path uses, so a mapped agent cannot receive the catalog its `skill://`
+        # mapping excludes and an unmapped custom agent cannot receive a block
+        # its session-start context never contained.
+        if not is_new_session and needs_reinjection:
+            _inject, _globs = _skills_injection_plan(agent, is_cc=is_cc)
+            if _inject:
+                _cfg = KiroCrewConfig.load()
+                lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
+                caps = _resolve_caps(model_window)
+                skills_ctx = self.skills.get_context(
+                    budget=caps.skills if lazy_skills else None,
+                    only=_globs or None,
+                )
+                if skills_ctx:
+                    if lazy_skills and len(skills_ctx) > caps.skills:
+                        skills_ctx = skills_ctx[: caps.skills] + "\n...[skills truncated]\n"
+                    # Scrub the PAYLOAD, keep the trusted wrapper outside it —
+                    # the same split the session-start path uses for this exact
+                    # content. A pinned (`always: true`) skill has its full body
+                    # emitted verbatim, and skills install from the public
+                    # registry, so a body carrying a forged `[END REINJECTED]` +
+                    # `[CURRENT USER REQUEST …]` pair would otherwise break out
+                    # of this block and read as an authoritative user request.
+                    parts.append(
+                        "[REINJECTED AFTER COMPACTION — skills index for discovery]\n"
+                        + _neutralize_structural_markers(skills_ctx)
+                        + "\n[END REINJECTED]\n\n"
+                    )
 
         # Channel history — inject on every message for group channel context
         ch_ctx: str | None = None
@@ -2149,6 +2379,8 @@ class ContextBuilder:
             logger.info("🔍 Minimal context — episodic memory skipped")
         elif blocks_reads:
             logger.info("🔍 Temporary session — episodic memory skipped")
+        elif not _group_included(context_groups, CONTEXT_GROUP_MEMORY):
+            logger.info("🔍 Memory group withheld by parent — episodic memory skipped")
         elif is_new_session:
             memory = self.get_memory_for(memory_store or workspace)
             if memory.vector_store:
@@ -2173,7 +2405,7 @@ class ContextBuilder:
 
         # Project context — inject on every message so the LLM always knows
         # the active project, even when set/changed after session start.
-        if project:
+        if project and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
             parts.append(
                 f"[PROJECT] Active project directory: {project}\n"
                 "This is the codebase you are working in for this session. "

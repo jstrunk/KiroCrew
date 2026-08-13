@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { X } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { modelListRefetchInterval } from '../providers/modelListHealth'
+import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
 import ToolCallLine from '../pages/chat/ToolCallLine'
 import type { ChatMessage } from '../types'
@@ -18,11 +18,15 @@ import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
 import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
+import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
+import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
-import { useAppSelector, useAppDispatch } from '../store'
-import { selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage } from '../store/chatSlice'
+import { useAppSelector, useAppDispatch, store } from '../store'
+import { retireStatelessQuestion, captureStatelessCard, capturePendingAskId, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage } from '../store/chatSlice'
 import { triggerRefresh } from '../store/dashboardSlice'
 import { api } from '../api/client'
+import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
+import { displayModel } from '../lib/model'
 
 
 import { i18nT } from '../i18n/t'
@@ -51,6 +55,9 @@ export default function ChatPane({
 }) {
   const dispatch = useAppDispatch()
   const provider = useProvider()
+  // Same gate the main chat uses: hide a Connections-owned OAuth banner only
+  // while the card that owns that flow is reachable.
+  const connectionsUiOn = useConnectionsUiEnabled()
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
   const [dragOver, setDragOver] = useState(false)
@@ -103,7 +110,7 @@ export default function ChatPane({
   // Subscribes to the store's global refresh so a default-agent write in ANY pane (or
   // in single chat) lands here too; a per-hook refresh would leave sibling pickers stale.
   const agentsRefreshTrigger = useAppSelector((s) => s.dashboard.refreshTrigger ?? 0)
-  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger)
+  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey)
   const navigate = useNavigate()
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Same contract as ChatPage: set-only, clearing lives on the Templates page.
@@ -114,15 +121,14 @@ export default function ChatPane({
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
   const agentDD = useFilteredDropdown(installedAgents)
-  const { data: availableModels = [{ name: 'auto', description: 'Default' }] } = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => {
-      const models = await provider.fetchAvailableModels()
-      return [{ name: 'auto', description: 'Default' }, ...models.filter((m) => m.name !== 'auto')]
-    },
-    refetchInterval: modelListRefetchInterval,
-  })
+  const availableModels = useAvailableModels()
   const modelDD = useFilteredDropdown(availableModels)
+  // See ChatPage: display what will actually run, not a pin the account lost
+  // access to. The degraded flag gates it — a cached list served while
+  // /api/models fails is stale and cannot disprove entitlement — and is
+  // subscribed to, since it can flip while the served list stays identical.
+  const _modelsDegraded = useModelsDegraded(provider.id)
+  const shownModel = displayModel(paneSlot?.model || '', availableModels, _modelsDegraded)
 
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
@@ -207,6 +213,16 @@ export default function ChatPane({
   const doSend = useCallback(() => {
     const text = input.trim()
     if (!text && !pendingFiles.length) return
+    // Capture the stateless card pending at ENTRY (before any state updates
+    // or yields): this send consumes the answer channel of the card the user
+    // saw when they hit send. Retired only after the server confirms it
+    // accepted the message (ok or queued) — the optimistic append below must
+    // not do it, or a failed send (offline, 5xx) deletes the card while the
+    // session never moved on.
+    const cardAtSend = captureStatelessCard(store.getState().chat.pendingQuestions, slotKey)
+    // A blocking card is resolved over the network, not in the store — an agent
+    // is parked on its request.
+    const askAtSend = capturePendingAskId(store.getState().chat.pendingQuestions, slotKey)
     setInput('')
     const files = pendingFiles
     setPendingFiles([])
@@ -220,7 +236,16 @@ export default function ChatPane({
       }))
     }
     const meta = files.length ? { files } : undefined
-    api.sendChat(text, slotKey, undefined, undefined, meta).catch(() => undefined)
+    api.sendChat(text, slotKey, undefined, undefined, meta)
+      .then(async (r) => {
+        if (!cardAtSend && !askAtSend) return
+        const body = await r.json().catch(() => ({}))
+        // `ok` only: a QUEUED acceptance is still cancellable — the queued
+        // path retires at its queue_pop instead (removeQueuedMessage).
+        if (body.ok && !body.queued && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
+        void resolveAskAfterSend(body, askAtSend, dispatch)
+      })
+      .catch(() => undefined)
   }, [input, pendingFiles, busy, slotKey, dispatch])
 
   const onStop = useCallback(() => { dispatch(requestStop({ slotId: slotKey, force: false })) }, [dispatch, slotKey])
@@ -229,6 +254,33 @@ export default function ChatPane({
     api.cancelQueuedMessage(slotKey, queueId).catch(() => undefined)
   }, [dispatch, slotKey])
   const onInterruptQueued = useCallback((queueId: string) => { api.interruptSlot(slotKey, queueId).catch(() => undefined) }, [slotKey])
+  const onReorderQueued = useCallback((queueId: string, direction: 'next' | 'later') => {
+    // Build the order from ALL queued messages in the slot, not just the
+    // interactive ones QueueStack renders: hidden system deliveries and
+    // recovery continuations are queued too, and submitting only the visible
+    // ids would let the backend append the omitted ones at the tail, silently
+    // demoting automation. The swap happens between adjacent VISIBLE cards but
+    // is expressed inside the complete id sequence.
+    const fullIds = allMessages
+      .filter(m => m.role === 'queued')
+      .map(m => m.meta?.queueId as string)
+      .filter(Boolean)
+    const visibleIds = queuedMessages.map(m => m.meta?.queueId as string).filter(Boolean)
+    const vFrom = visibleIds.indexOf(queueId)
+    const vTo = direction === 'next' ? vFrom - 1 : vFrom + 1
+    if (vFrom < 0 || vTo < 0 || vTo >= visibleIds.length) return
+    const a = fullIds.indexOf(visibleIds[vFrom])
+    const b = fullIds.indexOf(visibleIds[vTo])
+    if (a < 0 || b < 0) return
+    const next = [...fullIds]
+    ;[next[a], next[b]] = [next[b], next[a]]
+    // No optimistic dispatch: the server commits and broadcasts queue_reorder
+    // to every client including this one, and that WS event is the
+    // authoritative store update. A local dispatch with rollback-on-failure
+    // could restore a stale order when the server committed but the HTTP
+    // response was lost, leaving this client in conflict with execution order.
+    api.reorderQueuedMessages(slotKey, next).catch(() => undefined)
+  }, [slotKey, allMessages, queuedMessages])
   // Split-view panes render tool calls with the full ToolCallLine (purpose / input /
   // output / live status) instead of the SDK's bare pill. ToolCallLine's slot-aware
   // selectors read THIS slot's per-slot tool log, so a background pane shows the same
@@ -236,7 +288,7 @@ export default function ChatPane({
   // app-sdk/ChatMessageList stays Redux-free for the embed SDK.
   const renderTool = useCallback((m: ChatMessage) => <ToolCallLine message={m} running={running} slot={slotKey} />, [slotKey, running])
 
-  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-mono bg-bg border border-border rounded text-text outline-none focus:border-accent'
+  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-none focus:border-accent'
 
   return (
     <SlotProvider slotId={slotKey}>
@@ -286,7 +338,7 @@ export default function ChatPane({
           {messages.length === 0 && !running && (
             <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
           )}
-          <ChatMessageList messages={messages} running={running} renderTool={renderTool} />
+          <ChatMessageList messages={messages} running={running} renderTool={renderTool} hideCardOwnedOAuth={connectionsUiOn} />
           <div ref={endRef} />
         </div>
 
@@ -294,7 +346,7 @@ export default function ChatPane({
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {queuedMessages.length > 0 && (
-          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} />
+          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onReorder={onReorderQueued} />
         )}
 
         {/* The pending ask_question card renders per pane: in split mode the
@@ -330,10 +382,10 @@ export default function ChatPane({
           autoFocusKey={slotKey}
           agentName={paneSlot?.agent || 'default'}
           agentSource={installedAgents.find((a) => a.name === (paneSlot?.agent || 'default'))?.source}
-          modelName={paneSlot?.model || 'auto'}
+          modelName={shownModel}
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
-          contextWindowTokens={contextTokens?.window || provider.getContextWindow(paneSlot?.model || 'auto')}
+          contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
           onAgentClick={provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); agentDD.setOpen(!agentDD.open) } : undefined}
           onModelClick={(rect) => { setModelBtnRect(rect); modelDD.setOpen(!modelDD.open) }}
           approvalMode={displayMode}
@@ -396,7 +448,7 @@ export default function ChatPane({
               />
             </div>
             <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
-              <ModelDropdownList models={modelDD.filtered} activeModel={paneSlot?.model || 'auto'} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} />
             </div>
           </div>,
           document.body,

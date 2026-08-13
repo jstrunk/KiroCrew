@@ -2,7 +2,7 @@
 
 How to create a Slack app for Kiro Crew and connect it.
 
-> **Dashboard-only mode**: If you don't need Slack, skip this entirely. Leave Slack tokens empty during `kirocrew setup` and the gateway runs the web dashboard without Slack.
+> **Slack is optional**: If you don't need Slack, skip this entirely. The default `kirocrew setup` configures no messaging channels, and the gateway runs the web dashboard without any. When you are ready to connect Slack, run `kirocrew setup --slack` to enter the tokens created below.
 
 Kiro Crew connects to Slack using **Socket Mode**, so it runs entirely from your own machine over an outbound WebSocket: no public URL, no inbound webhooks, and no hosting required. You just need a Slack workspace where you can install an app.
 
@@ -461,13 +461,19 @@ Dashboard tokens grant full session access, so treat them like passwords.
 | ✅ Do | ❌ Don't |
 |-------|----------|
 | Keep the dashboard behind your own tunnel or reverse proxy | Share dashboard URLs, which carry the token in `?token=` |
-| Run `kirocrew logout` or restart the gateway if a token is exposed | Paste tokens in Slack channels, shared docs, or wikis |
+| If a token is exposed, run `kirocrew logout` (ends all sessions, refresh chains included) and revoke at your tunnel or reverse-proxy auth layer | Paste tokens in Slack channels, shared docs, or wikis |
 | Avoid showing the browser URL bar during screen shares | Leave dashboard links in screen-share recordings |
 | Leave the built-in `kirocrew token` deny rules enabled | Trust an AI agent that asks to run `kirocrew token` |
 
-`kirocrew logout` revokes every issued cookie, not just in-memory state: it bumps
-a persisted revocation generation, so cookies handed out before the logout are
-rejected on their next request.
+`kirocrew logout` ends every issued session, not just in-memory state: it bumps
+a persisted revocation generation that both access cookies and
+`mc_refresh_<port>` refresh tokens embed, so cookies handed out before the
+logout — refresh chains included — are rejected on their next request. See
+[remote-and-mobile.md](remote-and-mobile.md#session-duration). Restarting the
+gateway ends nothing (the generation reloads unchanged). To cut off an exposed
+dashboard completely, also revoke at your tunnel or reverse-proxy auth layer;
+to end just one browser's session, sign out in that browser
+(`POST /api/auth/logout`), which revokes its chain alone.
 
 > ⚠️ **Prompt injection risk**: an attacker can hide instructions in a webpage or
 > document that trick your agent into running `kirocrew token` and exfiltrating

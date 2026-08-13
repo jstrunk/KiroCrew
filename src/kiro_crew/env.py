@@ -99,6 +99,22 @@ _NODE_MANAGER_DIRS = (
     "{home}/.volta/bin",
     "{home}/n/bin",
 )
+# Standalone Node TREES -- an unpacked distribution rather than a manager's
+# per-version store, so there is no version to glob and no shim to consult.
+# These are where an operator unpacking a nodejs.org tarball by hand puts one.
+# Only ``bin`` dirs of a Node-only tree belong here, never a general-purpose bin
+# dir: every entry is PREPENDED to the pinned PATH of build subprocesses, where a
+# dir full of unrelated user binaries would shadow the system tools that pinning
+# exists to guarantee.
+_NODE_TREE_DIRS = (
+    "{home}/.local/node/bin",
+    "{home}/.local/share/node/bin",
+)
+# Standalone trees under the DATA home -- where ``ensure-node.sh`` unpacks the
+# unofficial glibc-2.17 build, i.e. a Node Kiro Crew installed itself. Relative
+# paths, resolved against ``data_home()`` separately from the ``$HOME`` templates
+# above because that call can fail (see :func:`node_bin_dirs`).
+_NODE_TREE_DATA_HOME_DIRS = ("node-glibc217/bin",)
 # Marker file written by ``ensure-node.sh`` recording the node bin dir it
 # resolved. The Makefile already consumes it; this keeps Python callers on the
 # same answer instead of re-deriving one.
@@ -183,13 +199,20 @@ def node_bin_dirs() -> tuple[str, ...]:
     3. The highest version found under each per-version manager root
        (mise / asdf / nvm / fnm).
     4. Shim dirs (mise shims, volta, n).
+    5. Standalone Node trees -- the glibc-2.17 build ``ensure-node.sh`` unpacks
+       into the data home (:data:`_NODE_TREE_DATA_HOME_DIRS`), then a
+       hand-unpacked nodejs.org tarball under ``~/.local``
+       (:data:`_NODE_TREE_DIRS`). Last because a manager's install is the version
+       the build was resolved against; a tree found here is a fallback that keeps
+       a plainly-installed Node from reading as "no Node at all" on a daemon
+       whose ``$PATH`` omits it.
 
     Every entry is verified to contain an executable ``node``, so the result is
     only ever real toolchain directories. Only the BEST version per manager root
     is returned: these entries go on the PATH of build subprocesses, and mise
     alone can contribute ~18 install and alias directories on a developer box --
     a PATH that long slows every exec lookup and buries the intended toolchain
-    behind stale majors (node 16/18 against a ``20 || >=22`` engines field).
+    behind stale majors (node 16/18 against a ``>=22`` engines field).
 
     Why this exists: ``install.sh --mise`` and ``ensure-node.sh`` -- the
     supported install path -- put node under ``$HOME``. A non-login gateway
@@ -230,6 +253,16 @@ def node_bin_dirs() -> tuple[str, ...]:
             ordered.append(str(matches[0]))
 
     ordered.extend(d.format(home=home, mise_data=mise_data) for d in _NODE_MANAGER_DIRS)
+    # Under a KIROCREW_HOME override data_home() mkdirs, so it can raise on an
+    # unwritable path. Only the data-home candidates depend on it; swallowing here
+    # keeps a failure from taking out the manager and $HOME tiers with them.
+    try:
+        dh: Path | None = data_home()
+    except OSError:
+        dh = None
+    if dh is not None:
+        ordered.extend(str(dh / rel) for rel in _NODE_TREE_DATA_HOME_DIRS)
+    ordered.extend(d.format(home=home) for d in _NODE_TREE_DIRS)
 
     out: list[str] = []
     seen: set[str] = set()
@@ -258,7 +291,7 @@ def node_augmented_path(base_path: str = "") -> str:
 
     Prepended, not appended: a distribution's system ``node`` can be older than
     what ``website/package.json`` declares in ``engines`` (Amazon Linux 2023
-    ships node 18 against a ``20 || >=22`` requirement), whereas
+    ships node 18 against a ``>=22`` requirement), whereas
     ``ensure-node.sh`` installs a version chosen to satisfy the build. Where
     both exist the managed toolchain is the one that works.
     """
@@ -281,6 +314,54 @@ def find_node_tool(name: str, base_path: str | None = None) -> str | None:
     """
     base = os.environ.get("PATH", "") if base_path is None else base_path
     return shutil.which(name, path=node_augmented_path(base))
+
+
+def _ensure_node_script() -> Path | None:
+    """Locate the bundled ``ensure-node.sh``, or ``None`` on a wheel install.
+
+    Search order mirrors :func:`kiro_crew.cli._ensure_node`: the explicit
+    ``KIROCREW_PROJECT_DIR`` first, then the source-tree root two levels above
+    this module. A pip/wheel install ships no shell script, so this returns
+    ``None`` and the caller falls back to whatever Node is already on PATH.
+    """
+    env_dir = os.environ.get("KIROCREW_PROJECT_DIR")
+    candidates = (
+        Path(env_dir) / "ensure-node.sh" if env_dir else None,
+        Path(__file__).resolve().parent.parent.parent / "ensure-node.sh",
+    )
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate
+    return None
+
+
+def ensure_node(timeout: float = 180.0) -> str | None:
+    """Guarantee a usable ``node`` is resolvable, bootstrapping it if needed.
+
+    Returns the absolute ``node`` path when one is (or becomes) available, else
+    ``None``. Resolution: use an already-resolvable Node; otherwise invoke the
+    bundled ``ensure-node.sh`` (mise / nvm / the nodejs glibc-217 tarball on old
+    hosts), which records its bin dir in the ``node-bin-dir`` marker
+    :func:`node_bin_dirs` reads — so a freshly bootstrapped toolchain is found
+    without a restart. On Windows, where the bash installer cannot run, this only
+    reports what is already present.
+
+    Blocking (spawns a subprocess and walks the filesystem) — never call it on
+    the event loop; offload with ``asyncio.to_thread`` / ``run_in_executor``.
+    """
+    node = find_node_tool("node")
+    if node:
+        return node
+    script = _ensure_node_script()
+    if script is None or platform_compat.IS_WINDOWS:
+        return None
+    try:
+        subprocess.run(["bash", str(script)], timeout=timeout, capture_output=True)
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning("ensure-node.sh failed: %s", type(exc).__name__)
+        return None
+    node_bin_dirs.cache_clear()  # the marker/bin dir may have just appeared
+    return find_node_tool("node")
 
 
 @functools.lru_cache(maxsize=1)

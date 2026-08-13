@@ -61,6 +61,22 @@ class TestAcpSessionProviderBasic:
         provider = AcpSessionProvider(handle, runtime)
         assert provider.context_usage_pct() == 55.5
 
+    def test_context_usage_unknown_is_false_while_pct_is_measured(self):
+        handle = _make_handle(context_pct=55.5)
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.context_usage_unknown() is False
+
+    def test_context_usage_unknown_after_in_place_compaction(self):
+        """A compaction zeroes the percentage; the adapter must pass "unknown"
+        through so a threshold consumer does not read the session as brand new."""
+        handle = _make_handle(context_pct=91.0)
+        handle.last_prompt_stats.reset_after_compaction()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.context_usage_pct() == 0.0
+        assert provider.context_usage_unknown() is True
+
     def test_context_window_tokens(self):
         handle = _make_handle(context_window=128000)
         runtime = _make_runtime()
@@ -635,6 +651,23 @@ class TestAcpSessionProviderRound4Parity:
         assert provider._session_key == "dashboard:slot9"
         assert provider._channel_id == "chan-7"
         assert runtime._last_activity > 0.0
+
+    def test_rekey_resets_context_state(self):
+        """#2932 -- the handoff must drop the previous session's context state
+        (mirror of AcpClient.rekey): _make_handle seeds pct=42/5000/200000, so
+        a leak here would hand those numbers to the claiming session and let
+        check_context_usage compact its empty conversation."""
+        handle = _make_handle()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+        assert handle.last_prompt_stats.context_pct == 42.0  # seeded stale state
+        provider.rekey("dashboard:slot9", "chan-7")
+        stats = handle.last_prompt_stats
+        assert stats.context_pct == 0.0
+        assert stats.context_used_tokens == 0
+        assert stats.context_window_tokens == 0
+        assert stats.context_tokens_from_usage is False
+        assert stats.context_pct_unknown is False
 
     def test_agent_reads_from_runtime(self):
         """#5 -- session.py session-info introspection reads

@@ -21,11 +21,11 @@ it leaves room for an answer nobody had thought of.
 
 ## Finding Something to Work On
 
-Two labels mark work that is ready for someone outside the core team.
-[`good first issue`](https://github.com/kirodotdev/KiroCrew/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
-is scoped small and does not assume much context.
-[`help wanted`](https://github.com/kirodotdev/KiroCrew/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
-is work the team wants done but is not doing right now.
+Start with the [open issues](https://github.com/kirodotdev/KiroCrew/issues). Issues
+carry an `area:` label naming the subsystem they land in — `area: dashboard`,
+`area: agents`, `area: cron` and so on — so you can filter to the part of the
+codebase you want to work in, and a type label (`bug`, `enhancement`,
+`documentation`) telling you what kind of change it is.
 
 Before starting anything substantial, check whether someone is already on it and
 comment on the issue saying you are picking it up. For a large change, open an
@@ -37,7 +37,7 @@ tell you in a paragraph.
 
 - macOS or Linux (Windows is not supported by the `kiro-cli` backend)
 - Python ≥ 3.9
-- Node.js ≥ 18 and npm (for the frontend)
+- Node.js ≥ 22 (24 LTS recommended) and npm (for the frontend)
 - The `kiro-cli` agent on your `PATH`, logged in (`kiro-cli login`) — it is the
   only LLM backend (`agent.provider = acp`)
 - [Ollama](https://ollama.com) for memory and knowledge-library embeddings
@@ -61,21 +61,23 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[voice]"
 
 # 4. Configure and verify
-kirocrew setup               # data dir, agent backend, Slack tokens (optional)
+kirocrew setup               # data dir, agent backend (channels connect later)
 kirocrew doctor              # verify everything works
-kirocrew gateway             # start server (dashboard + Slack)
+kirocrew gateway             # start server (dashboard + messaging channels)
 ```
 
 The dashboard is at `http://localhost:5476`.
 
-**Dashboard-only mode**: skip Slack tokens during `kirocrew setup` to run
-without Slack.
+**Messaging channels are optional**: the default `kirocrew setup` configures
+none, and the dashboard + CLI work without any channel credentials. Connect
+Slack, Discord, Telegram, Teams, Webex, WeCom, or WeChat later, or run
+`kirocrew setup --slack` for the guided Slack path.
 
 ## Development Skills (agents and humans)
 
 The contributor workflow is codified as agent-loadable skills in
-[`skills/kirocrew-dev/`](skills/kirocrew-dev/) — the canonical definition of
-how code gets written, tested, and reviewed here:
+[`src/kiro_crew/builtin_skills/kirocrew-dev/`](src/kiro_crew/builtin_skills/kirocrew-dev/)
+— the canonical definition of how code gets written, tested, and reviewed here:
 
 - **`kirocrew-worktree-dev`** — the HARD RULE workflow: every change in a git
   worktree, the blocking build gates, the built-dist gotcha, preview paths.
@@ -198,6 +200,10 @@ nightlies sort above what just shipped, and **merge the branch's fixes back into
 
 Nightly installs **side by side** as its own app. Insider and stable are two
 update lanes of **one** production app, switchable in Settings.
+
+The user-facing version of this table — same audiences, more detail on
+switching — is [Release channels](README.md#release-channels) in the README.
+Keep the two in step.
 
 ### Cutting a release
 
@@ -447,7 +453,7 @@ depends on *where your branch lives*:
 
 | Check | Fork PR | Branch pushed to `kirodotdev/KiroCrew` |
 | --- | --- | --- |
-| **Opus 5 Review** | Skipped (neutral — not a failure) | Runs |
+| **Opus 4.8 Review** | Skipped (neutral — not a failure) | Runs |
 | **GPT 5.6 Review** | Skipped | Runs |
 | **Design Review** | Skipped | Runs |
 | Tests, lint, typecheck, CodeQL, coverage, build | Run normally | Run normally |

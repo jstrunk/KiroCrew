@@ -172,29 +172,15 @@ _SAFE_ENV_KEYS = frozenset(
 )
 
 
-#: Case-folded view of the allowlist, for the Windows match below.
-_SAFE_ENV_KEYS_FOLDED = frozenset(k.upper() for k in _SAFE_ENV_KEYS)
-
-
 def _is_safe_env_key(key: str) -> bool:
     """Whether *key* is allowlisted, honoring Windows' case-insensitive env.
 
-    On Windows, environment variable names are case-INSENSITIVE and CPython's
-    ``os.environ`` upper-cases every key, so ``os.environ.items()`` yields
-    ``SYSTEMROOT`` — never the ``SystemRoot`` spelling Microsoft documents and that
-    this allowlist (and ``kiro_prerequisite``'s) writes. A literal membership test
-    therefore dropped exactly the variables it was extended to carry, and the
-    failure is silent at the boundary and fatal in the child: a Windows process
-    without ``SystemRoot`` cannot resolve side-by-side assemblies and dies before
-    ``main()``.
-
-    Folding on Windows only, rather than upper-casing the list, keeps POSIX exact:
-    ``PATH`` and ``Path`` are genuinely different variables there, and a
-    case-insensitive match would let a lookalike through.
+    Thin wrapper binding this module's allowlist to the shared matching
+    convention — exact on POSIX, case-folded on Windows. The rationale (why a
+    literal membership test silently drops ``SystemRoot`` on Windows, and why
+    POSIX must stay exact) lives on :func:`platform_compat.env_key_allowed`.
     """
-    if platform_compat.IS_WINDOWS:
-        return key.upper() in _SAFE_ENV_KEYS_FOLDED
-    return key in _SAFE_ENV_KEYS
+    return platform_compat.env_key_allowed(key, _SAFE_ENV_KEYS)
 
 
 def minimal_env(**extra: str) -> dict[str, str]:
@@ -987,6 +973,54 @@ def _enrich_with_install_status(
     return entries
 
 
+def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stamp server-computed ``provenance`` and ``verified`` on every row.
+
+    SECURITY CONTRACT: these two fields are the API trust boundary for
+    ``GET /api/apps/registry``. They are computed here — where the
+    server-attached ``_registry`` tag is authoritative — and OVERWRITE any
+    value an index entry may have published, so an external registry can
+    never spoof them. Client code must read these fields and must not
+    re-derive trust from the absence of ``_registry``, an internal tagging
+    detail. ``_registry`` stays in the payload: the external-source label
+    text, older clients, ``appManifest.ts::keysFor`` (first-party copy
+    gate), and ``pickFeatured``'s legacy arm all still read it — do not
+    stop emitting or rename it without migrating those dependants.
+
+    Per row:
+
+    - ``provenance``: ``"external"`` when ``_registry`` is set (the tag is
+      applied server-side per configured registry and cannot be forged by
+      index content); otherwise ``"builtin"`` when ``origin == "builtin"``,
+      else ``"core"`` (bundled ``app-registry.json`` or edition entry).
+    - ``verified``: ``True`` only when provenance is NOT ``"external"`` AND
+      (``origin == "builtin"`` or the INDEX-declared author — snapshotted
+      into ``_index_author`` by ``list_registry`` before the manifest merge
+      — is "kirocrew", case-insensitively). The badge asserts first-party
+      provenance next to an Install button that runs setup code with
+      gateway privileges, so it is never awardable from index-published
+      trust keys or from the repo-fetched ``app.json``: a third-party core
+      repo publishing ``"author": "kirocrew"`` in its manifest does not
+      mint it (the merged ``author`` display field is deliberately NOT
+      consulted).
+    - ``featured``: dropped entirely from external rows so an external index
+      can never self-flag into the Discover spotlight, regardless of client
+      logic. Core-entry ``featured`` flags are preserved.
+    """
+    for entry in entries:
+        index_author = entry.pop("_index_author", None)
+        author_lower = index_author.lower() if isinstance(index_author, str) else ""
+        if entry.get("_registry"):
+            entry["provenance"] = "external"
+            entry["verified"] = False
+            entry.pop("featured", None)
+        else:
+            builtin = entry.get("origin") == "builtin"
+            entry["provenance"] = "builtin" if builtin else "core"
+            entry["verified"] = builtin or author_lower == "kirocrew"
+    return entries
+
+
 def _version_newer(registry_ver: str, installed_ver: str) -> bool:
     """Return True if registry version is strictly newer than installed.
 
@@ -1069,7 +1103,7 @@ def _read_external_registry_cache(
             if not isinstance(entry, dict):
                 continue
             entry_name = entry.get("name")
-            if not isinstance(entry_name, str) or not KEBAB_RE.match(entry_name):
+            if not isinstance(entry_name, str) or not KEBAB_RE.fullmatch(entry_name):
                 logger.warning(
                     "Dropping cached external registry %s entry with invalid "
                     "name %r (must be lowercase kebab-case)",
@@ -1306,7 +1340,7 @@ async def _fetch_and_cache_external_registry(reg) -> list[dict[str, Any]] | None
     valid_entries: list[dict[str, Any]] = []
     for entry in entries:
         entry_name = entry.get("name")
-        if not isinstance(entry_name, str) or not KEBAB_RE.match(entry_name):
+        if not isinstance(entry_name, str) or not KEBAB_RE.fullmatch(entry_name):
             logger.warning(
                 "Dropping external registry %s entry with invalid name %r "
                 "(must be lowercase kebab-case)",
@@ -1518,6 +1552,8 @@ async def list_registry() -> list[dict[str, Any]]:
     3. Fetch each app's app.json (cached, 24h TTL) for display info
     4. Run detectInstalled commands for external installs
     5. Enrich with install status from KiroCrew's app manager
+    6. Stamp server-computed trust fields (``provenance``/``verified``) and
+       strip ``featured`` from external rows — see ``_apply_trust_fields``
     """
     entries = await asyncio.to_thread(_load_registry_file)
 
@@ -1532,6 +1568,16 @@ async def list_registry() -> list[dict[str, Any]]:
 
     installed = await asyncio.to_thread(list_installed_apps)
     installed_map = {a["name"]: a for a in installed}
+
+    # Snapshot the INDEX-declared author before the manifest merge below
+    # overwrites ``author`` with the repo-fetched app.json value.
+    # ``_apply_trust_fields`` derives ``verified`` from this snapshot only:
+    # the bundled/edition index is trusted content, the fetched manifest is
+    # the app author's — a repo publishing ``"author": "kirocrew"`` in its
+    # app.json must not mint the badge. Unconditional assignment also
+    # neutralizes an index that pre-seeds the key itself.
+    for entry in entries:
+        entry["_index_author"] = entry.get("author")
 
     # Fetch manifests in parallel for all entries
     resolved = await asyncio.gather(
@@ -1572,7 +1618,9 @@ async def list_registry() -> list[dict[str, Any]]:
         except (asyncio.TimeoutError, OSError):
             pass  # detection failed, treat as not installed
 
-    return _enrich_with_install_status(entries, installed_map, detected)
+    return _apply_trust_fields(
+        _enrich_with_install_status(entries, installed_map, detected)
+    )
 
 
 def get_server_platform() -> dict[str, str]:
@@ -2629,7 +2677,21 @@ async def _clone_build_app_locked(
             "error": f"blocked by admission policy: {denied}",
         }
 
-    result = await _run_app_build(pkg_dir, app_name, log_lines)
+    # Build in the directory that actually HOLDS the package, not the clone root.
+    #
+    # A monorepo registry entry declares `subdirectory`, and historically it was
+    # joined only AFTER this build ran — so `_run_app_build` looked for
+    # pyproject.toml/package.json at the clone root, found none, logged "No build
+    # step detected — using source as-is", and returned ok=True having installed
+    # nothing. The app's own pyproject.toml was never seen. A silent success is
+    # the worst shape for this: `setup.onInstall` does get `cwd=app_source`, so
+    # an app could paper over it with a script, which is exactly how a bug like
+    # this stays hidden.
+    #
+    # `app_source` is already the containment-checked join of `subdirectory`
+    # under the clone root (the identity gate above fails closed on an escaping
+    # value), so it is safe to run the build command there.
+    result = await _run_app_build(app_source, app_name, log_lines)
     if result["ok"]:
         result["pkg_dir"] = pkg_dir
         # Surface the pre-clone checkout state so the caller's LATER gates
@@ -2711,16 +2773,56 @@ async def _run_app_build(
         or (build_dir / "setup.py").is_file()
         or (build_dir / "requirements.txt").is_file()
     ):
-        pip = shutil.which("pip") or shutil.which("pip3")
-        if pip:
-            if (build_dir / "requirements.txt").is_file() and not (
-                (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
-            ):
-                build_cmds.append([pip, "install", "-r", "requirements.txt"])
-            else:
-                build_cmds.append([pip, "install", "."])
+        # `sys.executable -m pip`, NOT `shutil.which("pip")`.
+        #
+        # A Python app has to land in the interpreter that will IMPORT it — the one
+        # running this gateway. `which("pip")` resolves to whatever pip is first on
+        # PATH, which is routinely a different interpreter: `bin/kirocrew` execs
+        # `.venv/bin/kirocrew` WITHOUT putting the venv's `bin/` on PATH, and
+        # `service/common.py::service_path()` prepends `~/.local/bin` ahead of it. So the
+        # build pip was whatever the user happened to have.
+        #
+        # The failure is SILENT, which is why it survived. Measured on a host whose first
+        # pip was 3.7 and whose gateway venv was 3.12: with a version-incompatible pip the
+        # install failed loudly, but with a *compatible-but-different* pip (3.10) it
+        # reported "Successfully installed", the build step reported success, and the
+        # package landed in `~/.local/lib/python3.10/site-packages` — invisible to the
+        # gateway, with `ENABLE_USER_SITE = False` in a venv so there is no fallback. The
+        # app installs, the entry point never appears, and nothing anywhere says why.
+        #
+        # Our own packages only fail loudly because they declare `requires-python`; a
+        # third-party app without that constraint fails silently on EVERY mismatch.
+        #
+        # EXCEPTION: never run pip against the desktop app's bundled interpreter.
+        # The desktop build ships a python-build-standalone runtime inside the
+        # application bundle (`Resources/backend-dist/...`); on macOS that bundle is
+        # code-signed, so a pip install writing into its site-packages invalidates
+        # the signature and breaks subsequent launches/updates — and the write is
+        # discarded on every app update anyway. This is a LOUD failure, not a
+        # soft-skip: a Python app that declares a build step needs its packages
+        # importable by the gateway, and skipping the install while reporting
+        # success would recreate exactly the silent-broken-install shape this
+        # function is written to prevent. Detection lives in
+        # platform_compat.is_bundled_interpreter() — the single owner of the
+        # packaging-layout sentinel — so a bundler rename breaks its pinned test
+        # instead of silently un-matching an inline check here.
+        if platform_compat.is_bundled_interpreter():
+            return {
+                "ok": False,
+                "name": app_name,
+                "error": (
+                    "Python apps that require a build step are not supported in "
+                    "the desktop app: its bundled interpreter is inside the "
+                    "signed application bundle and cannot install packages"
+                ),
+            }
+        pip_cmd = [sys.executable, "-m", "pip"]
+        if (build_dir / "requirements.txt").is_file() and not (
+            (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
+        ):
+            build_cmds.append([*pip_cmd, "install", "-r", "requirements.txt"])
         else:
-            log_lines.append("pip not found on PATH — skipping Python build step")
+            build_cmds.append([*pip_cmd, "install", "."])
 
     if not build_cmds:
         log_lines.append("No build step detected — using source as-is")
@@ -2953,6 +3055,8 @@ async def install_from_registry(
             "error": f"blocked by execution policy: {execution_denied}",
             # Same wire contract as the openCommand denial in routes.py: the
             # frontend keys its affordance off `code`, never off this prose.
+            # Without it the App Store cannot tell "needs a trust grant" from
+            # any other install failure and the consent modal never opens.
             "code": "app_execution_denied",
             "log": "\n".join(log_lines),
         }
@@ -3000,6 +3104,8 @@ async def install_from_registry(
             log_lines,
             branch=branch,
             index_originated=index_originated,
+            # Passed so the BUILD runs where the package is. The containment check
+            # below is still authoritative for choosing app.json's directory.
             subdirectory=subdirectory,
             entry_repo=repo,
         )

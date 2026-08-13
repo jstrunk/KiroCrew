@@ -1,26 +1,22 @@
-"""CLI setup subcommand — interactive credential and config wizard."""
+"""CLI setup subcommand — interactive config wizard (channel credentials are opt-in)."""
 
 from __future__ import annotations
 
 import json
 import os
 import platform
-import re
 import shutil
 import socket
 import subprocess
 import sys
-from importlib.resources import files as _pkg_files
 from pathlib import Path
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-from kiro_crew import platform_compat
+from kiro_crew import platform_compat, slack_manifest
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.browser.setup import (
-    ensure_playwright_installed,
+    browser_mode_enabled,
     generate_playwright_config,
-    is_playwright_installed,
     refresh_storage_state,
     register_playwright_proxy,
 )
@@ -39,7 +35,7 @@ from kiro_crew.config.loader import (
     env_path,
     write_config_atomically,
 )
-from kiro_crew.constants import DATA_WARNING
+from kiro_crew.constants import DATA_WARNING, MIN_NODE_MAJOR
 from kiro_crew.sandbox import unavailable_kind
 from kiro_crew.sel import sel
 from kiro_crew.skills import SkillsLoader
@@ -69,26 +65,21 @@ def _manifest(alias: str | None = None, output: str | None = None, url: bool = F
     """Render slack-manifest.yaml with the user's alias substituted."""
 
     alias = alias or _get_alias()
-    if not re.fullmatch(r"[a-zA-Z0-9_-]+", alias):
+    if not slack_manifest.valid_alias(alias):
         print(
-            "❌ Invalid alias — must be alphanumeric, hyphens, or underscores only.",
+            "❌ Invalid alias — must be alphanumeric, hyphens, or underscores only, "
+            f"at most {slack_manifest.ALIAS_MAX} characters.",
             file=sys.stderr,
         )
         sys.exit(1)
     try:
-        template_text = (
-            _pkg_files("kiro_crew").joinpath("slack-manifest.yaml").read_text(encoding="utf-8")
-        )
+        rendered = slack_manifest.render(alias)
     except FileNotFoundError:
         print("❌ Cannot find slack-manifest.yaml", file=sys.stderr)
         sys.exit(1)
-    rendered = template_text.replace("{{ALIAS}}", alias)
     if url:
-        # Strip comment lines to shorten the URL
-        lines = [ln for ln in rendered.splitlines() if not ln.lstrip().startswith("#")]
-        encoded = quote("\n".join(lines).strip() + "\n", safe="")
         print("\n🔗 Click to create your Slack app:\n")
-        print(f"https://api.slack.com/apps?new_app=1&manifest_yaml={encoded}\n")
+        print(f"{slack_manifest.deep_link(alias)}\n")
     elif output:
         out = Path(output)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +144,7 @@ def _ensure_prerequisites() -> bool:
     # npm packages, e.g. the Playwright browser MCP).
     if not shutil.which("node"):
         _header()
-        print("  ⚠️  node not found on PATH — install Node.js >= 16 from https://nodejs.org\n")
+        print(f"  ⚠️  node not found on PATH — install Node.js >= {MIN_NODE_MAJOR} from https://nodejs.org\n")
 
     # kiro-cli is the agent backend. Note its absence so the user can install it.
     if not shutil.which(KIRO_CLI_BIN):
@@ -254,8 +245,30 @@ def _setup_electron() -> None:
     print("     Launch via Spotlight (⌘+Space → KiroCrew) or Finder → ~/Applications")
 
 
-def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = False) -> None:
+def _setup(
+    agent_only: bool = False,
+    electron_only: bool = False,
+    clean: bool = False,
+    slack: bool = False,
+) -> None:
     """Install agent config and optionally configure credentials."""
+    try:
+        _setup_impl(agent_only=agent_only, electron_only=electron_only, clean=clean, slack=slack)
+    except _SetupAborted as exc:
+        # A closed/piped stdin mid-wizard. One clean line instead of a stack
+        # trace at whichever prompt hit it first — every guarded prompt raises,
+        # so the exit point is deterministic. Bare `input()` calls still exist
+        # in some steps and traceback the old way; converting them all is a
+        # sweep for its own change.
+        print(f"\n⏭  Setup aborted: {exc}. Re-run interactively to finish.")
+
+
+def _setup_impl(
+    agent_only: bool = False,
+    electron_only: bool = False,
+    clean: bool = False,
+    slack: bool = False,
+) -> None:
     from kiro_crew.agent import install_agent  # circular import: agent imports cli
     from kiro_crew.cli import _project_dir_file  # circular import: cli -> cli_setup -> cli
 
@@ -323,14 +336,32 @@ def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = 
     _setup_sandbox_consent()
 
     if agent_only:
+        # --agent-only returns before the channel steps below, so an explicit
+        # --slack has nothing to act on. Say so instead of dropping it silently.
+        if slack:
+            print(
+                "\n  ⚠️  --slack is ignored with --agent-only. Run "
+                "'kirocrew setup --slack' for the guided Slack setup."
+            )
         print("\n👻 Done! Try: kirocrew gateway")
         return
 
-    # 3. Slack credentials
-    _setup_slack_tokens()
+    # 3. Messaging channels (optional, configured after setup by default).
+    #    Slack prompts run only on explicit opt-in (`kirocrew setup --slack`);
+    #    the dashboard and CLI need no channel credentials, and every channel
+    #    (Slack, Discord, Telegram, Teams, Webex, WeCom, WeChat) can be
+    #    connected later from the dashboard or its setup guide.
+    if slack:
+        _setup_slack_tokens()
 
-    # 3b. Slash command name
-    _setup_slash_command()
+        # 3b. Slash command name (Slack-only concept)
+        _setup_slash_command()
+    else:
+        print("── Messaging Channels ──\n")
+        print("  The dashboard works without any messaging credentials.")
+        print("  Connect Slack, Discord, Telegram, Teams, Webex, WeCom, or WeChat")
+        print("  later from the dashboard (Settings → Channels) or run")
+        print("  'kirocrew setup --slack' for the guided Slack setup.\n")
 
     # 4. Timezone
     _setup_timezone()
@@ -341,33 +372,26 @@ def _setup(agent_only: bool = False, electron_only: bool = False, clean: bool = 
     _maybe_setup_custom_domain()
 
     # ── Browser (Playwright MCP) ──
+    # Browser Mode is a deliberate, durably-persisted capability the user turns
+    # on from Settings -> Browser (registration = authorization now that there is
+    # no per-message marker). The wizard does NOT auto-register it: doing so would
+    # mount the browser_* tools for an agent whose owner never enabled Browser
+    # Mode. We only refresh the storage state if it is already set up.
     print("\n── Browser (Playwright MCP) ──")
-
-    if is_playwright_installed():
-        print("  Playwright MCP already installed")
-    else:
-        print("  Installing Playwright MCP...")
+    if browser_mode_enabled():
         try:
-            ensure_playwright_installed()
-            print("  Playwright MCP installed")
-        except Exception as exc:
-            print(f"  Playwright install failed: {exc}")
-            print("  Browser features will be unavailable until Playwright is installed")
-
-    # Always regenerate config and register proxy in mcp.json (preserve extension mode)
-    try:
-        generate_playwright_config()
-        refresh_storage_state()
-        # register_playwright_proxy owns the shared mcp.json lock, the
-        # user-entry guard, and the create-when-absent path — the patch
-        # primitives have none of those.
-        _, status = register_playwright_proxy()
-        if status == "kept-user-entry":
-            print("  Kept your existing playwright-mcp entry in mcp.json (left untouched)")
-        else:
-            print("  Browser proxy registered in mcp.json")
-    except Exception:
-        pass  # Non-fatal: browser still works without pre-loaded cookies
+            generate_playwright_config()
+            refresh_storage_state()
+            _, status = register_playwright_proxy()
+            if status == "kept-user-entry":
+                print("  Kept your existing playwright-mcp entry in mcp.json (left untouched)")
+            else:
+                print("  Browser Mode is on — proxy registered in mcp.json")
+        except Exception:
+            pass  # Non-fatal: browser still works without pre-loaded cookies
+    else:
+        print("  Browser Mode is off. Turn it on in Settings -> Browser to let the")
+        print("  agent operate a browser; it downloads Playwright and wires the proxy.")
 
     # 6. Desktop app (macOS only)
     if platform.system() == "Darwin":
@@ -436,7 +460,10 @@ def _setup_workspace_dir() -> None:
     print("── Workspace Directory ──\n")
     print("  LLM sessions and task output are stored in a workspace directory.")
     print(f"  {label}: {default}\n")
-    answer = input(f"  Workspace path [{default}]: ").strip()
+    # EOF (piped / closed stdin) keeps the default rather than raising a
+    # traceback out of the wizard — this step runs FIRST, so a bare input() here
+    # made `kirocrew setup < /dev/null` fail before any later guard could help.
+    answer = _input_or_skip(f"  Workspace path [{default}]: ") or ""
     chosen = default if answer.lower() in ("", "y", "yes") else Path(answer).expanduser()
     try:
         chosen.mkdir(parents=True, exist_ok=True)
@@ -549,20 +576,33 @@ def _detect_system_timezone() -> str:
     return ""
 
 
-def _input_or_skip(prompt: str) -> str | None:
-    """``input(prompt).strip()``, returning ``None`` on EOF instead of crashing.
+class _SetupAborted(Exception):
+    """Raised when stdin is closed mid-wizard.
 
-    A closed/piped stdin (non-interactive setup, or a Windows console quirk)
-    makes bare ``input()`` raise ``EOFError``. The timezone step's retry loop is
-    only entered on a validation failure, so a Windows user who mistyped a zone
-    once — the common case, since detection used to yield nothing there — hit an
-    uncaught traceback. Callers treat ``None`` as "skip this step".
+    The wizard is a sequential chain of interactive prompts; if stdin closes at
+    ANY prompt, every subsequent bare ``input()`` would traceback. Callers use
+    ``_input_or_skip`` for guarded prompts (workspace, slash-command, timezone);
+    the top-level ``_setup`` catches this and exits cleanly, so a
+    ``kirocrew setup < /dev/null`` — or a Windows console quirk that closes
+    stdin — surfaces one clean message instead of a stack trace.
+    """
+
+
+def _input_or_skip(prompt: str) -> str | None:
+    """``input(prompt).strip()``, or raise ``_SetupAborted`` on EOF.
+
+    Returns ``None`` when the user hit Enter with no input, which callers treat
+    as "keep the default / skip this step". A closed/piped stdin is a different
+    condition and must not be silently coerced to ``""`` (that used to admit an
+    empty default and cascade the failure into the NEXT step's bare
+    ``input()``) — see ``_SetupAborted``.
     """
 
     try:
-        return input(prompt).strip()
-    except EOFError:
-        return None
+        answer = input(prompt).strip()
+    except EOFError as exc:
+        raise _SetupAborted("stdin closed; setup cannot continue") from exc
+    return answer or None
 
 
 def _setup_slash_command() -> None:
@@ -578,7 +618,8 @@ def _setup_slash_command() -> None:
 
     print("── Slash Command ──\n")
     current = cfg.get("slack", {}).get("command", "kirocrew")
-    raw = input(f"  Slash command name [{current}]: ").strip()
+    # EOF keeps the current value (same reasoning as the workspace step).
+    raw = _input_or_skip(f"  Slash command name [{current}]: ") or ""
     if raw:
         raw = raw.lstrip("/").strip()
     if not raw:

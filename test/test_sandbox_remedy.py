@@ -19,14 +19,22 @@ import kiro_crew.sandbox as sb
 
 
 @pytest.fixture(autouse=True)
-def _clean_probe_state() -> Any:
+def _clean_probe_state(monkeypatch) -> Any:
     """Each test starts and ends with no cached backend or probe verdict.
 
     Joining the background warm thread is part of that isolation, not politeness:
     it writes the same `_last_unshare_failure` record these tests plant, so a thread still in flight from an earlier test lands mid-test
     and replaces a planted verdict with the real host's one. Joining (rather than
     sleeping) makes that deterministic.
+
+    Clears ``KIROCREW_SANDBOX_ACTIVE`` to prevent the "already inside sandbox"
+    passthrough from short-circuiting tests on sandboxed hosts.
     """
+    monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
+    monkeypatch.setattr(
+        sb, "_KIRO_INTERNAL_SETTINGS_PATH",
+        "/nonexistent/kirocrew-test/amazon-internal.json",
+    )
     _join_warm_thread()
     sb.reset_backend()
     yield
@@ -157,6 +165,29 @@ class TestRemedyRecording:
         sb._record_probe_failure(False, "x", sb.REMEDY_APPARMOR_USERNS)
         sb.reset_backend()
         assert sb.unavailable_remedy() == ""
+
+    def test_unavailable_reason_reads_the_same_recorded_failure(self) -> None:
+        # Sibling accessor: reason and remedy come from ONE recorded tuple, so a
+        # diagnostic surface can never pair failure A's text with failure B's fix.
+        sb._record_probe_failure(
+            False,
+            "unshare(CLONE_NEWNS) failed with errno 1 (EPERM)",
+            sb.REMEDY_APPARMOR_USERNS,
+        )
+        assert sb.unavailable_reason() == "unshare(CLONE_NEWNS) failed with errno 1 (EPERM)"
+
+    def test_unavailable_reason_is_empty_when_the_last_probe_succeeded(self) -> None:
+        sb._record_probe_failure(False, "x", sb.REMEDY_APPARMOR_USERNS)
+        sb._last_unshare_failure = None
+        assert sb.unavailable_reason() == ""
+
+    def test_remedy_guidance_is_the_shared_guidance_text(self) -> None:
+        # The public accessor must serve the one shared prose table, so doctor
+        # and the dashboard can never drift from the mechanism's own guidance.
+        assert sb.remedy_guidance(sb.REMEDY_APPARMOR_USERNS) == sb._linux_remedy_guidance(
+            sb.REMEDY_APPARMOR_USERNS
+        )
+        assert sb.remedy_guidance("not-a-token") == ""
 
     def test_a_deferred_on_loop_probe_reports_no_remedy(self) -> None:
         """The synthetic on-loop transient describes no host mechanism.

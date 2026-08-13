@@ -61,6 +61,32 @@ an Intel Mac where the universal build cannot run. Per-arch targets:
 | Linux x86_64 | x86_64 Linux | x86_64 `.AppImage` |
 | Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage` |
 
+**Both Linux architectures ship.** `build-desktop.yml` builds them on
+`ubuntu-22.04` and `ubuntu-22.04-arm`, and `publish-linux.yml` runs once per
+arch — each writing its own immutable S3 key, its own electron-updater channel
+file (`latest-linux.yml` for x64, `latest-linux-arm64.yml` for arm64) and its own
+`latest` alias. Published basenames are `KiroCrew-x86_64.AppImage` and
+`KiroCrew-aarch64.AppImage`.
+
+Two properties are load-bearing and worth knowing before you touch that lane:
+
+- **Linux is built natively per arch, never cross-compiled.** `build-desktop.sh`
+  provisions a python-build-standalone interpreter and then *runs* it (pip
+  install, plus the `python -m kiro_crew --version` self-containment gate), so a
+  host that cannot execute the target architecture cannot build it. macOS gets
+  away with one host only because Rosetta 2 executes the x86_64 slice.
+- **The runner's glibc is the floor for every user.** The AppImage links against
+  it, which is why both Linux legs stay on 22.04 (glibc 2.35) rather than moving
+  to 24.04 (2.39) — the newer floor would exclude AL2023, Debian 12 and RHEL 9.
+
+**Building your own package locally.** `make desktop` needs no arch flags: it
+detects the host and emits an AppImage for it, so running it on an ARM box
+produces the aarch64 build with no CI involved. Filenames are arch-qualified
+(`KiroCrew-<version>-<arch>.AppImage`) so several arches can sit in one directory
+without overwriting each other. To validate a packaging change against every
+platform *without* publishing anything, dispatch `build-desktop.yml` manually —
+it builds the full matrix and uploads artifacts, with no publish lane attached.
+
 Anything you **distribute** for macOS should be the universal DMG — the
 host-arch build is a local-machine artifact.
 
@@ -96,6 +122,15 @@ x64 gate doubles as proof the bundle runs under Rosetta. In
 `backend-dist/**` (single-arch Mach-O files inside a universal app are
 intentional there), and `extraResources` ships the `backend-dist/` directory
 wholesale so single- and dual-backend layouts both package.
+
+> **Renaming `backend-dist/` is load-bearing at runtime.** The backend detects
+> "am I the bundled interpreter?" via
+> `platform_compat.is_bundled_interpreter()`
+> (`BUNDLED_BACKEND_DIST_DIRNAME`), which is what stops `pip` from writing
+> into the signed bundle during app builds. `test/test_platform_compat.py`
+> pins that constant to both `extraResources` here and
+> `packaging/build-desktop.sh`, so a rename fails a test — update the constant
+> and the packaging layer in the same change.
 
 **Trade-off:** the DMG carries two full Python backend trees, so it is
 roughly **2× the size** of a per-arch DMG — expect ~350–400 MB. That is the
@@ -264,14 +299,15 @@ provider:
 3. It verifies authentication with `kiro-cli whoami`.
 
 If either check fails, the shared React setup gate appears in both the desktop
-shell and browser dashboard. On macOS, Linux, and native Windows, the user can
-explicitly choose **Install Kiro CLI**. The gateway downloads the fixed official
-HTTPS installer for the host platform, validates its size and
-platform-specific marker in memory, and pipes those same bytes to the fixed
-system interpreter. The installer itself verifies the downloaded Kiro CLI
-package. The second step runs `kiro-cli login --use-device-flow`, displays the
-secure sign-in URL and code, and opens the Kiro Crew dashboard only after
-`kiro-cli whoami` succeeds.
+shell and browser dashboard. Kiro Crew performs neither setup step: the gate
+links out to <https://kiro.dev/cli/> to obtain the CLI, and names the commands
+the user runs to sign in — `kiro-cli login` for a personal account, or
+`kiro-cli login --use-device-flow --license pro` for organization SSO. Both
+tiers are shown because the browser portal the bare command opens offers a free
+Builder ID alongside organization SSO, so an SSO user who picks the wrong one
+authenticates successfully and only discovers the mismatch later as models
+missing from their account. The gate's only control is **Check again**, which
+re-probes the host; it opens the dashboard once `kiro-cli whoami` succeeds.
 An installed candidate that cannot start is shown as needing repair rather than
 as merely signed out; one that runs is directly usable for sign-in regardless of
 install source (toolbox, Homebrew, winget, the official installer, or a

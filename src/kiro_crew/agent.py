@@ -58,7 +58,8 @@ from kiro_crew.config.paths import (
     kiro_agents_dir,
 )
 from kiro_crew.env import augmented_path
-from kiro_crew.mcp_utils import mcp_server_alias
+from kiro_crew.mcp_provenance import without_marker
+from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform import safe_context_call
@@ -1646,22 +1647,47 @@ def _refresh_dynamic_fields(config: dict) -> None:
             agent_state.set_cc_model(name, str(config["cc_model"]))
         del config["cc_model"]
 
+    # Imported lazily: config.loader imports this module, so a top-level import
+    # would close the cycle. Warm by the time this runs (importing agent pulls
+    # config.loader in), so the lookup costs nothing on the caller's thread.
+    from kiro_crew.config.loader import DEFAULT_MODEL, normalize_agent_model
+
     # Default-model tracking: when the model is managed (not an explicit user
     # pick), re-sync it from the shipped defaults.json so a default bump
     # propagates to existing installs. Agents with no sidecar entry are
     # grandfathered and left untouched (never force-changed).
+    #
+    # The assignment is unconditional for a managed spec, falling back to the
+    # inherit sentinel when the template pins nothing: "track the shipped
+    # default" and "pin whatever happens to be in the spec already" are not the
+    # same state, and only the sentinel makes a managed spec converge on the
+    # same value a clean install writes. It is also what lets the global below
+    # return to "auto" — leaving the field alone here would strand a concrete
+    # model that this propagation itself wrote, and a spec pin outranks the
+    # global in resolve_effective_model, so "auto" would be unreachable from the
+    # configuration surface. Writing the sentinel rather than deleting the key
+    # is equivalent to the resolver (normalize_agent_model collapses "auto" and
+    # an absent key to the same "inherit") and keeps the spec shaped like the
+    # shipped template.
     if agent_state.get_model_managed(name):
         shipped_model = (_load_json(_shipped_defaults()) or {}).get("model")
-        if shipped_model:
-            config["model"] = shipped_model
+        config["model"] = shipped_model or DEFAULT_MODEL
 
     # config.json agent.model is the user-facing authority (kirocrew config set
     # agent.model). An explicit pick (not the "auto" sentinel) is propagated into
     # the agent file so kiro-cli's --agent startup load matches it; otherwise the
     # stale agent-file model shadows config.json and session/set_model loses the
     # startup race. "auto" defers to managed/shipped resolution above.
-    mc_model = (mc_cfg.get("agent") or {}).get("model")
-    if mc_model and mc_model != "auto":
+    #
+    # Read through normalize_agent_model, the resolver's own chokepoint for
+    # hand-edited values: it collapses "auto", surrounding whitespace and any
+    # non-string to "" (inherit). That keeps this branch's notion of "the global
+    # defers" identical to the resolver's, and it is what stops a junk value
+    # (` auto `, an int) from reaching a spec kiro-cli validates with
+    # deny_unknown_fields — a spec it rejects wholesale, silently falling back to
+    # the default agent.
+    mc_model = normalize_agent_model((mc_cfg.get("agent") or {}).get("model"))
+    if mc_model:
         config["model"] = mc_model
 
     # Ensure kiro-cli uses agent-level mcpServers exclusively (not global
@@ -1743,6 +1769,19 @@ def _norm_mcp_spec(spec: Any) -> Any:
     if not isinstance(spec, dict):
         return spec
     return {k: v for k, v in spec.items() if not (k in ("env", "args") and not v)}
+
+
+def _alias_family_base(key: str) -> str:
+    """Strip a collision suffix, yielding the alias its family is named for.
+
+    ``_normalize_mcp_server_keys`` preserves a server whose alias is already held
+    by a different spec under the lowest free ``<alias>-<n>``, so that key is the
+    only name for a server no source spells. Callers resolving ownership through
+    it must still confirm identity: sharing a family means sharing an alias, not
+    being the same server.
+    """
+    base, _, tail = key.rpartition("-")
+    return base if base and tail.isdigit() else key
 
 
 def _normalize_mcp_server_keys(config: dict) -> None:
@@ -2236,8 +2275,12 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         if isinstance(spec, dict) and name not in managed_names:
             # Copy so config never aliases the source dict — a later update()
             # (kirocrew merge) must not mutate shared_mcp, which is reused as a
-            # fallback candidate during command validation below.
-            config.setdefault("mcpServers", {}).setdefault(name, dict(spec))
+            # fallback candidate during command validation below. The copy also
+            # drops our authorship marker: it records who wrote the entry in a
+            # SHARED file and has no meaning in a spec we render ourselves, so
+            # keeping it would put a key in front of the runtime that says nothing
+            # to it.
+            config.setdefault("mcpServers", {}).setdefault(name, without_marker(spec))
 
     # Merge shared MCP servers from edition-contributed provider globals (CPP
     # seam) — now LOWER priority than Kiro global; setdefault is a no-op when
@@ -2259,7 +2302,7 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
             if name not in managed_names:
                 # Copy (see note above) so the source dict stays pristine for
                 # the fallback-candidate lookup.
-                config.setdefault("mcpServers", {}).setdefault(name, dict(spec))
+                config.setdefault("mcpServers", {}).setdefault(name, without_marker(spec))
 
     # ~/.kiro/crew/mcp.json overrides kiro mcp.json for the kirocrew agent —
     # kirocrew-specific config wins in a tie.
@@ -2314,12 +2357,92 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         return shutil.which(cmd, path=augmented_path(base))
 
     valid_servers: dict[str, Any] = {}
-    for name, spec in config.get("mcpServers", {}).items():
+    # The store is keyed by its own RAW name, but ``name`` below iterates the
+    # config, whose slashed keys a previous pass rewrote to their alias
+    # (``_normalize_mcp_server_keys``). Looking the store up by the raw key alone
+    # would miss the owner of an aliased entry and fall through to "unmanaged",
+    # preserving the previously-rendered wire hints -- so an edit that cleared them
+    # would answer 200 and never take effect. Alias-keyed for that reason, and the
+    # mapping skips a malformed value for the same reason the merge does.
+    #
+    # A LIST per alias, not one entry: the mapping is many-to-one, so two store
+    # names can share an alias. Keeping only the last would strip the other server
+    # of its owner entirely, and the identity check below would then read it as
+    # unmanaged rather than simply looking at the next candidate.
+    _store_by_alias: dict[str, list[dict]] = {}
+    for _n, _s in kirocrew_mcp.items():
+        if isinstance(_s, dict):
+            _store_by_alias.setdefault(mcp_server_alias(_n), []).append(_s)
+    _cfg_servers: dict[str, Any] = config.get("mcpServers", {})
+    for name, spec in _cfg_servers.items():
         if not isinstance(spec, dict):
             continue
-        # Remote Streamable HTTP servers — preserve as-is (url-based, no command)
+        # Remote Streamable HTTP servers — preserved as-is except for the OAuth
+        # hints, which are renamed to the fields kiro-cli actually deserializes.
+        # This is the one boundary where the internal spelling (``scopes`` /
+        # ``clientId``, what mcp.json and the UI use) becomes the wire spelling,
+        # so every source file keeps one shape and only the emitted spec changes.
+        #
+        # The dashboard store's own entry answers both ownership and source. A
+        # usable dict means the store owns this name and states its hints (in
+        # either spelling -- the scope-toggle preservation rule copies a global
+        # spec in verbatim, so a store entry can legitimately hold wire form).
+        # Anything else -- absent, or a malformed value the merge above skipped
+        # and which therefore supplied nothing -- means we own nothing here, and
+        # the entry's own wire values are the only copy of configuration written
+        # in a file we do not control.
         if spec.get("url"):
-            valid_servers[name] = spec
+            # An entry with no store owner is unmanaged: its own wire values are
+            # the only copy of configuration written in a file we do not control,
+            # so they are preserved verbatim. That includes a server defined only
+            # in the agent config itself (``kiro-cli mcp add --agent kirocrew``, a
+            # hand-edit) -- the rebuild merges onto that file, so clearing its
+            # hints here would destroy the only copy. Narrowing a grant is the
+            # editor's job, where the change is explicit and reversible.
+            # A malformed store value contributes nothing -- and "nothing"
+            # includes no veto over the alias lookup, so it cannot shadow a
+            # usable slashed owner that aliases onto this name. It still does not
+            # confer ownership: a name with no usable entry anywhere stays
+            # unmanaged, because the fallback yields ``None`` too.
+            #
+            # ``mcp_server_alias`` is many-to-one, so an alias match is NOT an
+            # identity match: an unrelated user-owned name can collide with a
+            # managed one. A binding that GRANTS -- these hints are credentials
+            # and requested access -- therefore also demands transport identity,
+            # or one server's grant lands on another's. (The disabled guard below
+            # is the opposite direction and stays name-only on purpose: see there.)
+            _store_entry = kirocrew_mcp.get(name)
+            if not isinstance(_store_entry, dict):
+                _url = spec.get("url")
+                _candidates = [
+                    c
+                    for c in _store_by_alias.get(mcp_server_alias(name), ())
+                    if c.get("url") == _url
+                ]
+                # Nothing in a name says whether normalization minted it or a user
+                # typed it, and a url is not an identity when two owners share one.
+                # So the collision family is searched only with corroboration that
+                # a mint was actually forced -- the plain alias is held by a
+                # DIFFERENT transport -- and only when exactly one owner answers.
+                # An ambiguous or uncorroborated family leaves the entry unmanaged,
+                # because preserving a grant costs less than moving one.
+                if not _candidates:
+                    _base = _alias_family_base(name)
+                    _held = _cfg_servers.get(_base)
+                    if (
+                        _base != name
+                        and isinstance(_held, dict)
+                        and _held.get("url") != _url
+                    ):
+                        _candidates = [
+                            c
+                            for c in _store_by_alias.get(_base, ())
+                            if c.get("url") == _url
+                        ]
+                _store_entry = _candidates[0] if len(_candidates) == 1 else None
+            valid_servers[name] = kiro_oauth_wire_entry(
+                spec, store_entry=_store_entry, server=name
+            )
             continue
         # Build candidate specs in priority order: the merged winner first,
         # then the same server from each source as a resolution fallback.
@@ -2397,15 +2520,52 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     # These are explicitly installed by the user via `aim mcp install` or
     # manual mcp.json edits — unlike managed servers, they should always
     # be registered regardless of fresh/existing config state.
+    #
+    # ``kirocrew_mcp`` is in this chain for the same reason: it holds every entry
+    # the user added through the dashboard, including Connections providers. It
+    # was omitted originally, and because ``tools`` is a CLOSED allowlist (no
+    # wildcard) the result was silent and total — kiro-cli mounted a connected
+    # provider and exposed none of its tools, so a fully consented Notion
+    # connection still answered "I don't have a Notion integration". The entry
+    # reached ``mcpServers`` (via the merges above) but never ``tools``.
     _shared_added: list[str] = []
     _shared_removed: list[str] = []
     _shared_not_auto: list[str] = []
-    for name, spec in itertools.chain(extra_shared_mcp.items(), shared_mcp.items()):
+    # ``disabled`` is TIGHTEST-WINS across scopes, because the scopes disagree by
+    # design: ``POST /api/mcp/toggle enabled:false`` writes ``disabled: true``
+    # into the kiro global ONLY, so a same-named dashboard-store entry legitimately
+    # carries no such key -- and this chain visits the store LAST. Judging each
+    # spec in isolation would let that final entry undo the earlier removal,
+    # clear the flag off the emitted spec, and re-add the ref to BOTH lists.
+    # ``allowedTools`` is the one path that never reaches the PreToolUse gate, so
+    # the operator's disable would be silently void for every tool on that server.
+    #
+    # Both sides are keyed by the ALIAS, not the raw key, because that is the
+    # identity the emitted ref carries and the mapping is many-to-one: a slashed
+    # global key and a slash-free store key are different dict keys that mount the
+    # same ``@ref``. Comparing raw keys would let the alias-spelled entry look
+    # like a different server and re-add the ref the disable just removed.
+    #
+    # Unlike the OAuth-hint binding above, this match deliberately does NOT also
+    # demand transport identity. The two run in opposite directions: over-matching
+    # here only over-disables -- an availability cost, no privilege gained --
+    # while under-matching would let an operator's disable be missed on the one
+    # path (``allowedTools``) that never reaches the PreToolUse gate. Denying is
+    # allowed to be loose; granting is not.
+    _disabled_anywhere = {
+        mcp_server_alias(srv)
+        for scope in (extra_shared_mcp, shared_mcp, kirocrew_mcp)
+        for srv, srv_spec in scope.items()
+        if isinstance(srv_spec, dict) and srv_spec.get("disabled")
+    }
+    for name, spec in itertools.chain(
+        extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items()
+    ):
         if not isinstance(spec, dict) or name in managed_names:
             continue
         alias = mcp_server_alias(name)
         ref = f"@{alias}"
-        if spec.get("disabled"):
+        if spec.get("disabled") or alias in _disabled_anywhere:
             for key in ("tools", "allowedTools"):
                 lst = config.get(key)
                 if lst is not None and ref in lst:
@@ -2806,19 +2966,31 @@ def _install_knowledge_agent() -> None:
     """Generate and install the kirocrew-knowledge agent config.
 
     This agent is used by the Knowledge Library's LLMPool for document
-    extraction.  It uses claude-haiku-4.5 (cheapest model).  The previous
-    Amazon-internal MCP server / internal-websites wiring is omitted
-    on public installs; the agent ships without MCP servers and relies on the
-    model's own capabilities for extraction.  Symbol preserved for callers.
+    extraction. By default it uses the user's configured agent.model (so
+    extraction runs on the same model as chat). If the user sets
+    knowledge.extraction_model explicitly, that model is used instead —
+    allowing a cheaper model for extraction without changing the chat default.
     """
+    from kiro_crew.config.loader import KiroCrewConfig
+
     path = kiro_agents_dir_path() / _KNOWLEDGE_AGENT_FILENAME
+
+    # Resolve model: knowledge.extraction_model > agent.model > "auto"
+    try:
+        cfg = KiroCrewConfig.load()
+        model = cfg.knowledge.extraction_model.strip()
+        if not model:
+            # Use the user's default model (same as chat).
+            model = cfg.agent.model or "auto"
+    except Exception:
+        model = "auto"
 
     config: dict[str, object] = {
         "name": "kirocrew-knowledge",
         "description": (
             "Dedicated agent for knowledge extraction, categorization, " "and summarization."
         ),
-        "model": "claude-haiku-4.5",
+        "model": model,
         "includeMcpJson": False,
         "prompt": _KNOWLEDGE_SYSTEM_PROMPT,
         "mcpServers": {},
@@ -2826,7 +2998,7 @@ def _install_knowledge_agent() -> None:
     }
 
     _atomic_json_write(path, config)
-    logger.info("Installed knowledge agent config: %s", path)
+    logger.info("Installed knowledge agent config: %s (model=%s)", path, model)
 
 
 _RESEARCH_SYSTEM_PROMPT = """# KiroCrew Research Worker

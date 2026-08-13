@@ -8,12 +8,14 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from conftest import make_escaping_link
 from kiro_crew.apps.manifest import (
     AppManifest,
     CapabilityDependencies,
     Dependencies,
     SetupConfig,
 )
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +70,46 @@ class TestValidation:
         errors = m.validate()
         assert any("kebab-case" in e for e in errors)
 
+    def test_reserved_name_rejected(self):
+        """The system.* notification namespace stays un-shadowable."""
+        m = AppManifest.from_dict(_valid_manifest(name="system"))
+        errors = m.validate()
+        assert any("reserved" in e for e in errors)
+
+    @pytest.mark.parametrize("name", sorted(WINDOWS_DEVICE_STEMS))
+    def test_every_windows_device_stem_is_rejected(self, name):
+        """The whole documented device-name set, not just the stems that happen
+        to fail on one build. An app name is a persistent published identity, so
+        admitting a stem is a one-way door while over-refusing is freely
+        relaxable."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("not portable" in e for e in errors), (name, errors)
+
+    def test_device_stem_vocabulary_is_not_duplicated(self):
+        """One definition, shared with the git-branch grammar. Two copies of a
+        22-name set drift, and the branch rule is the precedent this follows."""
+        from kiro_crew.apps.manifest import UNPORTABLE_APP_NAMES
+
+        assert UNPORTABLE_APP_NAMES is WINDOWS_DEVICE_STEMS
+
+    @pytest.mark.parametrize("name", ["null-app", "console", "com10", "lpt10", "connect"])
+    def test_names_merely_resembling_a_device_stay_valid(self, name):
+        """The rule matches the exact stem. ``com10``/``lpt10`` are outside the
+        reserved 1-9 range and the rest are ordinary words."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        assert m.validate() == []
+
+    @pytest.mark.parametrize("name", ["demo\n", "nul\n", "system\n", "demo\r\n", "demo\n\n"])
+    def test_a_trailing_newline_cannot_slip_through(self, name):
+        """``$`` also matches before a trailing newline, so a ``$``-anchored
+        grammar admits ``"demo\\n"`` — and worse, ``"nul\\n"`` and ``"system\\n"``
+        evade the reserved-name checks that run after it, because those compare
+        against the exact string. ``KEBAB_RE`` is anchored with ``\\Z``."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("kebab-case" in e for e in errors), (name, errors)
+
     def test_invalid_version_format(self):
         m = AppManifest.from_dict(_valid_manifest(version="not-semver"))
         errors = m.validate()
@@ -116,22 +158,64 @@ class TestValidation:
         assert m.validate() == []
 
     def test_canonical_containment_with_app_root(self, tmp_path):
-        # A symlink whose target escapes the app root must be flagged when
+        # A link whose target escapes the app root must be flagged when
         # app_root is known; a plain relative path inside the root passes.
         app_root = tmp_path / "app"
         app_root.mkdir()
         outside = tmp_path / "outside"
         outside.mkdir()
         (outside / "secret.py").write_text("x = 1\n")
-        (app_root / "link.py").symlink_to(outside / "secret.py")
         (app_root / "ok.py").write_text("y = 2\n")
+        entry_point = make_escaping_link(app_root, outside)
 
-        escaping = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": "link.py"}))
+        escaping = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": entry_point}))
         errors = escaping.validate(app_root=app_root)
         assert any("path traversal" in e for e in errors)
 
         contained = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": "ok.py"}))
         assert contained.validate(app_root=app_root) == []
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "/tmp/evil.py",  # POSIX-absolute
+            "\\\\server\\share\\evil.py",  # UNC
+            "C:/evil.py",  # drive + root, forward slashes
+            "C:\\evil.py",  # drive + root, backslashes
+            "D:evil.py",  # drive-RELATIVE: no root, but relocates the join
+            "..\\evil.py",  # backslash traversal
+            "../evil.py",  # forward-slash traversal
+            "ui/../../evil.py",  # traversal in a non-leading segment
+        ],
+    )
+    def test_rooted_or_traversing_entrypoint_rejected(self, entry, tmp_path):
+        # Rooted and traversing paths must be refused identically whether or not
+        # app_root is known, and on either host OS -- an app-resource path is
+        # joined onto the app root, so anything carrying a drive, a root anchor
+        # or a ".." segment can relocate that join. Asserting BOTH call forms is
+        # what pins host-independence: a manifest is portable data validated on
+        # whichever host installs the app, and "..\evil.py" resolves *inside* a
+        # POSIX app_root, so a validator that leaned on canonical containment
+        # for traversal would accept on POSIX what it rejects on Windows.
+        m = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": entry}))
+        assert any("path traversal" in e for e in m.validate())
+        assert any("path traversal" in e for e in m.validate(app_root=tmp_path))
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "index.mjs",
+            "backend/server.py",
+            "ui\\index.mjs",  # backslash separator is not a traversal
+            "kiro_crew.apps.builtins.x.server",  # dotted module-style
+            "a..b/c.py",  # ".." inside a segment, not a segment itself
+        ],
+    )
+    def test_plain_relative_entrypoint_accepted(self, entry):
+        # Guards the flip side of the containment rule: widening it must not
+        # start refusing the ordinary relative paths every shipped app declares.
+        m = AppManifest.from_dict(_valid_manifest(backend={"entryPoint": entry}))
+        assert m.validate() == []
 
     def test_cron_missing_name(self):
         m = AppManifest.from_dict(_valid_manifest(crons=[{"every": 60, "message": "hi"}]))

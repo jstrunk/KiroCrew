@@ -3,7 +3,7 @@ import { useIsMobile } from '../../hooks/useIsMobile'
 import { useDevMode } from '../../hooks/useDevMode'
 import { usePointerDrag } from '../../hooks/usePointerDrag'
 import { Reorder } from 'framer-motion'
-import { FileText, Bot, Workflow, ScrollText, MessageSquare, TerminalSquare, GitCompare, GitPullRequest, Plus, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, PanelRight, Layers } from 'lucide-react'
+import { FileText, Bot, Workflow, ScrollText, MessageSquare, TerminalSquare, GitCompare, GitPullRequest, Plus, X, Hash, Pen, Columns2, Component, Globe, CircleDot, Folder, PanelRight, PanelBottom, Layers } from 'lucide-react'
 import { PanelRightLight, PanelBottomSolid } from '../../components/icons/panels'
 import ActivityViewer from './ActivityViewer'
 import DiffPanel from '../../components/DiffPanel'
@@ -19,6 +19,7 @@ import { adoptTab as adoptBottomTerminal } from '../../hooks/useBottomTerminal'
 import type { usePanelTabs, ViewKind, PanelTab, TabKind } from '../../hooks/usePanelTabs'
 import { PINNED_VIEWS, useAllAppTabs } from '../../hooks/usePanelTabs'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
+import { useSidePanelDock } from '../../hooks/useSidePanelDock'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator
 } from '../../components/ui/dropdown-menu'
@@ -55,7 +56,7 @@ const KIND_ICON: Record<TabKind, ReactNode> = {
  * Keyed by `ViewKind | 'terminal'` (not `string`) so adding a view without its
  * label and description is a type error rather than a missing-key render.
  */
-export const NEW_MENU_LABEL_KEY: Record<ViewKind | 'terminal', string> = {
+export const NEW_MENU_LABEL_KEY: Record<ViewKind, string> = {
   changes: 'pages.chat.sidePanel.menu_changes',
   issues: 'pages.chat.sidePanel.menu_issues',
   files: 'pages.chat.sidePanel.menu_files',
@@ -66,10 +67,9 @@ export const NEW_MENU_LABEL_KEY: Record<ViewKind | 'terminal', string> = {
   context: 'pages.chat.sidePanel.menu_context',
   side: 'pages.chat.sidePanel.menu_side',
   browser: 'pages.chat.sidePanel.menu_browser',
-  terminal: 'pages.chat.sidePanel.menu_terminal',
 }
 
-export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
+export const NEW_MENU_DESC_KEY: Record<ViewKind, string> = {
   changes: 'pages.chat.sidePanel.menu_changes_desc',
   issues: 'pages.chat.sidePanel.menu_issues_desc',
   files: 'pages.chat.sidePanel.menu_files_desc',
@@ -80,7 +80,6 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
   context: 'pages.chat.sidePanel.menu_context_desc',
   side: 'pages.chat.sidePanel.menu_side_desc',
   browser: 'pages.chat.sidePanel.menu_browser_desc',
-  terminal: 'pages.chat.sidePanel.menu_terminal_desc',
 }
 
 /** Views offered by the + menu, in the three semantic groups the menu renders
@@ -97,7 +96,7 @@ export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
  *  Every key of `NEW_MENU_LABEL_KEY` must appear exactly once across the
  *  groups — `sidePanelAddMenu.test.tsx` pins that partition, so adding a view
  *  without placing it in a group fails rather than silently dropping it. */
-const NEW_MENU_GROUPS: { kind: ViewKind | 'terminal'; icon: ReactNode }[][] = [
+const NEW_MENU_GROUPS: { kind: ViewKind; icon: ReactNode }[][] = [
   // Session output — what this chat referenced or produced. (Changes / Files /
   // Artifacts are auto-pinned and filtered out below; they are listed here so
   // this table stays the complete catalog of views.)
@@ -113,7 +112,6 @@ const NEW_MENU_GROUPS: { kind: ViewKind | 'terminal'; icon: ReactNode }[][] = [
   [
     { kind: 'side', icon: <MessageSquare size={15} /> },
     { kind: 'browser', icon: <Globe size={15} /> },
-    { kind: 'terminal', icon: <TerminalSquare size={15} /> },
   ],
   // Diagnostics.
   [
@@ -131,7 +129,7 @@ const VIEW_KINDS = new Set<TabKind>(['changes', 'issues', 'files', 'artifacts', 
  *  belongs in a non-developer's menu. Gating BOTH empties the diagnostics group
  *  outright when Developer Mode is off — which is exactly the empty-group case
  *  `newMenuSections` drops. */
-const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context'])
+const DEV_ONLY_VIEWS = new Set<ViewKind>(['logs', 'context'])
 
 /** Which `+`-menu entries are offered, given the two gates that hide entries:
  *  Terminal is hidden when the feature is disabled server-side, and the
@@ -140,16 +138,14 @@ const DEV_ONLY_VIEWS = new Set<ViewKind | 'terminal'>(['logs', 'context'])
  *  listed; they appear on their own when they have content.
  *
  *  Grouped, and **emptied groups are dropped**: with Developer Mode off the
- *  whole diagnostics group disappears, and Terminal disabled shrinks Workspaces
- *  to two rows — a group that filtered down to nothing would otherwise render
- *  as a separator with no rows after it. */
+ *  whole diagnostics group disappears. A group that filtered down to nothing
+ *  would otherwise render as a separator with no rows after it. */
 export function newMenuSections(
   opts: { devMode: boolean; terminalEnabled: boolean },
-): { kind: ViewKind | 'terminal'; icon: ReactNode }[][] {
+): { kind: ViewKind; icon: ReactNode }[][] {
   return NEW_MENU_GROUPS
     .map(group => group.filter(item =>
-      (opts.terminalEnabled || item.kind !== 'terminal')
-      && (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind))
+      (opts.devMode || !DEV_ONLY_VIEWS.has(item.kind))
       && !(PINNED_VIEWS as string[]).includes(item.kind),
     ))
     .filter(group => group.length > 0)
@@ -198,6 +194,11 @@ interface SidePanelProps {
    *  clamp and the user's persisted width, and retires the resize handle —
    *  there is nothing to resize against. Undefined = beside mode. */
   fillWidth?: number
+  /** Whether this frame can host the bottom dock (the main App shell has a
+   *  bottom grid row; embed/popout/artifact frames do not). When false, the
+   *  panel always renders as the right column and the dock toggle is hidden,
+   *  regardless of the global dock preference. */
+  canDockBottom?: boolean
 }
 
 /**
@@ -295,7 +296,7 @@ export default function SidePanel({
   projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
   issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
   onAddSourceToChat, onSubmitComments, onFileSave, onClose,
-  inlinePreviewPath, onInlinePreviewChange, expanded, fillWidth,
+  inlinePreviewPath, onInlinePreviewChange, expanded, fillWidth, canDockBottom = true,
 }: SidePanelProps) {
   const { tabs, activeId, openView, openTerminal, setActive, closeTab, patchTab, setOrder, syncPinned, openFolder } = tabsCtl
   // EVERY app frame, every slot, rendered from one stable-keyed list below so a
@@ -371,15 +372,36 @@ export default function SidePanel({
     return !isNaN(v) && v >= MIN_W ? v : 460
   })
   const widthRef = useRef(width); widthRef.current = width
+  // Dock position (right column vs bottom row). Bottom dock is height-
+  // resizable instead of width-resizable, so it carries its own persisted
+  // dimension. Kept separate from width so flipping back and forth restores
+  // each orientation's last size.
+  const [dock, setDock] = useSidePanelDock()
+  const HEIGHT_KEY = 'mc-side-panel-height'
+  const MIN_H = 200
+  const [height, setHeight] = useState(() => {
+    const v = parseInt(localStorage.getItem(HEIGHT_KEY) || '', 10)
+    return !isNaN(v) && v >= MIN_H ? v : 360
+  })
+  const heightRef = useRef(height); heightRef.current = height
   // Responsive clamp: the user's chosen width is persisted untouched, but the
   // rendered width yields to the window so the chat keeps its reserved
   // minimum. On mobile the panel simply takes the full width. Re-measured on
   // window resize AND when the header clusters change size (e.g. the readout
   // capsule expanding), since the header's content need is part of the reserve.
   const isMobile = useIsMobile()
+  // Bottom dock only applies on desktop; mobile always renders as the
+  // full-width inline panel regardless of the stored preference.
+  const isBottom = canDockBottom && dock === 'bottom' && !isMobile
   const [maxW, setMaxW] = useState(() => window.innerWidth - measureSidePanelReservedW())
+  // Bottom-dock height cap: leave the topbar row + a usable chat minimum
+  // visible above the panel. Re-measured on resize.
+  const [maxH, setMaxH] = useState(() => Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
   useEffect(() => {
-    const recalc = () => setMaxW(window.innerWidth - measureSidePanelReservedW())
+    const recalc = () => {
+      setMaxW(window.innerWidth - measureSidePanelReservedW())
+      setMaxH(Math.max(MIN_H, Math.round(window.innerHeight * 0.85)))
+    }
     recalc()
     window.addEventListener('resize', recalc)
     // Observe the header's clusters (their intrinsic width is independent of
@@ -392,6 +414,7 @@ export default function SidePanel({
     return () => { window.removeEventListener('resize', recalc); ro.disconnect() }
   }, [])
   const effectiveWidth = sidePanelEffectiveWidth({ fillWidth, isMobile, expanded, width, maxW })
+  const effectiveHeight = Math.max(MIN_H, Math.min(height, maxH))
   // While the user drags the resize handle, every mousemove shifts the whole
   // panel's viewport position (the handle is on the LEFT edge; the right edge
   // is pinned to the window). Framer's layout projection on each Reorder.Item
@@ -410,13 +433,36 @@ export default function SidePanel({
     },
     onEnd: () => { setResizing(false); safeSetItem(WIDTH_KEY, String(widthRef.current)) },
   })
+  // Top-edge resize for the bottom dock: drag up to grow the panel's height.
+  // The bottom edge is pinned to the window, so a negative dy (dragging up)
+  // widens the panel.
+  const startHRef = useRef(0)
+  const panelResizeV = usePointerDrag({
+    threshold: 0,
+    onStart: () => { startHRef.current = heightRef.current; setResizing(true) },
+    onMove: ({ dy }) => {
+      const max = Math.max(MIN_H, Math.round(window.innerHeight * 0.85))
+      setHeight(Math.max(MIN_H, Math.min(startHRef.current - dy, max)))
+    },
+    onEnd: () => { setResizing(false); safeSetItem(HEIGHT_KEY, String(heightRef.current)) },
+  })
 
   return (
-    <div className="shrink-0 min-h-0 mt-0 mb-2 flex flex-col bg-bg overflow-hidden relative border-l border-t border-b border-border rounded-l-xl" style={{ width: effectiveWidth, maxWidth: '100vw' }}>
-      {/* Left-edge resize handle */}
-      {fillWidth == null && <div role="separator" aria-orientation="vertical" aria-label={i18nT('pages.chat.sidePanel.resize_panel')} className="absolute left-0 top-0 bottom-0 w-[6px] cursor-col-resize z-30 group/drag" style={{ touchAction: 'none' }} {...panelResize}>
-        <div className="absolute left-0 top-0 bottom-0 w-[2px] transition-colors duration-200 bg-transparent group-hover/drag:bg-accent resize-accent" />
-      </div>}
+    <div
+      className={`shrink-0 flex flex-col bg-bg overflow-hidden relative ${isBottom ? 'min-w-0 w-full border-t border-border' : 'min-h-0 mt-0 mb-2 border-l border-t border-b border-border rounded-l-xl'}`}
+      style={isBottom ? { height: effectiveHeight, maxHeight: '85vh', width: '100%' } : { width: effectiveWidth, maxWidth: '100vw' }}
+    >
+      {isBottom ? (
+        /* Top-edge resize handle — drag up/down to size the bottom dock. */
+        <div role="separator" aria-orientation="horizontal" aria-label={i18nT('pages.chat.sidePanel.resize_panel')} className="absolute left-0 right-0 top-0 h-[6px] cursor-row-resize z-30 group/drag" style={{ touchAction: 'none' }} {...panelResizeV}>
+          <div className="absolute left-0 right-0 top-0 h-[2px] transition-colors duration-200 bg-transparent group-hover/drag:bg-accent resize-accent" />
+        </div>
+      ) : fillWidth == null ? (
+        /* Left-edge resize handle */
+        <div role="separator" aria-orientation="vertical" aria-label={i18nT('pages.chat.sidePanel.resize_panel')} className="absolute left-0 top-0 bottom-0 w-[6px] cursor-col-resize z-30 group/drag" style={{ touchAction: 'none' }} {...panelResize}>
+          <div className="absolute left-0 top-0 bottom-0 w-[2px] transition-colors duration-200 bg-transparent group-hover/drag:bg-accent resize-accent" />
+        </div>
+      ) : null}
       {/* Tab strip — drag chips horizontally to reorder (framer Reorder).
           Per Figma "left-nav" (7328:10637): the row is a rounded elevated card
           (bg-elevated, 12px radius, 8px padding) floating above the content,
@@ -432,6 +478,16 @@ export default function SidePanel({
         >
           <PanelRightLight size={15} />
         </button>
+        {canDockBottom && !isMobile && (
+          <button
+            className="flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
+            onClick={() => setDock(isBottom ? 'right' : 'bottom')}
+            title={isBottom ? i18nT('pages.chat.sidePanel.dock_right') : i18nT('pages.chat.sidePanel.dock_bottom')}
+            aria-label={isBottom ? i18nT('pages.chat.sidePanel.dock_right') : i18nT('pages.chat.sidePanel.dock_bottom')}
+          >
+            {isBottom ? <PanelRight size={15} /> : <PanelBottom size={15} />}
+          </button>
+        )}
         <span aria-hidden="true" className="w-px h-5 bg-border shrink-0" />
         {/* Pinned views (Changes / Files / Artifacts): always present, fixed at
             the front, non-closable, not draggable, compact. Wrapped in a

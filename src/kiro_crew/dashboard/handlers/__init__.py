@@ -95,6 +95,10 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_cron_cancel,
     api_cron_delete,
     api_cron_enable,
+    api_cron_folders,
+    api_cron_folders_create,
+    api_cron_folders_delete,
+    api_cron_folders_update,
     api_cron_history,
     api_cron_history_all,
     api_cron_history_detail,
@@ -176,7 +180,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_gateway_enable,
     api_mcp_gateway_metrics,
     api_mcp_gateway_servers,
-    api_mcp_gateway_set_poolable,
+    api_mcp_gateway_set_stub,
     api_mcp_gateway_status,
     api_mcp_global_scopes,
     api_mcp_probe,
@@ -293,9 +297,19 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     api_skills,
     api_skills_create,
     api_skills_pending,
+    api_skills_pending_dismiss_all,
 )
 
 # ── Sessions (extracted to handlers/sessions.py) ──
+from kiro_crew.dashboard.handlers.session_storage import (  # noqa: E402, F401
+    api_session_inventory,
+    api_session_inventory_detail,
+    api_session_inventory_trash,
+    api_session_storage,
+    api_session_storage_cleanup,
+    api_session_storage_empty,
+    api_session_storage_restore,
+)
 from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     _SHUTDOWN_TIMEOUT_SECS,
     _fetch_usage_bg,
@@ -325,7 +339,14 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.side import (  # noqa: E402, F401
     api_side_close,
     api_side_open,
+    api_side_queue_cancel,
+    api_side_queue_edit,
     api_side_turn,
+)
+
+# ── Skill context budget (extracted to handlers/skill_budget.py) ──
+from kiro_crew.dashboard.handlers.skill_budget import (  # noqa: E402, F401
+    api_skills_budget,
 )
 from kiro_crew.dashboard.handlers.sso_login import (  # noqa: E402, F401
     api_sso_login_ws,
@@ -338,6 +359,9 @@ from kiro_crew.dashboard.handlers.steering import (  # noqa: E402, F401
     list_steering_blocking,
     resolve_steering_file,
     steering_roots,
+)
+from kiro_crew.dashboard.handlers.tailnet import (  # noqa: E402, F401
+    api_tailnet_status,
 )
 
 # ── Task Runner (extracted to handlers/taskrunner.py) ──
@@ -366,6 +390,7 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
 )
 from kiro_crew.dashboard.handlers.telemetry import (  # noqa: E402, F401
     api_beacon_status,
+    api_collection_status,
     api_context_trace,
     api_telemetry_startup,
 )
@@ -402,13 +427,16 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     _update_info,
     _version_key,
     api_changelog,
+    api_gateway_restart,
     api_log_level,
     api_log_level_get,
     api_logs,
+    api_releases,
     api_stream,
     api_update_apply,
     api_update_auto,
     api_update_cancel,
+    api_update_channel,
     api_update_check,
     api_update_simulate,
     get_update_info,
@@ -481,14 +509,16 @@ def _list_aim_prompts() -> list[dict[str, Any]]:
                 logger.debug("Skipping sensitive path: %s", sop_file)
                 continue
             name = sop_file.stem.removesuffix(".sop")
-            result.append({
-                "name": name,
-                "fullName": f"agent-sop:{name}",
-                "description": _extract_sop_description(sop_file),
-                "path": resolved,
-                "package": root.name,
-                "source": "package",
-            })
+            result.append(
+                {
+                    "name": name,
+                    "fullName": f"agent-sop:{name}",
+                    "description": _extract_sop_description(sop_file),
+                    "path": resolved,
+                    "package": root.name,
+                    "source": "package",
+                }
+            )
 
     # Also scan ~/.kiro/prompts/ for user-created prompts
     home = Path.home()
@@ -587,4 +617,8 @@ from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_denied_commands_disable_all,
     api_denied_commands_list,
     api_governance_policy,
+    api_trusted_app_grant,
+    api_trusted_app_revoke,
+    api_trusted_apps_allow_all,
+    api_trusted_apps_list,
 )

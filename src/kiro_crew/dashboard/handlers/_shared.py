@@ -18,9 +18,14 @@ from kiro_crew.agent_discovery import (
 )
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.skills import skills_dir
+from kiro_crew.slack.handler import (
+    _hydrate_conv_flags,
+    is_thread_incognito,
+    is_thread_temporary,
+)
 
 if TYPE_CHECKING:
     from kiro_crew.platform.interfaces import CapabilityManager
@@ -585,7 +590,7 @@ SKILL_TREE_MAX_ENTRIES = 500
 SKILL_FILE_MAX_BYTES = 1_048_576  # 1 MiB
 
 
-def _resolve_skill_root(name: str, state: DashboardState) -> Path | None:
+def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "") -> Path | None:
     """Return the absolute skill directory for *name*, or None.
 
     Accepts the same nested-name scheme used by the existing skill API:
@@ -594,6 +599,11 @@ def _resolve_skill_root(name: str, state: DashboardState) -> Path | None:
     - ``package/<skill>`` → resolved via _resolve_aim_skill_path() lookup
     - ``kiro-user/<skill>`` → ``~/.kiro/skills/<skill>``
     - ``kiro-workspace/<skill>`` → ``<project>/.kiro/skills/<skill>``
+
+    *session_key* scopes ``kiro-workspace/`` to the requesting chat slot's
+    project. Without it, resolution falls back to the single project shared by
+    every slot — and fails closed to ``None`` when open slots disagree, since
+    guessing could read the wrong checkout (#2457).
 
     The returned path is always under one of the allowed roots — paths
     that try to escape via ``..`` or symlinks are rejected.
@@ -605,9 +615,7 @@ def _resolve_skill_root(name: str, state: DashboardState) -> Path | None:
         root = Path.home() / ".kiro" / "skills"
     elif name.startswith("kiro-workspace/"):
         rel = name[len("kiro-workspace/") :]
-        # We cannot reliably resolve project dir here — gate this to
-        # paths under any active slot's project directory.
-        proj = active_project_dir(state)
+        proj = active_project_dir(state, session_key)
         if proj is None:
             return None
         root = proj / ".kiro" / "skills"
@@ -705,16 +713,19 @@ MAX_AGENT_SKILLS = 100
 _GLOB_CHARS = ("*", "?", "[")
 
 
-def _skill_key_roots(state: DashboardState) -> list[tuple[str, Path]]:
+def _skill_key_roots(state: DashboardState, session_key: str = "") -> list[tuple[str, Path]]:
     """``(key_prefix, root)`` pairs for every location skills are keyed from.
 
     Mirrors :func:`_resolve_skill_root`'s roots, in the same precedence order,
     so an enumerated key names the same directory that function would resolve.
     Roots that cannot exist in this deployment (no active project dir, no
-    edition roots) are omitted.
+    edition roots) are omitted. *session_key* scopes the ``kiro-workspace/``
+    root to the requesting chat slot's project, exactly as
+    :func:`_resolve_skill_root` does — the two MUST agree or an enumerated key
+    would not resolve (#2457).
     """
     out: list[tuple[str, Path]] = [("kiro-user/", Path.home() / ".kiro" / "skills")]
-    proj = active_project_dir(state)
+    proj = active_project_dir(state, session_key)
     if proj is not None:
         out.append(("kiro-workspace/", proj / ".kiro" / "skills"))
     out.append(("", skills_dir()))
@@ -788,7 +799,7 @@ def _collect_skills_under(
             _collect_skills_under(entry, root, root_resolved, prefix, out, depth - 1)
 
 
-def enumerate_skill_catalog(state: DashboardState) -> dict[str, Path]:
+def enumerate_skill_catalog(state: DashboardState, session_key: str = "") -> dict[str, Path]:
     """Map every discoverable catalog key to its ``SKILL.md`` path.
 
     Built by **enumerating** the skill roots, never by joining a caller-supplied
@@ -800,12 +811,17 @@ def enumerate_skill_catalog(state: DashboardState) -> dict[str, Path]:
     validate-then-join — it also removes the tainted-path dataflow that
     validate-then-join leaves for static analysis to flag.
 
+    *session_key* only selects which project's ``kiro-workspace/`` root joins
+    the walk (see :func:`_skill_key_roots`); it never widens the enumeration
+    property above. Results are computed per call — nothing is cached — so a
+    per-session root cannot leak into another session's catalog.
+
     It is additionally the single source of truth for BOTH directions of the
     key <-> URI mapping, so they cannot disagree: a mapping written against a
     symlinked skill directory inverts back to the same key it was written from.
     """
     catalog: dict[str, Path] = {}
-    for prefix, root in _skill_key_roots(state):
+    for prefix, root in _skill_key_roots(state, session_key):
         if is_sensitive_path(str(root)) or not root.is_dir():
             continue
         try:
@@ -834,6 +850,7 @@ def skill_key_for_uri(
     agent_path: Path,
     state: DashboardState,
     catalog: dict[str, Path] | None = None,
+    session_key: str = "",
 ) -> str | None:
     """Invert a ``skill://`` resource URI back to a catalog key, or ``None``.
 
@@ -850,7 +867,7 @@ def skill_key_for_uri(
     expanded = expand_skill_uri(uri, agent_path)
     if not expanded:
         return None
-    entries = catalog if catalog is not None else enumerate_skill_catalog(state)
+    entries = catalog if catalog is not None else enumerate_skill_catalog(state, session_key)
     wanted = Path(expanded)
     for key, path in entries.items():
         if path == wanted:
@@ -871,7 +888,10 @@ def skill_key_for_uri(
 
 
 def skill_uri_for_key(
-    key: str, state: DashboardState, catalog: dict[str, Path] | None = None
+    key: str,
+    state: DashboardState,
+    catalog: dict[str, Path] | None = None,
+    session_key: str = "",
 ) -> str | None:
     """Resolve a catalog key to the ``skill://`` URI for its ``SKILL.md``.
 
@@ -882,7 +902,7 @@ def skill_uri_for_key(
 
     Pass *catalog* to reuse one walk across many keys.
     """
-    entries = catalog if catalog is not None else enumerate_skill_catalog(state)
+    entries = catalog if catalog is not None else enumerate_skill_catalog(state, session_key)
     skill_md = entries.get(key)
     if skill_md is None:
         return None
@@ -890,7 +910,7 @@ def skill_uri_for_key(
 
 
 def agent_skill_views(
-    data: dict[str, Any], agent_path: Path, state: DashboardState
+    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
 ) -> tuple[list[str], list[str]]:
     """``(catalog_keys, unmanaged_uris)`` for *data*, from ONE catalog walk.
 
@@ -902,7 +922,7 @@ def agent_skill_views(
     Filesystem-heavy (it enumerates the skill roots) — callers on the asyncio
     event loop MUST run this off the loop.
     """
-    catalog = enumerate_skill_catalog(state)
+    catalog = enumerate_skill_catalog(state, session_key)
     keys: list[str] = []
     unmanaged: list[str] = []
     seen: set[str] = set()
@@ -917,7 +937,7 @@ def agent_skill_views(
 
 
 def agent_skill_keys(
-    data: dict[str, Any], agent_path: Path, state: DashboardState
+    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
 ) -> list[str]:
     """Catalog keys for the skills *data* maps, de-duplicated, order-preserving.
 
@@ -925,11 +945,11 @@ def agent_skill_keys(
     Templates editor owns and can rewrite. Wildcard / hand-authored URIs are
     excluded here and reported separately by :func:`agent_unmanaged_skill_uris`.
     """
-    return agent_skill_views(data, agent_path, state)[0]
+    return agent_skill_views(data, agent_path, state, session_key)[0]
 
 
 def agent_unmanaged_skill_uris(
-    data: dict[str, Any], agent_path: Path, state: DashboardState
+    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
 ) -> list[str]:
     """``skill://`` URIs that the catalog editor cannot express, in order.
 
@@ -937,7 +957,7 @@ def agent_unmanaged_skill_uris(
     the UI and preserved on every write so editing an agent through the dashboard
     never silently drops a hand-authored mapping.
     """
-    return agent_skill_views(data, agent_path, state)[1]
+    return agent_skill_views(data, agent_path, state, session_key)[1]
 
 
 def apply_skill_mapping(
@@ -945,6 +965,7 @@ def apply_skill_mapping(
     agent_path: Path,
     state: DashboardState,
     keys: list[str],
+    session_key: str = "",
 ) -> tuple[list[str], list[str]]:
     """Rewrite *data*'s ``skill://`` resources to *keys*, in place.
 
@@ -966,7 +987,7 @@ def apply_skill_mapping(
     # One enumeration for the whole write: every key resolved and every existing
     # URI inverted against the SAME snapshot, so a concurrent skill add/remove
     # cannot make the two halves disagree mid-request.
-    catalog = enumerate_skill_catalog(state)
+    catalog = enumerate_skill_catalog(state, session_key)
     for key in keys:
         if key in seen:
             continue
@@ -1107,10 +1128,25 @@ def _is_restricted_session(state: DashboardState, request: "Any") -> bool:
     if slot and slot.is_restricted:
         return True
     if sk.startswith("slack:"):
-        from kiro_crew.slack.handler import is_thread_incognito, is_thread_temporary
-
+        # Restore the DURABLE flags before consulting the in-memory maps.
+        # ``_thread_incognito``/``_thread_temporary`` are process-local and are
+        # only populated by ``_hydrate_conv_flags`` on an INBOUND Slack message,
+        # so a turn that no inbound message drove — a cron with
+        # session="origin", a webhook-resumed session, a monitor/autonudge
+        # re-injection, a subagent — reaches this gate with empty maps after a
+        # gateway restart even though the user's !incognito is on disk. Calling
+        # the canonical restore (rather than reading the SessionMap directly)
+        # keeps one source of truth and self-heals the process-local view.
+        # Idempotent and allocation-free for unflagged keys.
+        _hydrate_conv_flags(state.sessions, sk)
         if is_thread_temporary(sk) or is_thread_incognito(sk):
             return True
+    # NOTE: deliberately no disk fallback for an absent slot. This predicate is
+    # a SYNC helper with ~49 call sites reachable from async handlers, so reading
+    # the persisted mode here would put blocking file I/O on the event loop
+    # (AUTOSDE ``no-blocking-call-on-event-loop``). The archived-session recovery
+    # is done off-loop instead, by the one caller that needs it —
+    # ``api_lessons_create`` — via ``_probe_persisted_session``.
     return False
 
 
@@ -1124,41 +1160,39 @@ def _blocks_reads_session(state: DashboardState, request: "Any") -> bool:
     if slot and slot.blocks_reads:
         return True
     if sk.startswith("slack:"):
-        from kiro_crew.slack.handler import is_thread_temporary
-
+        # Same durable-flag restore as _is_restricted_session: a temporary
+        # thread whose flags this process never hydrated must not serve reads.
+        _hydrate_conv_flags(state.sessions, sk)
         if is_thread_temporary(sk):
             return True
+    # NOTE: deliberately no disk fallback for an absent slot. This predicate is
+    # a SYNC helper with ~49 call sites reachable from async handlers, so reading
+    # the persisted mode here would put blocking file I/O on the event loop
+    # (AUTOSDE ``no-blocking-call-on-event-loop``). The archived-session recovery
+    # is done off-loop instead, by the one caller that needs it —
+    # ``api_lessons_create`` — via ``_probe_persisted_session``.
     return False
 
 
-def _session_has_persisted_history(slot_name: str) -> bool:
-    """Return True iff the slot has a JSONL file in the data home's sessions/.
+# Byte ceiling for the session-metadata head read. The metadata line is a small
+# JSON object (a few hundred bytes); 64 KiB is generous headroom while keeping an
+# enormous or adversarial first line from being pulled into memory.
+_METADATA_HEAD_MAX_BYTES = 64 * 1024
 
-    This is a positive signal that the session was previously established
-    as non-ephemeral: ephemeral (incognito/temporary) sessions never write
-    to disk, so a persisted JSONL can only come from a real user session.
 
-    Used by ``api_lessons_create`` to distinguish between:
+def _persisted_session_paths(slot_name: str) -> list["Path"]:
+    """Every existing session transcript that *slot_name* could name.
 
-    * A legitimate MCP subprocess whose in-memory slot was evicted by the
-      idle-sweep loop (``session.py``'s 30-minute timeout). The subprocess
-      still holds the original ``KIROCREW_SESSION_KEY`` env var, so it
-      keeps sending the same ``X-Session-Key``, but ``state._slots`` has
-      moved on. Without this check such calls return HTTP 400 ``unknown
-      session`` even though the user is actively typing in the thread.
-
-    * A forged or stale key from a context that never had a real session
-      backing it — which should continue to be rejected.
-
-    Only checks existence, not contents. Authentication of the caller is
-    still enforced by the ``X-Internal-Secret`` middleware upstream; this
-    check only governs the *ephemeral vs non-ephemeral* distinction.
+    Returns more than one entry only when the key is genuinely ambiguous — see
+    :func:`_probe_persisted_session`, which treats that as unknown rather than
+    picking a winner.
     """
     if (
         not slot_name
         or "/" in slot_name
         or "\\" in slot_name
         or "\x00" in slot_name
+        or ":" in slot_name
         or slot_name.startswith(".")
     ):
         # Defence-in-depth against path traversal; ``KIROCREW_SESSION_KEY``
@@ -1168,10 +1202,19 @@ def _session_has_persisted_history(slot_name: str) -> bool:
         # (Windows) path separators, null bytes that can truncate C-level
         # path parsing, and leading dots that could target hidden
         # per-directory files outside the intended session namespace.
-        return False
+        #
+        # The colon is rejected for Windows, where it is not an ordinary
+        # character: ``WindowsPath("…/sessions") / "D:foo.jsonl"`` evaluates to
+        # ``D:foo.jsonl`` — a DRIVE-RELATIVE path that silently escapes the
+        # sessions directory entirely (verified; POSIX joins it literally and is
+        # unaffected). It also spells an NTFS alternate data stream
+        # (``file:stream``). A dashboard slot key never contains a colon: the
+        # transport prefix is stripped by the caller before this point, and
+        # ``_normalize_slot_key`` folds the key to ``[\\w\\-.]`` anyway.
+        return []
     sess_dir = config_dir() / "sessions"
     if not sess_dir.exists():
-        return False
+        return []
     # Match the resolution order used by slack/interactions.py when
     # linking Slack threads to existing sessions: bare stem first, then
     # the ``dashboard_`` prefix fallback for dashboard slots. Cron sessions
@@ -1180,14 +1223,153 @@ def _session_has_persisted_history(slot_name: str) -> bool:
     # dashboard slot ``dashboard:cron-{id}`` writes ``dashboard_cron-{id}.jsonl``.
     # Probe those too so an idle-evicted cron session is recognised rather
     # than misclassified as forged.
-    if (sess_dir / f"{slot_name}.jsonl").exists():
-        return True
-    if not slot_name.startswith("dashboard_") and (
-        sess_dir / f"dashboard_{slot_name}.jsonl"
-    ).exists():
-        return True
-    if (sess_dir / f"cron_{slot_name}.jsonl").exists():
-        return True
-    if (sess_dir / f"dashboard_cron-{slot_name}.jsonl").exists():
-        return True
-    return False
+    candidates = [sess_dir / f"{slot_name}.jsonl"]
+    if not slot_name.startswith("dashboard_"):
+        candidates.append(sess_dir / f"dashboard_{slot_name}.jsonl")
+    candidates.append(sess_dir / f"cron_{slot_name}.jsonl")
+    candidates.append(sess_dir / f"dashboard_cron-{slot_name}.jsonl")
+    return [p for p in candidates if p.exists()]
+
+
+def _persisted_session_path(slot_name: str) -> "Path | None":
+    """First existing transcript for *slot_name*, or None.
+
+    Existence only. When more than one candidate exists the answer is still
+    "yes, a session exists" — which is all the establish-vs-forged check needs.
+    Anything making an AUTHORIZATION decision must use
+    :func:`_probe_persisted_session`, which refuses to guess between them.
+    """
+    matches = _persisted_session_paths(slot_name)
+    return matches[0] if matches else None
+
+
+def _session_has_persisted_history(slot_name: str) -> bool:
+    """Return True iff the slot has a JSONL file in the data home's sessions/.
+
+    A positive signal that the session was previously **established** — i.e.
+    that the key belongs to a real session rather than being forged or stale.
+    It says nothing about the session's ``memory_mode``: every mode writes its
+    transcript to disk (``_save_slot_to_history`` has no ``memory_mode`` gate,
+    by design, so incognito/temporary tabs still survive a reload). Callers
+    gating *memory writes* must therefore consult
+    :func:`_persisted_session_memory_mode` as well — file existence alone is
+    not evidence that writes are permitted.
+
+    Used by ``api_lessons_create`` (in ``handlers/cron.py``) to distinguish
+    between:
+
+    * A legitimate MCP subprocess whose in-memory slot was evicted by the
+      idle-sweep loop (``session.py``'s 30-minute timeout) or archived by a
+      tab close. The subprocess still holds the original
+      ``KIROCREW_SESSION_KEY`` env var, so it keeps sending the same
+      ``X-Session-Key``, but ``state._slots`` has moved on. Without this
+      check such calls return HTTP 400 ``unknown session`` even though the
+      user is actively typing in the thread.
+
+    * A forged or stale key from a context that never had a real session
+      backing it — which should continue to be rejected.
+
+    Only checks existence, not contents. Authentication of the caller is
+    still enforced by the ``X-Internal-Secret`` middleware upstream; this
+    check only governs the *established vs forged* distinction.
+    """
+    return _persisted_session_path(slot_name) is not None
+
+
+def _persisted_session_memory_mode(slot_name: str) -> str | None:
+    """Return the ``memory_mode`` recorded in *slot_name*'s session metadata.
+
+    Three distinct outcomes, and the distinction IS the security property:
+
+    * ``"persistent"`` / ``"incognito"`` / ``"temporary"`` — read from the
+      metadata line. A metadata line that parses but carries no ``memory_mode``
+      is reported as ``"persistent"``: the field postdates the feature, so a
+      valid header without it is genuinely a legacy persistent session.
+    * ``None`` — **unknown**. No file, or no parseable metadata object as the
+      first line. Callers gating memory writes MUST deny on ``None`` rather
+      than treat it as persistent. Denying is safe: ``ConversationLog.append``
+      writes the metadata line when it creates the file, before any message is
+      appended, so a session file whose first line is not metadata was not
+      produced by a normal session and is no evidence that writes are allowed.
+
+    This is the recovery path for a session whose in-memory state is gone but
+    whose transcript is still on disk. Both in-memory signals a restricted
+    session normally carries are dropped when a tab is archived
+    (``api_chat_slot_close`` removes the slot from ``state._slots`` *and*
+    discards its key from ``state._restricted_keys``), while the transcript —
+    including its ``memory_mode`` marker — persists. Without reading that
+    marker back, an archived incognito session whose MCP subprocess is still
+    alive presents as an ordinary established session and its memory writes
+    are allowed.
+
+    Only the FIRST line is consulted, and only ``_METADATA_HEAD_MAX_BYTES`` of
+    it: a later ``_type: metadata`` object is message content, not the header,
+    and must not be able to redefine the mode. Byte-bounding keeps an enormous
+    or adversarial first line from pinning memory.
+
+    Blocking file I/O — call from a worker thread, never on the event loop
+    (AUTOSDE ``no-blocking-call-on-event-loop``); prefer
+    :func:`_probe_persisted_session`. Deliberately uncached: a cache would need
+    invalidation on every mode change and could itself go stale, which is the
+    exact failure class this closes.
+    """
+    path = _persisted_session_path(slot_name)
+    if path is None:
+        return None
+    return _read_memory_mode(path)
+
+
+def _read_memory_mode(path: "Path") -> str | None:
+    """Read the ``memory_mode`` out of *path*'s metadata line. See above."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_METADATA_HEAD_MAX_BYTES)
+    except OSError:
+        return None
+    first, _sep, _rest = head.partition(b"\n")
+    try:
+        d = json.loads(first.decode("utf-8", "replace"))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("_type") != "metadata":
+        return None
+    mode = d.get("memory_mode")
+    if mode is None:
+        # Valid header, field absent -> legacy persistent session.
+        return "persistent"
+    if not isinstance(mode, str):
+        return None
+    # Allowlist, not normalize-and-hope: an unrecognised value must read as
+    # unknown so the caller fails closed. Case/whitespace matter because the
+    # comparison downstream is set membership — `"incognito "` would lower() to
+    # itself, miss INCOGNITO_MEMORY_MODES, and be treated as unrestricted. The
+    # API validates this field on the way in, but a hand-edited or partially
+    # written transcript is not bound by that.
+    normalized = mode.strip().lower()
+    if normalized not in VALID_MEMORY_MODES:
+        return None
+    return normalized
+
+
+def _probe_persisted_session(slot_name: str) -> tuple[bool, str | None]:
+    """``(file_exists, memory_mode_or_None)`` for *slot_name*.
+
+    Refuses to guess when the key is **ambiguous**. ``slot_name`` reaches this
+    function with its transport namespace already stripped
+    (``sk.split(":", 1)[-1]``), so one stem can match several real transcripts —
+    e.g. a legacy Slack thread at ``<ts>.jsonl`` and an archived dashboard slot
+    named after that same ts at ``dashboard_<ts>.jsonl``. Taking the first
+    candidate would let a *persistent* file answer for an *incognito* session and
+    permit the write. Existence stays true (a session really does exist), but the
+    mode is reported as ``None`` = unknown, which the caller denies on.
+
+    Blocking I/O: hand this to a worker thread from an async caller
+    (``await asyncio.to_thread(_probe_persisted_session, slot_name)``). It is a
+    single composed call so one thread hop covers the whole probe.
+    """
+    matches = _persisted_session_paths(slot_name)
+    if not matches:
+        return False, None
+    if len(matches) > 1:
+        return True, None
+    return True, _read_memory_mode(matches[0])

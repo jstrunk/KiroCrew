@@ -105,11 +105,47 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Session intent summaries",
+        "session_summary.py",
+        "Intent-summary payloads persisted to the `.intents` sidecar and served by "
+        "`GET /api/chat/slots/{slot}/summary`. The payload is model output derived "
+        "from transcript text, so a secret or beacon URL pasted into the chat can be "
+        "reproduced inside it; `normalize_payload` runs the whole nested payload "
+        "through the credential + exfiltration-URL chain before the write, because "
+        "the sidecar is durable and read straight back to the panel.",
+    ),
+    (
+        "Session storage inventory",
+        "dashboard/handlers/session_storage.py",
+        "A session's title and its first message, served by "
+        "`GET /api/system/session-storage/sessions` and its per-row detail. Both are "
+        "conversation content read straight off a transcript, so either can carry a "
+        "key someone pasted into a chat — the same output-boundary reason as the "
+        "session-memory titles below.",
+    ),
+    (
+        "Chat pin previews",
+        "dashboard/chat_pins.py",
+        "Message previews submitted to POST /api/chat/pins are persisted to "
+        "chat_pins.json and re-rendered by the pinned-messages panel, so the "
+        "preview is an output boundary; credentials and exfiltration URLs are "
+        "redacted before storage and on every response path (list and "
+        "idempotent duplicate-create) via _redacted_pin.",
+    ),
+    (
+        "Skill context budget",
+        "dashboard/handlers/skill_budget.py",
+        "Skill display names served by `GET /api/skills/-/budget`. An auto-skill's "
+        "frontmatter `name` is written by the agent, so it is LLM-authored text that "
+        "reaches the dashboard verbatim — the same output-boundary reason as the "
+        "session-memory titles below.",
+    ),
+    (
         "Session & task memory panel",
         "dashboard/session_memory.py",
         "Chat titles served by `GET /api/sessions/memory`. Titles are generated from "
         "user content, and the resume path in `chat_handlers` assigns a "
-        "client-supplied `body[\"title\"]` to the slot with no scan of its own, so this "
+        'client-supplied `body["title"]` to the slot with no scan of its own, so this '
         "serializer is the boundary that guarantees the scan — the same "
         "output-boundary reason as the sibling subagent-task text.",
     ),
@@ -122,12 +158,174 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "output-boundary reason as the app plan/activity-log sinks.",
     ),
     (
+        "Session transfer bundle",
+        "dashboard/session_transfer.py",
+        "Transcript content copied to another Kiro Crew instance over an Instances "
+        "tunnel. The bundle LEAVES this host, so it is an output boundary: a "
+        "transcript written before the redactors existed (or carried in from a "
+        "channel) can still hold a raw credential on disk, and relying on the "
+        "receiving instance to scrub it would send the secret across the boundary "
+        "first. This covers **Layer A only** — the display transcript, plus the "
+        "title and origin label. The Layer B kiro-cli context is deliberately "
+        "forwarded BYTE-EXACT and is NOT scrubbed: its thinking blocks carry a "
+        "provider signature over their own content, so any rewrite invalidates the "
+        "conversation and the peer's next turn is rejected (measured: a leaf-string "
+        "pass altered a signature in 41% of one developer machine's 704 sessions). "
+        "Redacting that artifact and transplanting it are mutually exclusive. What "
+        "bounds the exposure is the destination rather than the payload — a send "
+        "goes to the OPERATOR'S OWN peer instance over a tunnel they authenticated, "
+        "and the peer stores it 0600 — so Layer B never leaves the operator's own "
+        "trust boundary. Inbound Layer B is validated structurally (parse-only, "
+        "never rewritten) and refused whole if any record does not parse.",
+    ),
+    (
         "Profile artifact",
         "perf_sampler.py",
         "Folded-stack profiles written by `kirocrew perf sample`. Frame labels are "
         "code identifiers and shortened paths, but the artifact exists to be sent "
         "to a maintainer, and py-spy's raw output embeds absolute paths from the "
         "target process — so it is an egress boundary, redacted on the way out.",
+    ),
+    (
+        "md-notebook error middleware",
+        "apps/builtins/md_notebook/server.py",
+        "Every md-notebook API error body. Handlers drive git and filesystem work "
+        "over caller-supplied vault URLs, ids and note paths, so an unmodeled "
+        "exception carries absolute paths and git stderr; `_safe_error` scrubs "
+        "credentials, exfiltration URLs and host paths before the JSON reaches the "
+        "browser — the same output-boundary reason as the dashboard error sinks.",
+    ),
+    (
+        "Issue Radar provider CLI stderr",
+        "apps/builtins/issue_radar/backend/errors.py",
+        "`gh`/`glab` stderr quoted into provider exception messages, which the "
+        "issue-radar routes return in their error bodies and the frontend renders "
+        "verbatim. `sanitize_cli_stderr` runs only the host-path pass plus a "
+        "private-host filter, not the credential scanner: both CLIs take their "
+        "token from the environment rather than argv and neither echoes it, so host "
+        "topology is the disclosure risk here. The actionable phrasing (auth, "
+        "not-found, 403, timeout) is deliberately preserved so the user can "
+        "self-diagnose.",
+    ),
+    (
+        "Auto-Improvement fallback tool audit",
+        "apps/builtins/auto_improvement/spine/agent_runner.py",
+        "Per-tool SEL events for the unattended subprocess agent carry the tool's TARGET "
+        "HINT — a path, glob or shell command the model chose. On-disk SEL records are not "
+        "redacted by the writer and the persisted HMAC chain signs the bytes as-written, so "
+        "the hint is redacted here, before `log_tool_invocation`. Fail-closed: a redactor "
+        "that cannot run emits a fixed placeholder rather than raw agent text.",
+    ),
+    (
+        "Auto-Improvement commit messages",
+        "apps/builtins/auto_improvement/spine/driver.py",
+        "Agent-authored commit subjects/bodies redacted before they become PERMANENT git "
+        "history — both the local keep commit and the direct-push commit. A pushed commit "
+        "message cannot be edited without rewriting history, so this is a one-way egress "
+        "boundary.",
+    ),
+    (
+        "Auto-Improvement one-click commit",
+        "apps/builtins/auto_improvement/backend/commit.py",
+        "The operator-triggered commit path builds its message from the queued PR body "
+        "(agent-authored prose) and redacts before committing — same "
+        "cannot-be-unpublished reason as the driver's path.",
+    ),
+    (
+        "Auto-Improvement MCP tool results",
+        "apps/builtins/auto_improvement/backend/mcp_server.py",
+        "Every `tools/call` result is serialized run evidence handed to an LLM — a finding's "
+        "note/signature/hypothesis are the model's own prose. Redacted BEFORE truncation so "
+        "the cut cannot split a credential into a fragment the scanner misses. FAIL-CLOSED: "
+        "these six tools are conveniences, so withholding a result beats leaking. The ERROR "
+        "paths are scanned too (`_redact_error`): tool ARGUMENTS reach exception text by "
+        'design — `get_finding` raises "no finding with fingerprint <fp>" with the caller\'s '
+        "raw value — so a credential-shaped argument was echoed straight back to the model "
+        "and into the SEL record. Measured before fixing. The exception type and JSON-RPC "
+        "error code are composed in after scrubbing, so the message stays actionable.",
+    ),
+    (
+        # The watcher's residual risk, disclosed because accepting it is the OPERATOR's
+        # decision and a silent limitation is the real defect. Measured: a nested process under
+        # `mode="strict"` sees ~/.aws, ~/.config/gh and ~/.docker EMPTY on a populated host,
+        # and ~/.ssh exposes only `known_hosts` (host-key verification needs it) while
+        # id_rsa/*.key stay hidden — so CREDENTIALS are confined. NETWORK EGRESS is NOT: the
+        # sandbox never enters a network namespace (no CLONE_NEWNET; its docstring explains
+        # agentic commands need reachable networking), and while curl/wget/nc are denied,
+        # `python helper.py` is allowed and can open a socket. The shell denylist cannot close
+        # that — it gates the requested command, not what the command then does. Consequence:
+        # point the PR watcher only at repositories whose PR comments you would be willing to
+        # execute. Raised by the GPT review (twice); the credential half was already verified
+        # under D-84, the egress half is new and correct.
+        "Auto-Improvement PR-watcher egress boundary",
+        "apps/builtins/auto_improvement/backend/pr_watchers.py",
+        "The watcher reads UNTRUSTED text (pull-request comments, check logs) and runs with an "
+        "auto-approved shell, because its job is to run the repository's own build/test/lint, "
+        "rebase, and commit. Credential stores are hidden by the strict sandbox (verified), but "
+        "network EGRESS is deliberately reachable and a nested interpreter can open a socket "
+        "even though curl/wget/nc are denied. Two OPT-IN gates, both default OFF, both a "
+        "one-time consent: `watcherAcceptEgressRisk` is a HARD precondition — `_make_runner` "
+        "refuses to build any watcher runner without it, so a watcher cannot run at all until "
+        "the operator acknowledges this egress boundary — and `watcherAutoStart` separately "
+        "gates whether a polled GET may PROMOTE watchers (a promote used to happen with no "
+        "operator action, leaving no consent moment). Treat setting either flag as agreeing to "
+        "execute the pull request's comments.",
+    ),
+    (
+        "Auto-Improvement run activity feed",
+        "apps/builtins/auto_improvement/backend/runner.py",
+        "The live activity ring buffer carries RAW model output — assistant text and the "
+        "`command` of a bash tool call — and is served verbatim by GET /run into the "
+        "dashboard — so this is an egress boundary, not an internal log. FAIL-CLOSED: an "
+        "unscannable string becomes a fixed placeholder while the event structure, "
+        "timestamps and other fields survive, so the operator still sees the run "
+        "progressing without unscanned text reaching the browser. Recursive, because the "
+        "agent event is nested. The WATCHER snapshot and chat-session records are scanned on "
+        "the same grounds (`routes._redact_tree`): the watcher log ring is redacted on WRITE, "
+        "but `WatcherState.as_dict` beside it served `target`/`title`/`lastNote`/"
+        "`verdictReason`/`fixing` raw — all model- or pull-request-derived, and the watcher "
+        "ingests PR text as untrusted input by design. Measured with a credential-shaped "
+        "`target` (an access-key literal, not reproduced here — this disclosure is itself "
+        "scanned): it reached the browser verbatim. The session "
+        "records go through it too, because `save_session` merges the caller's patch and the "
+        "stored `title` is built from a finding's target. So do the route ERROR bodies: "
+        "`commit.py` builds its `error` from `(proc.stderr or '')[:160]` — raw git stderr, "
+        "which quotes refs, paths and whatever a repository's own hooks printed. That was "
+        "latent while nothing rendered it; surfacing a refused commit at the finding row made "
+        'it a live path to the browser, so all five `result.get("error")` responses plus the '
+        "PR-status and draft bodies are scanned. "
+        "Covers the TERMINAL ERROR field on the same response too "
+        '(`_fail`): `f"{type(exc).__name__}: {exc}"` was assigned raw while the feed '
+        "beside it was scanned, and an exception message routinely quotes what failed — a "
+        "git url, a subprocess argv, a path — so a run dying on an agent-influenced value "
+        "carried it to the browser. The exception TYPE is composed in after redaction so "
+        "the message stays actionable.",
+    ),
+    (
+        "Auto-Improvement PR prose",
+        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py",
+        "The pull-request TITLE and BODY are agent-authored prose published by `gh pr "
+        "create`, and a PR description cannot be un-published. Redacted in place because "
+        "prose survives rewriting; the DIFF beside it is instead detected-and-refused by "
+        "`spine/push_policy.py:scan_content_for_secrets`, since rewriting a patch would "
+        "corrupt the fix the gate proved.",
+    ),
+    (
+        "Auto-Improvement finding evidence",
+        "apps/builtins/auto_improvement/backend/routes.py",
+        "The candidate diff and drafted PR body are agent-authored text read back off "
+        "disk and rendered in the operator's browser by GET /findings/{fp}. FAIL-CLOSED, "
+        "unlike the watcher log below: the text stays on disk and re-readable, so "
+        "withholding it beats serving it unscanned.",
+    ),
+    (
+        "Auto-Improvement watcher log",
+        "apps/builtins/auto_improvement/backend/pr_watchers.py",
+        "Per-PR watcher log lines carry agent output and third-party CI text and are "
+        "served to the dashboard via GET /watchers/{fp}/log with NO second scan, so this is "
+        "the only pass between that text and the browser. FAIL-CLOSED: an unscannable "
+        "line becomes a fixed placeholder, so the log keeps advancing without serving "
+        "unscanned text.",
     ),
     (
         "Side-chat parent snapshot",
@@ -252,6 +450,14 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "Workflow progress summaries injected back into a session.",
     ),
     (
+        "Crew Mode delivery",
+        "crew_chat.py",
+        "Every crew-slot post (`_post`): forwarded subagent summaries/errors, "
+        "decision-agent questions, and topic-meta renders — all LLM-authored — "
+        "written to the transcript, broadcast over WS, and persisted to the "
+        "conversation log.",
+    ),
+    (
         "Onboarding import",
         "onboarding_import.py",
         "Imported foreign-agent history and config before it enters Kiro Crew.",
@@ -266,6 +472,15 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "Discord direct send",
         "discord/transport_dispatch.py",
         "The direct-send path that bypasses TurnDriver, redacted independently.",
+    ),
+    (
+        "Telegram failure reason",
+        "telegram/transport_dispatch.py",
+        "The bounded failure reason a permanent AcpError surfaces in the chat "
+        "reply instead of the generic retry text. The message is backend error "
+        "text rather than stream output, so it bypasses the shared TurnDriver "
+        "redaction and is scanned (credentials, exfiltration URLs, local "
+        "paths) at this egress before the renderer posts it.",
     ),
     (
         "Discord session-resume replay",
@@ -296,6 +511,13 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "Install/start/stop script output and warnings surfaced from an app.",
     ),
     (
+        "App teardown output",
+        "apps/teardown.py",
+        "Output from an app's own onDisable script, scrubbed by the dual-pass "
+        "redact() helper before it becomes a warning on the disable and "
+        "trust-revocation responses.",
+    ),
+    (
         "App activity log",
         "apps/builtins/mochi/activity_log.py",
         "Agent-authored activity entries are redacted before persistence, for the "
@@ -311,6 +533,22 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "over the app's /plan route; a credential or webhook URL an LLM wrote into "
         "a narrative/task field is recursively redacted here before json_response, "
         "the same output-boundary reason as the app activity log.",
+    ),
+    (
+        "Shared options-overflow sink",
+        "messaging/renderer.py",
+        "The one place LLM-authored [OPTIONS:] choices that do not fit a channel's "
+        "interactive widget are written into the message BODY (format_overflow, "
+        "reached from apply_options_cap on slack/telegram/discord). That crosses a "
+        "boundary the widget path does not: a widget label is plain text, while the "
+        "body is markdown-parsed, so a key split by a code span, emphasis or a "
+        "Discord spoiler is broken to every byte-level scan -- including the "
+        "TurnDriver's streaming redactor -- and whole on screen once the platform "
+        "drops the delimiters. Choices are therefore redacted here in DISPLAY form "
+        "(messaging/display_safety.py) BEFORE mention syntax is defanged, since the "
+        "ZWSP insertion is itself a post-scan transformation. Enforced at this sink "
+        "rather than per renderer for the same reason the max_buttons cap lives in "
+        "shared code: a channel cannot forget what it does not call.",
     ),
     (
         "Slack render pipeline",
@@ -463,6 +701,34 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "exfiltration-URL scanners plus a sensitive-header pass before anything is "
         "written into the archive.",
     ),
+    (
+        "Tag definitions (HTTP + auto-tag)",
+        "dashboard/chat_tags.py",
+        "Tag names supplied by both the POST /api/chat/tags HTTP handler and the "
+        "background auto-tag task are LLM-authored or project-derived and persist "
+        "to tags.json, the dashboard sidebar, and Slack notifications. Both paths "
+        "redact credentials and exfiltration URLs before creation/persistence.",
+    ),
+    (
+        "Background auto-tag (project-derived names)",
+        "dashboard/chat_auto_tag.py",
+        "The background auto-tag task derives tag names from the slot's project "
+        "path and persists them to tags.json and the dashboard sidebar via the "
+        "shared tag-creation path. Names are passed through redact_credentials "
+        "and redact_exfiltration_urls before resolution or persistence.",
+    ),
+    (
+        "Session-pulse survey feedback (Aperture egress)",
+        "dashboard/handlers/feedback.py",
+        "The free-text `feedback` field submitted via POST /api/feedback/submit is "
+        "forwarded to Aperture, a third-party AWS service, so it is a genuine "
+        "external egress boundary — a user typing a credential or exfiltration URL "
+        "while describing their experience would otherwise leave the host "
+        "unredacted. `_customer_responses` runs it through redact_exfiltration_urls "
+        "then redact_credentials before it is included in the outbound payload. "
+        "`rating` (a fixed frontend enum) and `email` (already flagged `pii: True`) "
+        "are not run through this pass.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -483,6 +749,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
         "apps/builtins/mochi/redact.py",
+        # Same shape: applies a redactor the CALLER injects, to scan the form a
+        # platform will actually render (markup collapsed, ANSI stripped). It owns
+        # no output of its own -- the registered sinks are the modules that call
+        # it (slack/format.py, messaging/renderer.py).
+        "messaging/display_safety.py",
         "autonudge_authz.py",
         "acp/_dispatch.py",
         "acp/client.py",
@@ -494,6 +765,28 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # message with and without redaction, so a raw comparison would keep both
         # copies — nothing redacted here is ever written or shown.
         "channel_transcript_migration.py",
+        # Comparison-only, same shape: the steer settler redacts BOTH the pending
+        # text and the backend's echo purely to compute a match identity. The ACP
+        # layer already redacted the echo on the way in, so comparing it against
+        # raw pending text never matched and the consumed steer got requeued and
+        # run twice. Nothing redacted here is written or shown — the ledger and
+        # the transcript keep the original text.
+        "dashboard/steer_settle.py",
+        # DETECTOR, not a redactor: the pre-push content scan calls both scanners only
+        # to COUNT findings and then refuses the push. It deliberately discards the
+        # cleaned text — rewriting a code diff would corrupt the very fix the gate
+        # proved — so it is not a redaction egress path. The push it guards is not an
+        # output boundary this panel measures either: nothing reaches GitHub when the
+        # scan hits, and the change degrades to the local queue instead. Lives in
+        # push_policy because all three push paths share this one implementation.
+        "apps/builtins/auto_improvement/spine/push_policy.py",
+        # Inbound: the crew worker's slot title is derived from an issue title,
+        # which is untrusted text anyone who can open an issue wrote. It is
+        # scrubbed before it becomes a slot title (and fails CLOSED to the slot
+        # key if the redactors are unavailable), so this is inbound sanitisation
+        # rather than an egress boundary — the slot title's user-visible surface
+        # is already covered by the registered dashboard sinks.
+        "apps/builtins/issue_radar/backend/crew_runtime.py",
         # Internal persistence / indexing (the on-disk or in-memory copy), whose
         # user-visible surface is already covered by a registered sink.
         "dashboard/chat_folders.py",
@@ -541,6 +834,22 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "mcp_cron.py",
         "mcp_discovery.py",
         "mcp_gateway/backend.py",
+        # The kirocrew-core tool handlers, moved out of mcp_core.py into their
+        # domain modules. Same classification as mcp_core.py above for the same
+        # reason: a tool result's user-visible surface is a registered sink
+        # downstream, and these redact before returning to it. `learn.py` is
+        # absent because it calls no redactor -- the allowlist is checked for
+        # stale entries too.
+        "mcp_tools/apps.py",
+        "mcp_tools/artifacts.py",
+        "mcp_tools/browse.py",
+        "mcp_tools/control.py",
+        "mcp_tools/knowledge.py",
+        "mcp_tools/messaging.py",
+        "mcp_tools/sessions.py",
+        "mcp_tools/skills.py",
+        "mcp_tools/spawn.py",
+        "mcp_tools/workflows.py",
         "workflows/agent_exec.py",
         "workflows/agent_pool.py",
         "workflows/runner.py",
@@ -639,9 +948,22 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "deploy/scan.py",
         # Bundled app backends: each app's own surface, not core egress.
         "apps/builtins/auto_research/handlers.py",
+        "apps/builtins/code_review_sage/sage_lib/learning.py",
         "apps/builtins/code_review_sage/sage_lib/pipeline.py",
         "apps/builtins/code_review_sage/sage_lib/report.py",
         "apps/builtins/code_review_sage/sage_lib/review_driver.py",
+        # `store` DEFINES this app's redactor (`redact_text`) so every reader in the
+        # app can scrub, not just the posting path; `discovery` calls it when reading
+        # the worker-writable pinned-repo file before the sidebar renders it. Both
+        # are the app's own surface, same classification as its siblings above.
+        "apps/builtins/code_review_sage/sage_lib/store.py",
+        "apps/builtins/code_review_sage/sage_lib/discovery.py",
+        # `chat_session` scrubs every turn of a post-review conversation at its
+        # serialization boundary: the reviewer can repeat a credential it read in
+        # the diff, and a tool title carries the arguments it was called with. Same
+        # classification as its siblings — the app's own surface, rendered by this
+        # app's panel, not a core egress path.
+        "apps/builtins/code_review_sage/sage_lib/chat_session.py",
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
@@ -946,7 +1268,10 @@ def _token_auth_items() -> list[PostureItem]:
             "transport that preserves the client address, for the pin to identify one client"
         )
     else:
-        _pin_detail = "A session is bound to the client address that first used it"
+        _pin_detail = (
+            "Per-client: a session is bound to the client address — or the "
+            "daemon-verified tailnet identity — that first used it"
+        )
 
     return [
         PostureItem(

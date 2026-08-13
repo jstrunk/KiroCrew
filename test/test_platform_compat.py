@@ -12,14 +12,17 @@ output we can assert directly), and the process-helper return contracts.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -147,6 +150,85 @@ class TestProcessHelpers:
 
     def test_process_matches_false_for_unused_pid(self):
         assert pc.process_matches(2_000_000_000, ("kiro-cli", "claude")) is False
+
+
+class TestProcessCwd:
+    """``process_cwd`` is polled per open terminal, so its contract is that it
+    answers from ``/proc`` or ``libproc`` and NEVER spawns a subprocess. The
+    macOS branch is exercised on every platform by faking the ``libproc``
+    handle, since the byte offsets it slices with are the risky part."""
+
+    def test_returns_own_cwd(self):
+        cwd = pc.process_cwd(os.getpid())
+        if cwd is None:
+            pytest.skip("no /proc and no libproc on this host")
+        assert os.path.samefile(cwd, os.getcwd())
+
+    def test_returns_none_for_unused_pid(self):
+        assert pc.process_cwd(2_000_000_000) is None
+
+    def test_never_spawns_a_subprocess(self, monkeypatch):
+        # The whole point of this helper: a fork+exec of the gateway per poll is
+        # what it exists to avoid, so a regression that reintroduces one here
+        # must fail loudly rather than just get slower.
+        def explode(*a, **k):
+            raise AssertionError("process_cwd must not spawn a subprocess")
+
+        monkeypatch.setattr(subprocess, "run", explode)
+        monkeypatch.setattr(subprocess, "Popen", explode)
+        pc.process_cwd(os.getpid())
+        pc.process_cwd(2_000_000_000)
+
+    @staticmethod
+    def _fake_libproc(path: bytes, *, filled: int | None = None):
+        """A libproc stand-in whose proc_pidinfo writes *path* at the cwd offset."""
+        size = pc._DARWIN_PROC_VNODEPATHINFO_SIZE
+
+        class _Lib:
+            def proc_pidinfo(self, pid, flavor, arg, buf, buffersize):
+                buf.raw = (
+                    b"\0" * pc._DARWIN_VNODE_INFO_SIZE
+                    + path
+                    + b"\0" * (size - pc._DARWIN_VNODE_INFO_SIZE - len(path))
+                )
+                return size if filled is None else filled
+
+        return _Lib()
+
+    def test_darwin_reads_the_path_at_the_cwd_offset(self, monkeypatch):
+        monkeypatch.setattr(
+            pc, "_darwin_libproc_handle", lambda: self._fake_libproc(b"/Users/u/proj"),
+        )
+        assert pc._darwin_process_cwd(4242) == "/Users/u/proj"
+
+    def test_darwin_refuses_a_short_write(self, monkeypatch):
+        # A byte count other than the exact struct size means the layout the
+        # offsets assume no longer matches the kernel's, so the path cannot be
+        # sliced out safely — the caller falls back instead of getting garbage.
+        monkeypatch.setattr(
+            pc,
+            "_darwin_libproc_handle",
+            lambda: self._fake_libproc(b"/Users/u/proj", filled=64),
+        )
+        assert pc._darwin_process_cwd(4242) is None
+
+    def test_darwin_refuses_an_error_return(self, monkeypatch):
+        monkeypatch.setattr(
+            pc, "_darwin_libproc_handle", lambda: self._fake_libproc(b"/x", filled=-1),
+        )
+        assert pc._darwin_process_cwd(4242) is None
+
+    def test_darwin_returns_none_without_libproc(self, monkeypatch):
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: None)
+        assert pc._darwin_process_cwd(4242) is None
+
+    def test_darwin_swallows_a_throwing_libproc(self, monkeypatch):
+        class _Boom:
+            def proc_pidinfo(self, *a):
+                raise OSError("nope")
+
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: _Boom())
+        assert pc._darwin_process_cwd(4242) is None
 
 
 class TestFindListeningPids:
@@ -412,8 +494,33 @@ class TestResourceShims:
     def test_proc_rss_bytes_for_pid_none_for_unused_pid(self):
         assert pc.proc_rss_bytes_for_pid(2_000_000_000) is None
 
+    def test_proc_rss_tree_mb_for_pid_windows_only(self):
+        # Windows-only: the lineage-validated tree walk. On POSIX it returns None
+        # (callers keep their /proc or ps route), and it must never raise.
+        result = pc.proc_rss_tree_mb_for_pid(os.getpid())
+        if not pc.IS_WINDOWS:
+            assert result is None
+            return
+        # On Windows self (no children spawned by this test) reads a positive
+        # tree total that is at least the single-process RSS.
+        assert result is not None and result > 0
+        single = pc.proc_rss_bytes_for_pid(os.getpid())
+        assert single is not None
+        assert result >= single / (1024 * 1024) - 1  # -1: sampled microseconds apart
+
+    def test_proc_rss_tree_mb_for_pid_rejects_reserved_pid(self):
+        # A reserved/non-int pid must not anchor a tree walk (recycled-root risk).
+        assert pc.proc_rss_tree_mb_for_pid(1) is None
+        assert pc.proc_rss_tree_mb_for_pid(0) is None
+
     def test_proc_cpu_seconds_nonnegative(self):
         assert pc.proc_cpu_seconds() >= 0.0
+
+    def test_proc_cpu_seconds_is_positive_for_a_running_process(self):
+        # A running interpreter has always consumed some CPU. This must be > 0
+        # on every supported platform: on Windows GetCurrentProcess's handle was
+        # truncated without argtypes, so GetProcessTimes failed and this read 0.0.
+        assert pc.proc_cpu_seconds() > 0.0
 
     def test_raise_nofile_soft_limit_is_safe(self):
         # No-op on Windows; best-effort raise on POSIX. Must never raise.
@@ -434,6 +541,180 @@ class TestChmodShims:
             pc.fchmod_safe(fd, 0o600)   # applies on POSIX, no-op on Windows
         finally:
             os.close(fd)
+
+
+class TestDirLinkShims:
+    """``symlink_or_junction`` / ``is_link_or_junction`` / ``unlink_link_or_junction``.
+
+    These run on every platform: the contract is the same everywhere (a name
+    that means another directory), only the mechanism differs — a symlink on
+    POSIX, a directory junction on Windows, where an ordinary account holds no
+    ``SeCreateSymbolicLinkPrivilege`` and ``os.symlink`` fails with
+    ``WinError 1314``.
+    """
+
+    def test_link_is_created_and_transparent(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "index.html").write_text("hi")
+        link = tmp_path / "link"
+
+        pc.symlink_or_junction(target, link)
+
+        assert pc.is_link_or_junction(link)
+        assert link.is_dir()
+        assert link.resolve() == target.resolve()
+        # Reads go through, and later writes to the target are visible via the
+        # link — the property the dist resolver relies on for rebuild pickup.
+        assert (link / "index.html").read_text(encoding="utf-8") == "hi"
+        (target / "later.txt").write_text("fresh")
+        assert (link / "later.txt").read_text(encoding="utf-8") == "fresh"
+
+    def test_plain_dir_and_file_are_not_links(self, tmp_path):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        regular = tmp_path / "f.txt"
+        regular.write_text("x")
+
+        assert not pc.is_link_or_junction(plain)
+        assert not pc.is_link_or_junction(regular)
+        assert not pc.is_link_or_junction(tmp_path / "does-not-exist")
+
+    def test_dangling_link_is_still_reported_as_a_link(self, tmp_path):
+        """A link whose target is gone must still answer True.
+
+        The dist resolver's replace path keys off exactly this: ``exists()``
+        follows the link and is already False, so only the link-ness test can
+        tell "stale link to clean up" from "nothing here".
+        """
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+        shutil.rmtree(target)
+
+        assert pc.is_link_or_junction(link)
+        assert not link.exists()
+
+    def test_unlink_removes_the_link_and_spares_the_target(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep")
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+
+        pc.unlink_link_or_junction(link)
+
+        assert not pc.is_link_or_junction(link)
+        assert not os.path.lexists(str(link))
+        assert (target / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    def test_unlink_removes_a_dangling_link(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+        shutil.rmtree(target)
+
+        pc.unlink_link_or_junction(link)
+
+        assert not os.path.lexists(str(link))
+
+    def test_unlink_refuses_a_real_directory(self, tmp_path):
+        """A non-link must raise on both platforms, empty or not.
+
+        POSIX ``os.unlink`` refuses a directory outright, so the Windows
+        ``rmdir`` fallback has to be fenced to reparse points: unfenced it
+        DELETES a real empty directory, so a caller that mis-detects link-ness
+        loses data on Windows only while POSIX raises.
+        """
+        empty = tmp_path / "real-empty"
+        empty.mkdir()
+        full = tmp_path / "real-full"
+        full.mkdir()
+        (full / "keep.txt").write_text("keep")
+
+        with pytest.raises(OSError):
+            pc.unlink_link_or_junction(empty)
+        with pytest.raises(OSError):
+            pc.unlink_link_or_junction(full)
+
+        assert empty.is_dir()
+        assert (full / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="junctions exist only on Windows")
+    def test_windows_link_is_usable_without_elevation(self, tmp_path):
+        """Windows gets a working directory link either way it is made.
+
+        ``symlink_or_junction`` tries ``os.symlink`` FIRST and only falls back to
+        a junction, so which mechanism lands depends on whether the host holds
+        ``SeCreateSymbolicLinkPrivilege`` — GitHub's runners do, an ordinary
+        account does not. Asserting "junction, never symlink" would therefore
+        pin the unprivileged host as if it were universal, and fail on CI.
+
+        What matters to every caller is the same on both paths, so that is what
+        is asserted: the name is a reparse point that ``is_link_or_junction``
+        recognises (an ``is_symlink()``-only test does NOT see a junction, which
+        is the bug this shim exists for), it is transparent to path operations,
+        and ``rmtree`` refuses it — which is why ``unlink_link_or_junction``
+        exists. The junction branch specifically is covered by
+        ``test_junction_is_recognised_and_removable`` below.
+        """
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "f.txt").write_text("hi", encoding="utf-8")
+        link = tmp_path / "link"
+
+        pc.symlink_or_junction(target, link)
+
+        assert pc.is_link_or_junction(link)
+        assert link.is_dir()  # transparent to path operations
+        assert (link / "f.txt").read_text(encoding="utf-8") == "hi"
+        # rmtree refuses any directory link, which is why unlink_link_or_junction exists.
+        with pytest.raises(OSError):
+            shutil.rmtree(str(link))
+        pc.unlink_link_or_junction(link)
+        assert not link.exists()
+        assert target.is_dir(), "removing the link must spare the target"
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="junctions exist only on Windows")
+    def test_junction_is_recognised_and_removable(self, tmp_path):
+        """A JUNCTION specifically — the form an unprivileged Windows user gets.
+
+        Created directly via ``_winapi.CreateJunction`` rather than through the
+        shim, so this covers the unprivileged branch even on a runner that holds
+        the symlink privilege and would otherwise take the symlink path.
+        """
+        import _winapi
+
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "junction"
+        _winapi.CreateJunction(str(target), str(link))
+
+        # A junction reports is_symlink() False — the whole reason the shim's
+        # detector cannot be an is_symlink() test.
+        assert not link.is_symlink()
+        assert pc.is_link_or_junction(link)
+        # 0xA0000003 = IO_REPARSE_TAG_MOUNT_POINT, spelled literally rather than
+        # read from the module under test (so the assertion is independent of it)
+        # and rather than via os.path.isjunction (3.12+ only; this project
+        # supports 3.10).
+        assert os.lstat(str(link)).st_reparse_tag == 0xA0000003
+        pc.unlink_link_or_junction(link)
+        assert not link.exists()
+        assert target.is_dir()
+
+    @pytest.mark.skipif(not pc.IS_POSIX, reason="POSIX symlink mechanism")
+    def test_posix_link_is_a_symlink(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+
+        pc.symlink_or_junction(target, link)
+
+        assert link.is_symlink()
+        assert os.readlink(str(link)) == str(target)
 
 
 # ---------------------------------------------------------------------------
@@ -1574,7 +1855,7 @@ class TestFindListeningPidsErrors:
 
 class TestKillAsyncVariants:
     """Regression guards for the async ``kill_pid_async`` / ``kill_process_tree_async``
-    variants (Mesh-2801).
+    variants.
 
     The async wrappers exist so async call sites can offload the blocking
     Windows ``taskkill`` spawn to :func:`kiro_crew.executors.subprocess_executor`
@@ -1808,6 +2089,88 @@ class TestProcessTokenSid:
     @pytest.mark.skipif(pc.IS_WINDOWS, reason="the off-Windows guard")
     def test_returns_none_off_windows(self) -> None:
         assert pc._process_token_sid() is None
+
+
+class TestWin32StructsAreModuleScoped:
+    """``ctypes.POINTER(T)`` memoises T -> POINTER(T) forever.
+
+    ctypes keeps that memo in a module-level dict with no eviction, so a
+    Structure subclass declared inside a function body pins a fresh pair of type
+    objects on EVERY call. The Windows metrics/enumeration helpers are polled
+    (the dashboard's system-metrics endpoint, the RSS-recycle watchdog, the
+    tree-kill parent-map walk, the MCP pipe's per-connection peer check), which
+    turned that into unbounded growth in a long-running gateway -- measured at
+    ~8 KiB per ``proc_rss_bytes`` call, never reclaimed.
+
+    Asserting on the source keeps this enforceable from the POSIX fleet, where
+    the Windows branches never execute.
+    """
+
+    #: Helpers whose Win32 struct layouts must come from module scope.
+    _WIN32_STRUCT_USERS = (
+        "get_ppid",
+        "_windows_process_parent_map",
+        "_win_process_image_name",
+        "_process_token_sid_unguarded",
+        "proc_rss_bytes",
+        "proc_rss_bytes_for_pid",
+        "system_memory",
+    )
+
+    def test_the_shared_layouts_are_defined_once_at_module_scope(self) -> None:
+        import ctypes
+
+        for name in (
+            "_ProcessEntry32",
+            "_ProcessMemoryCounters",
+            "_MemoryStatusEx",
+            "_SidAndAttributes",
+            "_TokenUser",
+        ):
+            assert issubclass(getattr(pc, name), ctypes.Structure), name
+
+    @pytest.mark.parametrize("func_name", _WIN32_STRUCT_USERS)
+    def test_no_helper_declares_a_structure_in_its_body(self, func_name: str) -> None:
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(pc, func_name))))
+        local_structs = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+            and any(
+                isinstance(base, ast.Attribute) and base.attr in ("Structure", "Union")
+                for base in node.bases
+            )
+        ]
+        assert not local_structs, (
+            f"{func_name} declares {local_structs} in its body; each call would pin a new "
+            "type in ctypes' pointer-type memo. Hoist the layout to module scope."
+        )
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Win32 metrics paths")
+    def test_repeated_metrics_calls_add_no_pointer_memo_entries(self) -> None:
+        """The behavioural half: polling must not grow ctypes' memo at all."""
+        import ctypes
+
+        memo = ctypes._pointer_type_cache  # type: ignore[attr-defined]
+        pid = os.getpid()
+        probes = (
+            pc.proc_rss_bytes,
+            lambda: pc.proc_rss_bytes_for_pid(pid),
+            pc.system_memory,
+            lambda: pc.get_ppid(pid),
+            lambda: pc.process_owner_sid(pid),
+        )
+        for probe in probes:
+            probe()  # a first call may legitimately populate the memo once
+        before = len(memo)
+        for _ in range(25):
+            for probe in probes:
+                probe()
+        assert len(memo) == before
 
 
 class TestLocalUserId:
@@ -2049,6 +2412,32 @@ def test_trusted_system_bin_rejects_a_name_not_in_system_dirs(tmp_path, monkeypa
     monkeypatch.setenv("PATH", str(tmp_path))
     assert platform_compat.trusted_system_bin("definitely-not-a-system-tool") is None
     assert platform_compat.trusted_system_bin("ps") is not None
+
+
+def test_trusted_system_bin_dirs_are_not_limited_to_fhs():
+    # A distribution may keep ps/lsof/systemd-run outside /usr/{s}bin; an
+    # FHS-only pin resolves nothing at all there.
+    from kiro_crew import platform_compat
+
+    fhs = {"/usr/bin", "/bin", "/usr/sbin", "/sbin"}
+    assert set(platform_compat._TRUSTED_SYSTEM_BIN_DIRS) - fhs
+
+
+def test_trusted_system_bin_resolves_outside_fhs(tmp_path, monkeypatch):
+    # A tool reachable only through a non-FHS pinned directory still resolves.
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX lookup
+        pytest.skip("POSIX binary resolution")
+
+    system_dir = tmp_path / "sw" / "bin"
+    system_dir.mkdir(parents=True)
+    tool = system_dir / "definitely-not-a-system-tool"
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+
+    monkeypatch.setattr(platform_compat, "_TRUSTED_SYSTEM_BIN_DIRS", (str(system_dir),))
+    assert platform_compat.trusted_system_bin("definitely-not-a-system-tool") == str(tool)
 
 
 @pytest.mark.skipif(
@@ -2336,3 +2725,74 @@ def test_an_absent_tool_reports_no_unpinned_path(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
 
     assert pc.tool_outside_trusted_dirs("definitely-not-a-system-tool") is None
+
+
+# ── Desktop bundled-interpreter detection ──
+
+_REPO_ROOT = Path(__file__).parent.parent
+
+
+class TestIsBundledInterpreter:
+    """``is_bundled_interpreter`` is the single runtime owner of the desktop
+    packaging-layout sentinel; these tests pin both its behavior and its
+    agreement with the packaging layer, so a bundler directory rename breaks a
+    test here instead of silently un-matching the runtime guard (which would
+    let pip write into the signed macOS bundle)."""
+
+    def test_bundled_interpreter_path_is_detected(self, tmp_path, monkeypatch):
+        """The real desktop layout — a python-build-standalone runtime under
+        ``Resources/backend-dist/`` — must be recognized. The literal directory
+        name is deliberate here: the test pins the real-world layout, not the
+        constant (asserting via the constant would be tautological)."""
+        bundled = (
+            tmp_path
+            / "App.app"
+            / "Contents"
+            / "Resources"
+            / "backend-dist"
+            / "kirocrew-backend-arm64"
+            / "bin"
+            / "python3.12"
+        )
+        monkeypatch.setattr(pc.sys, "executable", str(bundled))
+        assert pc.is_bundled_interpreter() is True
+
+    def test_regular_interpreter_path_is_not_detected(self, tmp_path, monkeypatch):
+        """An ordinary venv interpreter must not trip the guard — a false
+        positive would refuse every Python app build on normal installs."""
+        regular = tmp_path / "gateway-venv" / "bin" / "python3.12"
+        monkeypatch.setattr(pc.sys, "executable", str(regular))
+        assert pc.is_bundled_interpreter() is False
+
+    def test_sentinel_matches_electron_builder_packaging_layout(self):
+        """Pin the constant to electron-builder's ``extraResources`` target so
+        a packaging rename fails HERE, not at runtime inside a signed bundle."""
+        pkg_json = _REPO_ROOT / "website" / "electron" / "package.json"
+        pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+        targets = {
+            res["to"]
+            for res in pkg["build"]["extraResources"]
+            if isinstance(res, dict) and "to" in res
+        }
+        assert pc.BUNDLED_BACKEND_DIST_DIRNAME in targets, (
+            "platform_compat.BUNDLED_BACKEND_DIST_DIRNAME no longer matches the "
+            "electron-builder extraResources target in website/electron/package.json. "
+            "If the desktop packaging directory was renamed, update the constant "
+            "(and this test) in the same change — otherwise the bundled-interpreter "
+            "guard silently stops matching and pip can write into the signed bundle."
+        )
+
+    def test_sentinel_matches_desktop_build_script_staging_dir(self):
+        """Same pin against the build script that stages the runtime trees.
+
+        Asserts the directory NAME as a path component — not any exact
+        shell-quoted expression — so a script refactor that introduces a
+        variable for the staging path does not false-positive this pin."""
+        script = (_REPO_ROOT / "packaging" / "build-desktop.sh").read_text(encoding="utf-8")
+        needle = f"/{pc.BUNDLED_BACKEND_DIST_DIRNAME}"
+        assert needle in script, (
+            "packaging/build-desktop.sh no longer stages anything under a "
+            f"'{pc.BUNDLED_BACKEND_DIST_DIRNAME}' directory — keep "
+            "platform_compat.BUNDLED_BACKEND_DIST_DIRNAME in sync with the "
+            "packaging layer (see is_bundled_interpreter)."
+        )

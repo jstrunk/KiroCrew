@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import pathlib
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.dashboard import terminal_commands
 from kiro_crew.dashboard.handlers import terminal
 
 
@@ -1123,6 +1125,325 @@ class TestApiTerminalComplete:
             resp = await terminal.api_terminal_complete(req)
         assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["doc.txt"]
 
+    @pytest.mark.asyncio
+    async def test_a_path_listing_carries_no_entry_kind(self, tmp_path):
+        # The client drops an entry that does not belong to the tier it asked for,
+        # so the path tier must not start emitting `kind` — that would silently
+        # empty every path menu.
+        (tmp_path / "docs").mkdir()
+        sess = _make_session(session_id="s1")
+        req = self._req({"session_id": "s1", "token": "doc"}, registry={"s1": sess})
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))):
+            resp = await terminal.api_terminal_complete(req)
+        assert all("kind" not in e for e in json.loads(resp.text)["entries"])
+
+
+class TestApiTerminalCompleteCommandTier:
+    """POST /api/terminal/complete with `argv` — subcommand and flag completions.
+
+    The engine itself is covered in test_terminal_commands.py; this class covers
+    the ROUTE: tier selection, the audit vocabulary, and the response shape.
+    """
+
+    @pytest.fixture(autouse=True)
+    def sel_log(self):
+        with patch.object(terminal, "_sel") as mock_sel:
+            log = MagicMock()
+            mock_sel.return_value.log_api_access = log
+            yield log
+
+    def _req(self, body, user="testuser", registry=None):
+        req = _make_request(user=user, registry=registry)
+        req.json = AsyncMock(return_value=body)
+        return req
+
+    @staticmethod
+    def _entries(*names):
+        return [
+            terminal_commands.CmdEntry(n, f"about {n}", n.startswith("-")) for n in names
+        ]
+
+    def _complete(self, entries, reason="cmd_listed"):
+        return patch.object(
+            terminal_commands, "complete", AsyncMock(return_value=(entries, reason)),
+        )
+
+    @pytest.mark.asyncio
+    async def test_argv_selects_the_command_tier(self, tmp_path):
+        # A real directory is present, so answering with subcommands rather than its
+        # contents proves the tier was chosen by `argv`, not by what happened to be
+        # on disk.
+        (tmp_path / "docs").mkdir()
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh", "pr"]}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
+             self._complete(self._entries("create", "checkout")):
+            resp = await terminal.api_terminal_complete(req)
+        body = json.loads(resp.text)
+        assert resp.status == 200
+        assert [e["name"] for e in body["entries"]] == ["create", "checkout"]
+        assert all(e["kind"] == "sub" for e in body["entries"])
+        # `dir: null` is the existing "nothing resolved on the filesystem" signal,
+        # reused so the response needs no new top-level field.
+        assert body["dir"] is None
+        assert body["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_passes_the_token_and_cwd_through_to_the_engine(self, tmp_path):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "cre", "argv": ["gh", "pr"]}, registry={"s1": sess},
+        )
+        engine = AsyncMock(return_value=(self._entries("create"), "cmd_listed"))
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
+             patch.object(terminal_commands, "complete", engine):
+            await terminal.api_terminal_complete(req)
+        assert engine.await_args.args[:3] == (["gh", "pr"], "cre", str(tmp_path))
+
+    @pytest.mark.asyncio
+    async def test_answers_flags_for_a_dash_token(self):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "--ti", "argv": ["gh", "pr", "create"]},
+            registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             self._complete(self._entries("--title")):
+            resp = await terminal.api_terminal_complete(req)
+        body = json.loads(resp.text)
+        assert [(e["name"], e["kind"]) for e in body["entries"]] == [("--title", "flag")]
+        assert body["prefix"] == "--ti"
+
+    @pytest.mark.asyncio
+    async def test_answers_even_when_the_cwd_cannot_be_read(self):
+        # A subcommand list does not depend on the working directory, so this branch
+        # is ordered BEFORE the path tier's unknown-cwd refusal.
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=None)), \
+             self._complete(self._entries("pr")):
+            resp = await terminal.api_terminal_complete(req)
+        assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["pr"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_fall_back_to_a_path_listing(self, tmp_path):
+        # The tiers are disjoint. Falling through would list the cwd for a word the
+        # client already decided cannot be a path.
+        (tmp_path / "docs").mkdir()
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
+             self._complete([], "cmd_none"):
+            resp = await terminal.api_terminal_complete(req)
+        assert json.loads(resp.text)["entries"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "argv", [[], "gh", ["./gh"], ["/usr/bin/gh"], [""], ["gh\n"], [7], {}]
+    )
+    async def test_rejects_a_malformed_argv_with_400(self, argv):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": argv}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")):
+            resp = await terminal.api_terminal_complete(req)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_the_rejection_carries_a_machine_readable_code(self):
+        # The dashboard renders `error` verbatim into a localized UI, so the prose
+        # alone is untranslatable by construction; `code` is the contract.
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["./gh"]}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")):
+            resp = await terminal.api_terminal_complete(req)
+        assert json.loads(resp.text)["code"] == "terminal_invalid_argv"
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_argv_never_reaches_the_engine(self):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["./gh"]}, registry={"s1": sess},
+        )
+        engine = AsyncMock()
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             patch.object(terminal_commands, "complete", engine):
+            await terminal.api_terminal_complete(req)
+        engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_path_tier_is_untouched_when_argv_is_absent(self, tmp_path):
+        (tmp_path / "docs").mkdir()
+        sess = _make_session(session_id="s1")
+        req = self._req({"session_id": "s1", "token": "doc"}, registry={"s1": sess})
+        engine = AsyncMock()
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value=str(tmp_path))), \
+             patch.object(terminal_commands, "complete", engine):
+            resp = await terminal.api_terminal_complete(req)
+        engine.assert_not_awaited()
+        assert [e["name"] for e in json.loads(resp.text)["entries"]] == ["docs"]
+
+    @pytest.mark.asyncio
+    async def test_passes_the_operator_command_map_to_the_engine(self):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["mytool"]}, registry={"s1": sess},
+        )
+        engine = AsyncMock(return_value=([], "cmd_unknown"))
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             patch.object(terminal, "_get_config",
+                          return_value={"completion": {"commands": {"mytool": "cobra"}}}), \
+             patch.object(terminal_commands, "complete", engine):
+            await terminal.api_terminal_complete(req)
+        assert engine.await_args.args[3] == {"mytool": "cobra"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [False, True, "yes", 7, [], None])
+    async def test_a_non_object_completion_config_is_not_an_error(self, value):
+        # config.json is hand-edited: `"completion": false` would make a chained
+        # `.get` raise on a boolean — an HTTP 500 on a keystroke from a typo. A
+        # non-object value means "no operator additions", which is also the default.
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
+        )
+        engine = AsyncMock(return_value=([], "cmd_unknown"))
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             patch.object(terminal, "_get_config", return_value={"completion": value}), \
+             patch.object(terminal_commands, "complete", engine):
+            resp = await terminal.api_terminal_complete(req)
+        assert resp.status == 200
+        assert engine.await_args.args[3] is None
+
+    @pytest.mark.asyncio
+    async def test_reads_the_config_off_the_event_loop(self):
+        # `_get_config` does a synchronous `read_text()` of config.json and this
+        # route fires per keystroke, so an inline read would stall every gateway
+        # task on a slow home filesystem. Asserts the thread, not the timing.
+        import threading
+        seen = {}
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
+        )
+
+        def spy(_request):
+            seen["thread"] = threading.current_thread().name
+            return {}
+
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             patch.object(terminal, "_get_config", spy), \
+             self._complete([], "cmd_unknown"):
+            await terminal.api_terminal_complete(req)
+        assert "thread" in seen, "config was never read"
+        assert seen["thread"] != threading.current_thread().name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cfg", [False, True, "yes", 7, [], None])
+    async def test_a_non_object_terminal_config_is_not_an_error(self, cfg):
+        # Both levels are type-checked: `"terminal": false` would make
+        # `.get("completion")` raise on a boolean, an HTTP 500 from a typo.
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
+        )
+        engine = AsyncMock(return_value=([], "cmd_unknown"))
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             patch.object(terminal, "_get_config", return_value=cfg), \
+             patch.object(terminal_commands, "complete", engine):
+            resp = await terminal.api_terminal_complete(req)
+        assert resp.status == 200
+        assert engine.await_args.args[3] is None
+
+    @pytest.mark.asyncio
+    async def test_a_missing_completion_config_is_not_an_error(self):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
+        )
+        engine = AsyncMock(return_value=([], "cmd_unknown"))
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             patch.object(terminal, "_get_config", return_value={}), \
+             patch.object(terminal_commands, "complete", engine):
+            resp = await terminal.api_terminal_complete(req)
+        assert resp.status == 200
+        assert engine.await_args.args[3] is None
+
+    # ── Audit ──
+    # The rule for this route is a FIXED, content-free reason vocabulary: it fires
+    # per keystroke, so a reason naming the command or flag would put the user's
+    # command line in the audit trail.
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reason,outcome", [("cmd_listed", "ok"), ("cmd_none", "ok"), ("cmd_unknown", "ok")],
+    )
+    async def test_audits_each_engine_verdict(self, reason, outcome, sel_log):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "cre", "argv": ["gh", "pr"]}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             self._complete(self._entries("create") if reason == "cmd_listed" else [], reason):
+            await terminal.api_terminal_complete(req)
+        assert sel_log.call_args.kwargs == {
+            "caller": "testuser",
+            "operation": "terminal.complete",
+            "outcome": outcome,
+            "source": "dashboard",
+            "resources": reason,
+        }
+
+    @pytest.mark.asyncio
+    async def test_audits_a_refused_working_directory_as_denied(self, sel_log):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["gh"]}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")), \
+             self._complete([], "sensitive_path"):
+            await terminal.api_terminal_complete(req)
+        assert sel_log.call_args.kwargs["outcome"] == "denied"
+        assert sel_log.call_args.kwargs["resources"] == "sensitive_path"
+
+    @pytest.mark.asyncio
+    async def test_audits_a_malformed_argv(self, sel_log):
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "", "argv": ["./gh"]}, registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w")):
+            await terminal.api_terminal_complete(req)
+        assert sel_log.call_args.kwargs["outcome"] == "denied"
+        assert sel_log.call_args.kwargs["resources"] == "invalid_argv"
+
+    @pytest.mark.asyncio
+    async def test_the_audit_never_records_what_was_typed(self, sel_log):
+        # The anti-leak proof, mirroring the path tier's own. Nothing from the
+        # command line — command, subcommand, flag, prefix, or an entry name — may
+        # appear anywhere in the event.
+        sess = _make_session(session_id="s1")
+        req = self._req(
+            {"session_id": "s1", "token": "--secret-flag", "argv": ["gh", "pr", "sneaky"]},
+            registry={"s1": sess},
+        )
+        with patch.object(terminal, "_session_cwd_cached", AsyncMock(return_value="/w/proj")), \
+             self._complete(self._entries("--secret-flag")):
+            await terminal.api_terminal_complete(req)
+        blob = repr(sel_log.call_args.kwargs)
+        for leaked in ("gh", "sneaky", "secret-flag", "/w/proj"):
+            assert leaked not in blob
+        assert sel_log.call_args.kwargs["resources"] == "cmd_listed"
+
 
 class TestApiTerminalDelete:
     @pytest.mark.asyncio
@@ -1413,85 +1734,78 @@ class TestApiTerminalWs:
         ws.close.assert_not_awaited()
 
 
-# ── scrollback ring buffer + redaction ──
+# ── scrollback ring buffer ──
 
 
-class TestScrollbackRedaction:
-    """The reconnect-replay scrollback feature (ported from the upstream project).
+class TestStreamIsForwardedUnscanned:
+    """The live PTY stream and its scrollback replay are byte copies.
 
-    The port re-anchors redaction onto ``kiro_crew.security`` whose redactors
-    return ``(text, warnings)`` tuples (upstream's ``redaction`` module returns
-    a bare ``str``), so the helper must unpack both — a verbatim copy would
-    have crashed treating the tuple as a string.
+    Scanning PTY output on its way to the browser was removed. It protected
+    nothing the browser does not already show — the user's own shell printed
+    those bytes into a panel only that authenticated operator can see, and any
+    threat that reaches it reaches their real terminal too — while costing real
+    correctness: it hid a token printed on purpose (``gh auth token``), swallowed
+    a device-code login or presigned URL mid-flow, and mis-fired on high-entropy
+    build output such as an npm ``integrity sha512-…`` line. It also forced a
+    decode, and a PTY read ends wherever the kernel had bytes, so a multi-byte
+    character split across two reads became two U+FFFD — permanently corrupting
+    CJK, emoji, and a TUI's box-drawing glyphs.
+
+    The credential boundary is the selection hand-off, which is where output
+    actually reaches a model, and it has no opt-out (``TestApiTerminalRedact``).
     """
 
-    def test_redact_terminal_strips_credentials(self):
-        # An AKIA access-key id in PTY output must be redacted before it is
-        # sent to any client (live frame or replayed scrollback).
-        out = terminal._redact_terminal(b"export AWS_KEY=AKIAIOSFODNN7EXAMPLE\n")
-        assert b"AKIAIOSFODNN7EXAMPLE" not in out
-        assert isinstance(out, bytes)
+    def test_redactors_are_called_only_by_the_selection_handler(self):
+        """Source guard for the single-scan-site design. A scan reappearing on the
+        streaming path brings back both the U+FFFD corruption and the false
+        positives, and leaves two places in the module each claiming to be the
+        credential boundary — so the count is pinned rather than reviewed."""
+        src = pathlib.Path(terminal.__file__).read_text(encoding="utf-8")
+        # The import lists these names without a paren, so a paren-suffixed
+        # count counts call sites and never the import.
+        assert src.count("redact_credentials(") == 1
+        assert src.count("redact_exfiltration_urls(") == 1
+        scan = src.index("    def _scan(t: str) -> str:")
+        region = src[scan:src.index("\n    try:", scan)]
+        assert "redact_credentials(" in region
+        assert "redact_exfiltration_urls(" in region
 
-    def test_redact_terminal_passes_clean_output_through(self):
-        assert terminal._redact_terminal(b"$ ls -la\n") == b"$ ls -la\n"
+    def test_session_reservation_has_no_await(self):
+        """Source guard for the reservation critical section.
 
-    def test_redact_terminal_handles_invalid_utf8(self):
-        # errors="replace" keeps a stray byte from raising; output is still bytes.
-        out = terminal._redact_terminal(b"\xff\xfeok")
-        assert isinstance(out, bytes)
-        assert b"ok" in out
+        The handler states its own invariant with the comment "Reserve slot
+        synchronously before any await to prevent race condition"; from there
+        through ``registry[session_id] = None`` the max-sessions check and the
+        placeholder assignment are only atomic while nothing suspends between
+        them. An await in there lets two concurrent opens for one session id both
+        pass the check and both spawn a PTY, leaking one untracked.
 
-    def test_scrollback_default_is_empty_bytearray(self):
-        sess = _make_session()
-        assert sess.scrollback == bytearray()
+        Deliberately starts at that comment, not at ``registry.get``: the
+        stale-entry cleanup above it awaits ``_kill_session`` and is pre-existing,
+        which is exactly why the authors drew the line where they did."""
+        src = pathlib.Path(terminal.__file__).read_text(encoding="utf-8")
+        start = src.index("    # Reserve slot synchronously before any await")
+        end = src.index("        registry[session_id] = None", start)
+        # Strip comments first: the anchor comment itself says the word "await",
+        # so a bare substring check matches the prose and never the code.
+        region = "\n".join(
+            line for line in src[start:end].splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "await" not in region, f"await in the reservation region:\n{region}"
 
-    @pytest.mark.asyncio
-    async def test_scrollback_captured_and_replayed_on_reconnect(self, monkeypatch, tmp_path):
-        """PTY output accumulates in the scrollback ring buffer and is replayed
-        (redacted) to a client that reconnects to the same session."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
-        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
-        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
-
-        registry: dict = {}
-        app = _make_app(registry=registry)
-
-        from aiohttp.test_utils import TestClient, TestServer
-
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/sb-sess") as ws:
-                await ws.send_bytes(b"echo marker-xyz\n")
-                # Drain at least one frame so read_pty runs and fills scrollback.
-                msg = await ws.receive(timeout=3)
-                assert msg.type == web.WSMsgType.BINARY
-                await ws.close()
-
-            sess = registry["sb-sess"]
-            # Scrollback retained after disconnect, bounded by the ring buffer.
-            assert len(sess.scrollback) > 0
-            assert len(sess.scrollback) <= terminal._SCROLLBACK_MAX
-
-            # Reconnect: the first frame must be the replayed scrollback.
-            async with client.ws_connect("/api/ws/terminal/sb-sess") as ws:
-                replay = await ws.receive(timeout=3)
-                assert replay.type == web.WSMsgType.BINARY
-                assert len(replay.data) > 0
-                await ws.close()
-
-            await terminal._kill_session(registry["sb-sess"])
-
-    @pytest.mark.asyncio
-    async def test_scrollback_trims_to_max(self, monkeypatch):
-        """When PTY output exceeds _SCROLLBACK_MAX, the buffer keeps only the
-        most recent _SCROLLBACK_MAX bytes (the trimming branch in read_pty)."""
-        sess = _make_session()
-        # Simulate the read_pty capture/trim logic directly.
-        for _ in range(0, terminal._SCROLLBACK_MAX * 2, 4096):
-            sess.scrollback.extend(b"x" * 4096)
-            if len(sess.scrollback) > terminal._SCROLLBACK_MAX:
-                sess.scrollback = sess.scrollback[-terminal._SCROLLBACK_MAX:]
-        assert len(sess.scrollback) == terminal._SCROLLBACK_MAX
+    def test_no_send_through_the_session_field_after_an_await(self):
+        """Source guard. ``sess.ws`` is set to None by the WS handler on
+        disconnect, so dereferencing it after a suspension point raises
+        AttributeError — which ``except OSError`` does NOT catch, killing the PTY
+        reader and stopping scrollback capture for a session the client may still
+        reconnect to. Every send must go through a captured local that was
+        revalidated after the await, so the pattern `sess.ws.send` must not exist
+        anywhere in this module."""
+        src = pathlib.Path(terminal.__file__).read_text(encoding="utf-8")
+        assert "sess.ws.send" not in src
+        # And the read loop's send must revalidate the capture after the lock.
+        assert src.count("if sess.ws is not live or live.closed:") == 1
 
 
 # ── reap_orphaned_terminals ──
@@ -1725,10 +2039,114 @@ class TestTerminalWsIntegration:
             await terminal._kill_session(registry["io-sess"])
 
     @pytest.mark.asyncio
+    async def test_stream_and_replay_forward_output_verbatim(self, monkeypatch, tmp_path):
+        """End-to-end through the real PTY read loop: a credential the user's own
+        shell printed reaches the browser unchanged, and so does the scrollback
+        replayed on reconnect. Neither path scans or rewrites bytes — the scan
+        lives at the selection hand-off (``TestApiTerminalRedact``), which is the
+        only place this output can reach a model. Drives the shipped loop rather
+        than re-deriving it, so a regression in the wiring fails here too."""
+        key = "AKIAIOSFODNN7EXAMPLE"
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_enabled_cache", [True, 0.0])
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def _drain(ws, needle, budget=60):
+            # The shell echoes the typed line before its output, so read until a
+            # marker resolves rather than trusting a frame count. Stops on
+            # REDACTED too: if a regression starts scanning this path the needle
+            # never arrives, and without that stop the test would burn the whole
+            # budget in receive timeouts instead of failing on its assertion.
+            seen = b""
+            for _ in range(budget):
+                msg = await ws.receive(timeout=5)
+                if msg.type != web.WSMsgType.BINARY:
+                    continue
+                seen += msg.data
+                if needle in seen or b"REDACTED" in seen:
+                    break
+            return seen
+
+        async with TestClient(TestServer(app)) as client:
+            async with client.ws_connect("/api/ws/terminal/verbatim") as ws:
+                # Split the literal in the TYPED line so the shell's echo of it
+                # cannot satisfy the needle — only the printf's real output joins
+                # the halves. Asserting on the echo would prove far less: it
+                # never reaches the redactors' notion of a credential either way.
+                await ws.send_bytes(f"printf '{key[:13]}''{key[13:]}\\n'\n".encode())
+                live = await _drain(ws, key.encode())
+                await ws.close()
+            assert key.encode() in live
+            assert b"REDACTED" not in live
+
+            # Reconnect: the ring buffer is replayed as the same raw bytes.
+            async with client.ws_connect("/api/ws/terminal/verbatim") as ws:
+                replay = await _drain(ws, key.encode())
+                await ws.close()
+            assert key.encode() in replay
+            assert b"REDACTED" not in replay
+            await terminal._kill_session(registry["verbatim"])
+
+    @pytest.mark.asyncio
+    async def test_multibyte_output_survives_read_boundaries(self, monkeypatch, tmp_path):
+        """A PTY read ends wherever the kernel had bytes, so a multi-byte character
+        is routinely split across two reads. Nothing decodes server-side, so both
+        halves are forwarded and the client's own decoder joins them.
+
+        Decoding each read independently (which scanning the stream required)
+        turned every such split into two U+FFFD, permanently corrupting CJK,
+        emoji and a TUI's box-drawing glyphs — the client cannot recover the
+        original bytes from a replacement char.
+
+        The payload is deliberately ONE line with no newline in it, because a
+        shell that writes line by line hands the reader whole lines and every
+        read then lands on a character boundary by accident — an earlier version
+        of this test passed against the corrupting code for exactly that reason.
+        A single unbroken run of 3-byte characters longer than one 4096-byte read
+        cannot be split cleanly, since 4096 is not a multiple of 3."""
+        char = "中"
+        count = 3000  # 9000 bytes: at least two reads, neither aligned
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_enabled_cache", [True, 0.0])
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(app)) as client:
+            async with client.ws_connect("/api/ws/terminal/multibyte") as ws:
+                await ws.send_bytes(
+                    f"printf '{char}%.0s' $(seq 1 {count}); printf 'DO''NE\\n'\n".encode()
+                )
+                seen = b""
+                for _ in range(400):
+                    msg = await ws.receive(timeout=10)
+                    if msg.type != web.WSMsgType.BINARY:
+                        continue
+                    seen += msg.data
+                    if b"DONE" in seen:
+                        break
+                await ws.close()
+            await terminal._kill_session(registry["multibyte"])
+
+        assert "\ufffd".encode() not in seen, "a read boundary corrupted a character"
+        assert seen.count(char.encode()) >= count
+
+    @pytest.mark.asyncio
     async def test_submitted_line_invalidates_the_cwd_memo(self, monkeypatch, tmp_path):
         """A submitted line may be a `cd`, so it drops the completion route's cwd
-        memo; a keystroke that submits nothing leaves the memo intact (otherwise
-        every character typed would force a fresh cwd probe)."""
+        memo and re-arms the title poller; a keystroke that submits nothing
+        leaves the memo intact (otherwise every character typed would force a
+        fresh cwd probe)."""
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
         monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
@@ -1761,6 +2179,18 @@ class TestTerminalWsIntegration:
                 await ws.send_bytes(b"d /tmp\r")
                 await _drain_to_pong(ws)
                 assert sess.cwd_probe is None
+
+                # The submitted line is the one input that can change the cwd,
+                # so it re-arms the title poller directly rather than relying on
+                # the shell's echo to do it. Stop the PTY reader first, since
+                # that echo would otherwise re-arm the session either way and
+                # the assertion would prove nothing.
+                if sess.reader_task is not None:
+                    sess.reader_task.cancel()
+                sess.frames_dirty = False
+                await ws.send_bytes(b"cd /tmp\r")
+                await _drain_to_pong(ws)
+                assert sess.frames_dirty is True
 
                 await ws.close()
 
@@ -1797,6 +2227,65 @@ class TestTerminalWsIntegration:
                 await ws.close()
 
             await terminal._kill_session(registry["recon-sess"])
+
+    @pytest.mark.asyncio
+    async def test_ws_takeover_displaced_socket_keeps_new_ws(self, monkeypatch, tmp_path):
+        """A displaced socket's cleanup must not clobber the takeover socket.
+
+        A second window (e.g. the terminal panel popping out) reconnects to a
+        session WHILE the first window's WS is still attached. The handler
+        replaces ``sess.ws`` with the new socket; when the displaced handler's
+        write loop then unwinds, its ``finally`` block must leave ``sess.ws``
+        pointing at the live takeover socket -- clearing it would silence PTY
+        output to the new window even though it is connected.
+        """
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(app)) as client:
+            ws1 = await client.ws_connect("/api/ws/terminal/takeover-sess")
+            sess = registry["takeover-sess"]
+            original_pid = terminal._sess_pid(sess)
+            first_ws = sess.ws
+            assert first_ws is not None
+
+            # Second client takes over the session while ws1 is still open.
+            ws2 = await client.ws_connect("/api/ws/terminal/takeover-sess")
+            sess = registry["takeover-sess"]
+            assert terminal._sess_pid(sess) == original_pid  # same PTY
+            takeover_ws = sess.ws
+            assert takeover_ws is not None
+            assert takeover_ws is not first_ws  # replaced by the new socket
+
+            # The displaced client closes; its server-side handler unwinds.
+            await ws1.close()
+            # Give the displaced handler's finally block a chance to run.
+            for _ in range(50):
+                await asyncio.sleep(0.05)
+                if sess.ws is takeover_ws and sess.last_ws_disconnect is None:
+                    break
+            assert sess.ws is takeover_ws  # NOT clobbered to None
+            assert sess.last_ws_disconnect is None
+
+            # And the new socket still works end-to-end (control ping).
+            await ws2.send_str(json.dumps({"type": "ping"}))
+            got_pong = False
+            for _ in range(40):
+                msg = await ws2.receive(timeout=3)
+                if msg.type == web.WSMsgType.TEXT and json.loads(msg.data).get("type") == "pong":
+                    got_pong = True
+                    break
+            assert got_pong
+
+            await ws2.close()
+            await terminal._kill_session(registry["takeover-sess"])
 
     @pytest.mark.asyncio
     async def test_ws_invalid_json_ignored(self, monkeypatch, tmp_path):
@@ -1951,43 +2440,94 @@ class TestTerminalWsIntegration:
                     "path is not live"
                 )
 
-                # Run sleep in foreground; drain until we see the command
-                # echoed back (so we know the shell is processing it, not
-                # buffering it pre-prompt).
-                await ws.send_bytes(b"sleep 30\n")
+                # Run a long-lived sleep in the foreground; drain until we see
+                # the command echoed back (so we know the shell is processing
+                # it, not buffering it pre-prompt). The duration is chosen to be
+                # far larger than the SIGINT-verification budget below: a
+                # genuinely dropped SIGINT must leave `sleep` running for the
+                # whole budget, so it can never end on its own and let the shell
+                # run the queued marker echo (which would be a false pass). Here
+                # this drain WANTS the line-discipline echo — it only proves the
+                # shell received the input, so matching the echoed command text
+                # is correct.
+                await ws.send_bytes(b"sleep 120\n")
                 echoed = await _drain_until(
                     ws,
-                    lambda b: b"sleep 30" in b,
+                    lambda b: b"sleep 120" in b,
                     budget_secs=5,
                 )
-                assert b"sleep 30" in echoed, (
-                    "shell did not echo `sleep 30` within 5s — "
+                assert b"sleep 120" in echoed, (
+                    "shell did not echo `sleep 120` within 5s — "
                     "input may not have reached an interactive shell"
                 )
 
-                # Send Ctrl+C (ETX byte) and drain until the prompt redraws,
-                # which is the visible signal that the foreground job has
-                # been killed and the shell is back at idle.
-                await ws.send_bytes(b"\x03")
-                await _drain_until(
-                    ws,
-                    lambda b: b"$ " in b or b"# " in b,
-                    budget_secs=5,
-                )
-
-                # Shell should still be alive after SIGINT killed sleep.
-                # Probe with an echo and drain until we see the marker.
-                await ws.send_bytes(b"echo SIGINT_OK\n")
-                tail = await _drain_until(
-                    ws,
-                    lambda b: b"SIGINT_OK" in b,
-                    budget_secs=10,
-                )
-                found = b"SIGINT_OK" in tail
-
+                # Deliver SIGINT and confirm the child actually received it.
+                # This step is inherently racy against shell scheduling on a
+                # loaded CI host, in two ways the old single-shot version did
+                # not survive:
+                #   * The ``sleep 120`` echo drained above is emitted by the PTY
+                #     line discipline the instant the bytes arrive — BEFORE the
+                #     shell has necessarily read the line and forked ``sleep``
+                #     into the foreground process group. A ``\x03`` that lands in
+                #     that window is delivered to the shell sitting at its prompt
+                #     (which simply discards the pending line) rather than to
+                #     ``sleep``, so the FIRST Ctrl+C can miss the child.
+                #   * Under this class's xdist integration group the forked shell
+                #     / reader thread can go unscheduled past a fixed budget, so
+                #     a single marker drain can time out even when delivery would
+                #     eventually succeed.
+                # Handle both by re-poking with Ctrl+C and re-probing the marker
+                # over a generous overall budget, rather than the old "\x03 once,
+                # wait for a prompt redraw, probe once" — a login shell on a
+                # minimal host may render no prompt at all (see the readiness-gate
+                # note above), which made the prompt drain a pure time sink and
+                # left the single probe to absorb the whole race.
+                #
+                # EXECUTION-only marker: the probe command is written so the PTY
+                # line-discipline echo of our own keystrokes never contains the
+                # search token. The typed bytes are ``echo SIG''INT_OK`` (an
+                # empty '' splits the literal), so the echoed input reads
+                # ``SIG''INT_OK`` — no ``SIGINT_OK`` substring — while only the
+                # shell's *execution* of the echo emits the concatenated
+                # ``SIGINT_OK`` on stdout. A match therefore proves the shell ran
+                # a command, i.e. SIGINT killed the foreground ``sleep`` and
+                # returned the shell to its prompt. Matching the bare echoed input
+                # (the previous version) let the test pass even when SIGINT was
+                # never delivered — a false pass that would hide a real
+                # terminal-signal regression.
                 sess = registry["sigint-sess"]
-                # Success: shell responded (SIGINT killed sleep, shell continued)
-                # OR process exited (signal was delivered, just killed everything)
+                loop = asyncio.get_event_loop()
+                overall_deadline = loop.time() + 25
+                found = False
+                while True:
+                    remaining = overall_deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    # Ctrl+C (ETX): kills the foreground `sleep` if it is
+                    # running, or harmlessly aborts an empty prompt line if a
+                    # previous iteration already recovered the shell.
+                    await ws.send_bytes(b"\x03")
+                    await ws.send_bytes(b"echo SIG''INT_OK\n")
+                    # Clamp each drain to the remaining budget so the overall
+                    # wait cannot overshoot ``overall_deadline`` by a full drain.
+                    tail = await _drain_until(
+                        ws,
+                        lambda b: b"SIGINT_OK" in b,
+                        budget_secs=min(5.0, remaining),
+                    )
+                    if b"SIGINT_OK" in tail:
+                        found = True
+                        break
+                    # Signal may instead have torn down the whole session — that
+                    # is also a valid "SIGINT was delivered" outcome.
+                    if sess.proc.returncode is not None:
+                        break
+
+                # Success: the shell executed a command after Ctrl+C (SIGINT
+                # killed sleep, shell continued) OR the process exited (signal
+                # was delivered, just tore the whole session down). A dropped
+                # SIGINT leaves `sleep 120` running for the whole 25s budget, so
+                # neither branch can become true — the test correctly fails.
                 assert found or sess.proc.returncode is not None
                 await ws.close()
 
@@ -2171,6 +2711,50 @@ class TestSessionTitle:
             assert terminal._session_title(self._sess()) is None
 
 
+# ── one cwd probe per poll tick ──
+
+
+@pytest.mark.skipif(
+    terminal.platform_compat.IS_WINDOWS,
+    reason="the cwd/title probes are POSIX-only (os.tcgetpgrp, /proc, libproc); "
+    "both helpers return None on Windows",
+)
+class TestCwdProbeSharing:
+    """The title label and the cwd frame are two consumers of ONE answer: with no
+    foreground command the title is just the cwd's basename. On a host where
+    _proc_cwd has to fork lsof — no /proc and no libproc — asking twice per tick
+    is the entire cost of an otherwise idle terminal, so the session memo has to
+    collapse them into one probe."""
+
+    def test_memoizes_within_the_ttl(self):
+        sess = _make_session()
+        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
+             patch.object(terminal, "_proc_cwd", return_value="/tmp/a") as probe:
+            assert terminal._session_cwd(sess) == "/tmp/a"
+            assert terminal._session_cwd(sess) == "/tmp/a"
+        assert probe.call_count == 1
+
+    def test_reprobes_once_the_ttl_expires(self):
+        # The memo must not outlive one tick, or a `cd` would take two polls to
+        # show up in the tab title.
+        sess = _make_session()
+        sess.cwd_probe = (time.monotonic() - terminal._CWD_PROBE_TTL_S - 1, "/tmp/old")
+        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
+             patch.object(terminal, "_proc_cwd", return_value="/tmp/new") as probe:
+            assert terminal._session_cwd(sess) == "/tmp/new"
+        assert probe.call_count == 1
+
+    def test_title_and_cwd_frame_share_one_probe(self):
+        # Exactly the pair of calls one poll tick makes, in order.
+        sess = _make_session()
+        with patch.object(terminal.platform_compat, "IS_POSIX", True), \
+             patch("os.tcgetpgrp", return_value=12345), \
+             patch.object(terminal, "_proc_cwd", return_value="/home/u/proj") as probe:
+            assert terminal._session_title(sess) == "proj"
+            assert terminal._session_cwd(sess) == "/home/u/proj"
+        assert probe.call_count == 1
+
+
 # ── poll_terminal_titles ──
 
 
@@ -2227,6 +2811,55 @@ class TestPollTerminalTitles:
              patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
             await terminal.poll_terminal_titles(self._app(sess))
         mock_title.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_does_not_probe_a_session_with_no_new_output(self):
+        # A shell cannot change directory or start a command without writing to
+        # the PTY, so a session that has produced nothing since its last probe
+        # cannot have gone stale. Probing it anyway is what made an idle
+        # terminal cost a forked lsof every second on hosts with no /proc.
+        ws = AsyncMock()
+        ws.closed = False
+        sess = _make_session(session_id="s1", ws=ws)
+        sess.frames_dirty = False
+        with patch.object(terminal, "_session_title") as title, \
+             patch.object(terminal, "_session_cwd") as cwd, \
+             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
+            await terminal.poll_terminal_titles(self._app(sess))
+        title.assert_not_called()
+        cwd.assert_not_called()
+        ws.send_str.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disarms_itself_after_probing(self):
+        ws = AsyncMock()
+        ws.closed = False
+        sess = _make_session(session_id="s1", ws=ws)
+        with patch.object(terminal, "_session_title", return_value="vim"), \
+             patch.object(terminal, "_session_cwd", return_value="/tmp/x"), \
+             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
+            await terminal.poll_terminal_titles(self._app(sess))
+        assert sess.frames_dirty is False
+
+    @pytest.mark.asyncio
+    async def test_output_landing_mid_probe_re_arms_the_session(self):
+        # The flag is cleared BEFORE the probe, so a write that lands while the
+        # probe is in flight is picked up on the next tick. Clearing it after the
+        # probe would swallow that write and freeze the title until some later,
+        # unrelated output happened to re-arm it.
+        ws = AsyncMock()
+        ws.closed = False
+        sess = _make_session(session_id="s1", ws=ws)
+
+        def output_lands_mid_probe(s):
+            s.frames_dirty = True  # what read_pty does on every PTY read
+            return "vim"
+
+        with patch.object(terminal, "_session_title", side_effect=output_lands_mid_probe), \
+             patch.object(terminal, "_session_cwd", return_value=None), \
+             patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
+            await terminal.poll_terminal_titles(self._app(sess))
+        assert sess.frames_dirty is True
 
     @pytest.mark.asyncio
     async def test_swallows_send_error(self):

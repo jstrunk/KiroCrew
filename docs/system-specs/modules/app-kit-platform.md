@@ -56,12 +56,26 @@ unrecoverable.
 
 Frontend badges and affordances read the same three fields
 (`origin === 'builtin'`, `resources === 'app'`, `lifecycle === 'gateway'`,
-`lifecycle !== 'locked'`). Provenance LABELS are a separate question: they must
-test the server-attached `_registry` tag FIRST, because `origin` and `author` are
-copied verbatim from an index entry for a not-yet-installed app, so an added
-registry could otherwise publish `origin: "builtin"` and self-award the
-first-party mark next to a button that runs its setup code with gateway
-privileges.
+`lifecycle !== 'locked'`). Provenance LABELS and the verified badge are a
+separate question: `/api/apps/registry` rows carry server-computed
+`provenance` (`"core" | "external" | "builtin"`) and `verified` fields,
+stamped by `_apply_trust_fields` in `registry.py` where the server-attached
+`_registry` tag is authoritative. The helper OVERWRITES anything an index
+publishes, and derives `verified` from the INDEX-declared author snapshotted
+before the app.json merge — never from the repo-fetched manifest — because
+`origin` and `author` are otherwise copied verbatim from index or manifest
+content for a not-yet-installed app: deriving trust from either let an added
+registry publish `origin: "builtin"`, or a third-party core repo publish
+`author: "KiroCrew"`, and self-award the first-party mark next to a button
+that runs its setup code with gateway privileges. The client
+(`isVerified`/`sourceLabel` in `website/src/components/appstore/types.ts`)
+reads the server fields, still rejects a `_registry`-tagged row first (so
+nothing smuggled through an older gateway can relabel an external row), and
+falls back to the legacy `origin`/`author` derivation only for rows from
+older gateways that emit neither field. `_registry` itself must keep being
+emitted: besides the external-source label and older clients,
+`appManifest.ts::keysFor` (first-party copy gate) and `pickFeatured`'s
+legacy arm still read it.
 
 ## 1. App MCP servers land in KiroCrew's agent config, never the shared kiro file
 
@@ -177,6 +191,83 @@ hyphenated builtin and fell back to the data home, reproducing the exact silent
 miss this function exists to prevent.
 
 Writer: `apps/bridges.py::_app_resource_root`.
+
+### 5.1 Resource-path containment is host-independent and flavour-explicit
+
+Every manifest resource path (`agents`/`skills`/`sops`, `ui.entry`,
+`ui.pages[].entryPoint`, `backend.entryPoint`) is joined onto the app root, so
+`manifest._path_escapes_app_root` refuses any path that could relocate that join.
+It applies three checks, and the two lexical ones run **first and unconditionally**
+— before, and independent of, whether `app_root` is known:
+
+1. `_is_rooted_path` — `PureWindowsPath(p).drive or .root`.
+2. `_has_dotdot_segment` — a `..` segment under **either** path flavour.
+3. Canonical containment (only when `app_root` is given) — `resolve()` +
+   `is_relative_to`, which catches what no lexical check can see: a symlink or
+   reparse point inside the root whose target leaves it.
+
+A manifest is portable data validated on whichever host installs the app, so all
+three must reach the same verdict everywhere. Both lexical checks are therefore
+written **flavour-explicitly** rather than via the running host's `os.path`
+(matching the `PurePosixPath|PureWindowsPath` idiom in
+`dashboard/handlers/knowledge.py`), and neither is deferred to `resolve()`:
+
+- **`is_absolute()` is flavour-bound.** It and `os.path.isabs` answer for the
+  RUNNING host, and `os.path` **is** `ntpath` on Windows, so pairing the two in an
+  `or` yields a single Windows-only test there. Windows' flavour reads
+  `/etc/passwd` as unanchored (no drive), which would let a POSIX-absolute resource
+  path through a Windows gateway. The Windows flavour treats both `/` and `\` as a
+  root, making it a strict superset — testing it alone covers both syntaxes on
+  either host.
+- **Drive-relative paths need drive-OR-root.** `D:evil.py` carries a drive but no
+  root, so `is_absolute()` is False, yet `app_root / "D:evil.py"` yields
+  `D:evil.py` and escapes the root entirely.
+- **`..` needs both flavours, and needs checking even when `app_root` is known.** A
+  POSIX host reads `..\evil.py` as one opaque filename, so a POSIX-only split
+  misses a backslash traversal — and `app_root / "..\evil.py"` *resolves inside*
+  the root on POSIX, so relying on containment alone makes the verdict differ by
+  host: accepted on POSIX, rejected on Windows. `a..b` and `notes..md` are single
+  segments and remain accepted.
+
+### 5.2 App skills are linked with a junction on Windows, not a symlink
+
+`_register_skills` links each declared skill directory into the skills tree twice
+(namespaced `skills/<app>/<skill>` plus a flat `skills/<skill>`). The link is a
+symlink on POSIX and a **directory junction** on Windows, via
+`platform_compat.symlink_or_junction`.
+
+The mechanism is load-bearing, not an implementation detail: a Windows symlink
+needs `SeCreateSymbolicLinkPrivilege`, which a standard (non-elevated,
+non-Developer-Mode) account does **not** hold. Raw `os.symlink` there raises
+`WinError 1314`, and because registration only logs a warning per skill, every app
+on an ordinary Windows install registered **zero** skills — silently. A junction
+needs no privilege and is transparent to every operation performed on the result
+(`is_dir`, `resolve`, reading files through it, and the `_iter_skill_files` walk
+that indexes app skills through their trusted-provider root).
+
+**Consequence for every link test in this subsystem:** a junction reports
+`is_symlink() is False`, so link-ness must be asked with
+`platform_compat.is_link_or_junction` and removal done with
+`platform_compat.unlink_link_or_junction`. Two failure modes follow from getting this
+wrong, and both are Windows-only and silent:
+
+- `is_symlink()` on re-registration classifies our own junction as a real
+  directory and hands it to `shutil.rmtree`, which **refuses any directory link**
+  — breaking every re-registration.
+- `is_symlink()` in the `_deregister_skills` sweep and the `reconcile_app_skills`
+  stale-link sweep finds zero links, so the **flat** link (which lives in the
+  skills root, outside the namespaced directory the `rmtree` removes) leaks: the
+  skills root keeps advertising a skill whose app is deregistered, and the link
+  dangles once the app is uninstalled.
+
+`_copy_app_tree` is the deliberate exception — it **omits** a junction found in an
+app source rather than reproducing it, since `copytree` cannot preserve one as a
+link and copying through it would duplicate the target's bytes (the multi-GB-walk
+failure mode) or expose a sensitive location.
+
+Writer: `apps/bridges.py::_register_skills`, `_deregister_skills`,
+`reconcile_app_skills`. Shim: `platform_compat.symlink_or_junction` / `is_link_or_junction` /
+`unlink_link_or_junction`.
 
 ## 6. App window entries: discovery, nested routes
 
@@ -357,11 +448,15 @@ Curator control over the Discover editorial layer is the registry entry's
 `featured` flag, and it is honored **only** for core-registry entries. The
 spotlight is the store's most persuasive install surface and its action runs
 third-party setup code with gateway privileges, so an external registry cannot
-flag itself into that slot. With nothing flagged, selection falls back to a
+flag itself into that slot: `_apply_trust_fields` strips `featured` from
+external rows server-side, and `pickFeatured` additionally excludes any row
+whose `provenance` (or legacy `_registry` tag) marks it external. With nothing
+flagged, selection falls back to a
 deterministic order (hero art, then verified publishers, then name), so the
 surface is never empty and never arbitrary.
 
 Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
-`register_builtin_apps`), `apps/discovery.py::discover_builtin_apps`;
+`register_builtin_apps`), `apps/discovery.py::discover_builtin_apps`,
+`apps/registry.py::_apply_trust_fields`;
 consumers: `website/src/pages/AppsPage.tsx` (`pickFeatured`),
 `website/src/components/appstore/types.ts` (`isVerified`, `sourceLabel`).
