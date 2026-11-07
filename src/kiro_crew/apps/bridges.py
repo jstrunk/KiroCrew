@@ -127,6 +127,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _PY_OPTS_WITH_SEPARATE_VALUE,
         _deregister_mcp_servers,
         _has_python_shebang,
+        _legacy_shared_mcp_path,
         _live_port_for,
         _maybe_provision_backendless_deps,
         _normalize_attached_m,
@@ -272,6 +273,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.config.paths import (  # noqa: F401
         kiro_agents_dir,
+        kiro_mcp_settings_path,
     )
     from kiro_crew.cron import (  # noqa: F401
         CronPendingMismatch,

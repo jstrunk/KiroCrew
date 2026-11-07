@@ -49,6 +49,7 @@ from kiro_crew.atomic_write import (
     open_access_control_source,
     pinned_parent_replace_supported,
 )
+from kiro_crew.config.paths import kiro_home
 from kiro_crew.context import steering_target_admissible
 from kiro_crew.dashboard.handlers.prompts_paths import _is_path_too_long_error
 from kiro_crew.dashboard.state import DashboardState
@@ -239,7 +240,7 @@ def steering_roots(project_dir: Path | None = None) -> list[tuple[str, Path]]:
     still excluded.
     """
     out: list[tuple[str, Path]] = []
-    user_dir = Path.home() / ".kiro" / "steering"
+    user_dir = kiro_home() / "steering"
     if not is_sensitive_path(str(user_dir)):
         out.append(("user", user_dir))
     if project_dir:

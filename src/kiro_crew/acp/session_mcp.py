@@ -427,7 +427,7 @@ def _global_settings(*, strict: bool = False) -> dict[str, Any]:
     must remain authoritative when their settings cannot be inspected safely.
     """
     try:
-        return _read_mcp_settings(_agent_mod._KIRO_MCP_JSON)
+        return _read_mcp_settings(_agent_mod._kiro_mcp_json())
     except (OSError, ValueError):
         if strict:
             raise
@@ -1507,7 +1507,11 @@ def native_settings_sources(work_dir: str | Path | None) -> list[NativeSettingsS
     it cannot read must stay authoritative. An absent file contributes nothing.
     """
     reads: list[tuple[str, Path, Any]] = [
-        (NATIVE_SOURCE_GLOBAL, _agent_mod._KIRO_MCP_JSON, lambda _p: _global_settings(strict=True))
+        (
+            NATIVE_SOURCE_GLOBAL,
+            _agent_mod._kiro_mcp_json(),
+            lambda _p: _global_settings(strict=True),
+        )
     ]
     if work_dir:
         project_path = Path(work_dir) / ".kiro" / "settings" / "mcp.json"

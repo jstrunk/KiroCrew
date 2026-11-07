@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable
 
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.paths import kiro_home
 from kiro_crew.dashboard.handlers._shared_workspace import active_project_dir
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import is_sensitive_path
@@ -54,7 +55,7 @@ def _canonical_skill_roots() -> list[Path]:
     ``<project>/.kiro/skills`` needs a chat slot and is added by the caller that
     has one.
     """
-    out: list[Path] = [Path.home() / ".kiro" / "skills", skills_dir()]
+    out: list[Path] = [kiro_home() / "skills", skills_dir()]
     try:
         # ``resolve()``, not just ``expanduser()``: a RELATIVE extra_paths entry
         # would otherwise key the catalog by a relative root, and the persisted
@@ -311,7 +312,7 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
     allow_leaf_symlink = name.startswith(LEAF_SYMLINK_PREFIX)
     if name.startswith("kiro-user/"):
         rel = name[len("kiro-user/") :]
-        root = Path.home() / ".kiro" / "skills"
+        root = kiro_home() / "skills"
     elif name.startswith("kiro-workspace/"):
         rel = name[len("kiro-workspace/") :]
         # NOT trust-gated, deliberately: reading a SKILL.md is how the operator

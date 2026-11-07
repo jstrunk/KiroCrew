@@ -113,7 +113,7 @@ def _init_timeout_ms(work_dir: str | Path | None) -> int | None:
     from kiro_crew.acp.session_mcp import _read_mcp_settings
 
     # Beside the global mcp.json: kiro-cli keeps both in ``~/.kiro/settings``.
-    paths = [agent_mod._KIRO_MCP_JSON.parent / "cli.json"]
+    paths = [agent_mod._kiro_mcp_json().parent / "cli.json"]
     if work_dir:
         paths.append(Path(work_dir) / ".kiro" / "settings" / "cli.json")
     found: int | None = None

@@ -37,6 +37,7 @@ from typing import Any
 
 from kiro_crew.apps.builtins.mochi.soul_loader import rendered_bg_prompt_path, rendered_prompt_path
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config.paths import kiro_mcp_settings_path
 from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ def _configured_server_names() -> list[str]:
     deny either. Contrast the probe cache, whose failure says nothing about what
     kiro-cli loaded — which is the case :func:`_ambient_servers` exists to cover.
     """
-    config = Path.home() / ".kiro" / "settings" / "mcp.json"
+    config = kiro_mcp_settings_path()
     try:
         raw = loads_user_json(config.read_text(encoding="utf-8"))
     except FileNotFoundError:

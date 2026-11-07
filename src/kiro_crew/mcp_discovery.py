@@ -938,6 +938,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.config.paths import (  # noqa: F401
         data_home,
         kiro_agents_dir,
+        kiro_mcp_settings_path,
     )
     from kiro_crew.env import (  # noqa: F401
         MCP_PATH_HINT,

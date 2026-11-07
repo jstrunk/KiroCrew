@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from kiro_crew.agent_discovery import expand_skill_uri, parsed_agent_specs
-from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.config.paths import kiro_agents_dir, kiro_home
 from kiro_crew.dashboard.handlers._shared_skill_roots import _edition_skill_roots
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 from kiro_crew.security import is_sensitive_path
@@ -40,7 +40,7 @@ def _kiro_skill_roots(project_dir: Path | None = None) -> list[tuple[str, Path]]
     ``source`` field on listed skills so the UI can show provenance.
     """
     out: list[tuple[str, Path]] = []
-    user_dir = Path.home() / ".kiro" / "skills"
+    user_dir = kiro_home() / "skills"
     if user_dir.is_dir() and not is_sensitive_path(str(user_dir)):
         out.append(("kiro-user", user_dir))
     if project_dir:

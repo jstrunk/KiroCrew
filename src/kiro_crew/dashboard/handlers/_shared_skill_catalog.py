@@ -21,6 +21,7 @@ from kiro_crew.agent_discovery import (
     skill_resource_uris,
     skill_uri_for_path,
 )
+from kiro_crew.config.paths import kiro_home
 from kiro_crew.dashboard.handlers._shared_skill_roots import (
     LEAF_SYMLINK_PREFIX,
     _canonical_skill_roots,
@@ -60,7 +61,7 @@ def _skill_key_roots(state: DashboardState, session_key: str = "") -> list[tuple
     :func:`_resolve_skill_root` does — the two MUST agree or an enumerated key
     would not resolve.
     """
-    out: list[tuple[str, Path]] = [("kiro-user/", Path.home() / ".kiro" / "skills")]
+    out: list[tuple[str, Path]] = [("kiro-user/", kiro_home() / "skills")]
     proj = active_project_dir(state, session_key)
     if proj is not None:
         out.append(("kiro-workspace/", proj / ".kiro" / "skills"))

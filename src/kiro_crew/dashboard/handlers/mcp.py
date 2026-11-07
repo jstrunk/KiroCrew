@@ -65,18 +65,18 @@ from kiro_crew.dashboard.handlers.mcp_config_entries import (
     _set_tool_overrides,
 )
 from kiro_crew.dashboard.handlers.mcp_config_files import (
-    _GLOBAL_MCP_JSON,
     _KIRO_GLOBAL_SURFACE,
-    _MCP_LOCK_PATH,
     AmbiguousServerKey,
     McpConfigHasComments,
     _config_key_for,
     _extra_mcp_scopes,
+    _global_mcp_json,
     _is_valid_mcp_name,
     _kirocrew_mcp_json,
     _load_config_or_refusal,
     _mcp_config_busy,
     _mcp_config_corrupt,
+    _mcp_lock_path,
     _mcp_server_not_found,
     _mcp_spec_invalid,
     _mcp_write_failed,
@@ -198,8 +198,8 @@ class _McpFileLock:
 
     async def __aenter__(self) -> None:
         try:
-            _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
-            _MCP_LOCK_PATH.touch(exist_ok=True)
+            _global_mcp_json().parent.mkdir(parents=True, exist_ok=True)
+            _mcp_lock_path().touch(exist_ok=True)
             # Open the lock fd WRITABLE and non-truncating. Windows msvcrt.locking()
             # requires write access on the handle -- an "r" fd fails with EACCES and
             # platform_compat.acquire_lock swallows that (best-effort semantics),
@@ -210,21 +210,19 @@ class _McpFileLock:
             # (GH-9248). Kept inline rather than routed through that helper: the fd
             # is stored on self._fd and released in __aexit__, so it must OUTLIVE
             # this method -- the with-scoped helper would close it at method return.
-            fd = open(_MCP_LOCK_PATH, "r+")
+            fd = open(_mcp_lock_path(), "r+")
         except OSError as exc:
             # Naming the path AND the errno is the point: "Read-only file
             # system" on this specific path is what tells the operator what to
-            # change, and it is not something retrying can recover. No
-            # KIRO_HOME remedy: _GLOBAL_MCP_JSON resolves from a fixed
-            # Path.home() that ignores KIRO_HOME, so moving it cannot move
-            # this lock -- naming the config the lock guards is what stays
-            # true.
+            # change, and it is not something retrying can recover. The lock
+            # sits beside the config it guards (``<kiro home>/settings``), so
+            # naming that config tells the operator which KIRO_HOME is in use.
             logger.warning(
                 "cannot open the mcp config lock %s (%s) -- writes to %s cannot be "
                 "serialized, so this update is being skipped",
-                _MCP_LOCK_PATH,
+                _mcp_lock_path(),
                 exc.strerror or exc,
-                _GLOBAL_MCP_JSON,
+                _global_mcp_json(),
             )
             raise
         # Run blocking lock acquire in a thread to avoid blocking the event
@@ -252,7 +250,7 @@ class _McpFileLock:
             # WAITING one, so a refusal here is never a caller's own "do not
             # wait" choice.
             if isinstance(exc, OSError):
-                logger.warning("mcp config lock %s: %s", _MCP_LOCK_PATH, exc)
+                logger.warning("mcp config lock %s: %s", _mcp_lock_path(), exc)
             raise
         self._fd = fd
 
@@ -291,9 +289,9 @@ def _write_mcp_json(data: dict) -> None:
 
     Raises :class:`McpConfigHasComments` when the file on disk holds JSONC.
     """
-    _refuse_commented_config(_GLOBAL_MCP_JSON)
-    _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_json_write(_GLOBAL_MCP_JSON, data)
+    _refuse_commented_config(_global_mcp_json())
+    _global_mcp_json().parent.mkdir(parents=True, exist_ok=True)
+    _atomic_json_write(_global_mcp_json(), data)
 
 
 async def api_mcp_sync(request: web.Request) -> web.Response:
@@ -328,10 +326,10 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
     if not_owned is not None:
         return not_owned
     # Refuse before ANY write: the global file is rewritten below as plain JSON.
-    loaded = await asyncio.to_thread(_load_config_or_refusal, _GLOBAL_MCP_JSON)
+    loaded = await asyncio.to_thread(_load_config_or_refusal, _global_mcp_json())
     if isinstance(loaded, web.Response):
         return loaded
-    await asyncio.to_thread(_refuse_commented_config, _GLOBAL_MCP_JSON)
+    await asyncio.to_thread(_refuse_commented_config, _global_mcp_json())
 
     # One serialized discover→write pass (agent config + CC sidecar), off the
     # event loop — the sync is blocking file I/O, and sync_discovered_servers'
@@ -342,7 +340,7 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
     if to_sync:
         # Also add to global mcp.json (what ACP actually reads)
         async with _get_mcp_lock():
-            gdata = _load_config_or_refusal(_GLOBAL_MCP_JSON)
+            gdata = _load_config_or_refusal(_global_mcp_json())
             if isinstance(gdata, web.Response):
                 return gdata
             gservers = gdata.setdefault("mcpServers", {})
@@ -458,7 +456,7 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
                     # to gate -- but the entry is still ours, and marking it now is
                     # what lets a later slice re-sync it without guessing.
                     gservers[s.name] = stamp(entry) if s.name in _managed else entry
-            _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
+            _global_mcp_json().parent.mkdir(parents=True, exist_ok=True)
             _write_mcp_json(gdata)
 
             # The registry write, the spec sync and the rollback all under the
@@ -609,7 +607,7 @@ async def api_mcp_toggle(request: web.Request) -> web.Response:
         # store mute left behind the global row (a per-tool stub, say), since a
         # mute left in either file keeps the server off.
         if key is not None and not store_held:
-            _refuse_commented_config(_GLOBAL_MCP_JSON)
+            _refuse_commented_config(_global_mcp_json())
             lift_store = enabled and await asyncio.to_thread(_kirocrew_entry_is_muted, name)
             if lift_store:
                 await asyncio.to_thread(_refuse_commented_config, _kirocrew_mcp_json())
@@ -688,7 +686,7 @@ async def api_mcp_toggle_tool(request: web.Request) -> web.Response:
         )
 
     async with _get_mcp_lock():
-        _refuse_commented_config(_GLOBAL_MCP_JSON)
+        _refuse_commented_config(_global_mcp_json())
         try:
             data = loads_mcp_config(await asyncio.to_thread(_read_global_mcp_text))
         except FileNotFoundError:
@@ -761,7 +759,7 @@ async def api_mcp_toggle_all(request: web.Request) -> web.Response:
         return not_owned
 
     async with _get_mcp_lock():
-        _refuse_commented_config(_GLOBAL_MCP_JSON)
+        _refuse_commented_config(_global_mcp_json())
         try:
             data = loads_mcp_config(await asyncio.to_thread(_read_global_mcp_text))
         except FileNotFoundError:
@@ -851,7 +849,7 @@ async def api_mcp_remove(request: web.Request) -> web.Response:
     # hand-edited with JSONC would otherwise raise only at its own write, after
     # the global file had already lost the entry and with the agent-spec sync
     # skipped.
-    await asyncio.to_thread(_refuse_commented_config, _GLOBAL_MCP_JSON, _kirocrew_mcp_json())
+    await asyncio.to_thread(_refuse_commented_config, _global_mcp_json(), _kirocrew_mcp_json())
     mgr = _capability_manager()
     if mgr.available():
         try:
@@ -969,7 +967,7 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
 
         # Remove from global mcp.json
         async with _get_mcp_lock():
-            _refuse_commented_config(_GLOBAL_MCP_JSON)
+            _refuse_commented_config(_global_mcp_json())
             try:
                 data = loads_user_json(await asyncio.to_thread(_read_global_mcp_text))
             except (FileNotFoundError, json.JSONDecodeError):
@@ -1060,11 +1058,11 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _get_mcp_lock():
-        data = _load_config_or_refusal(_GLOBAL_MCP_JSON)
+        data = _load_config_or_refusal(_global_mcp_json())
         if isinstance(data, web.Response):
             return data
         data.setdefault("mcpServers", {})[name] = entry
-        _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
+        _global_mcp_json().parent.mkdir(parents=True, exist_ok=True)
         _write_mcp_json(data)
 
         # Order matches the toggle paths: mcp lock outside, config lock in.
@@ -1100,8 +1098,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _rmw_remove_entry,
     )
     from kiro_crew.dashboard.handlers.mcp_config_files import (  # noqa: F401
+        _GLOBAL_MCP_JSON,
         _KIROCREW_MCP_JSON,
         _MAX_MCP_NAME_LEN,
+        _MCP_LOCK_PATH,
         _VALID_MCP_NAME_RE,
         MCP_CONFIG_HAS_COMMENTS,
         _atomic_write,
@@ -1183,6 +1183,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         api_mcp_quarantine_clear,
         api_mcp_servers,
     )
+
+if TYPE_CHECKING:  # names it serves from outside the family, from their homes
+    from kiro_crew.config.paths import kiro_mcp_settings_path  # noqa: F401
 
 
 async def api_mcp_apply(request: web.Request) -> web.Response:
@@ -1328,7 +1331,7 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
             return not_owned
         # A broken provider global would be replaced, and a JSONC one would lose
         # its comments, so the batch is refused before its first write.
-        for path in (_GLOBAL_MCP_JSON, *(scope.global_json for scope in _extra_mcp_scopes())):
+        for path in (_global_mcp_json(), *(scope.global_json for scope in _extra_mcp_scopes())):
             loaded = await asyncio.to_thread(_load_config_or_refusal, path)
             if isinstance(loaded, web.Response):
                 return loaded
@@ -1516,7 +1519,7 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                 resolved_spec = _find_server_spec_anywhere(name)
                 outcome["actions"]["kiroGlobal"] = await _offload_config_write(
                     _set_scope_entry,
-                    _GLOBAL_MCP_JSON,
+                    _global_mcp_json(),
                     name,
                     enabled=desired_kiro,
                     spec=resolved_spec,

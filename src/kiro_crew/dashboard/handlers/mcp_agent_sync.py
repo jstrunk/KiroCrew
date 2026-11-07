@@ -23,7 +23,7 @@ from kiro_crew.agent import (
     entry_as_enabled,
     kiro_agents_dir_path,
 )
-from kiro_crew.dashboard.handlers.mcp_config_files import _GLOBAL_MCP_JSON
+from kiro_crew.dashboard.handlers.mcp_config_files import _global_mcp_json
 from kiro_crew.mcp_hot_reload import live_sessions_apply_mcp_live, mark_reinjecting_providers
 from kiro_crew.mcp_provenance import WITHHELD_KEY
 from kiro_crew.mcp_utils import mcp_server_alias, without_mcp_refs
@@ -130,7 +130,7 @@ def _sync_mcp_to_agent_unlocked(name: str, enabled: bool, *, remove: bool = Fals
         if alias not in mcp_servers:
             # Copy spec from global mcp.json (looked up by original name)
             try:
-                gdata = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
+                gdata = loads_mcp_config(_global_mcp_json().read_text(encoding="utf-8"), jsonc=True)
                 spec = gdata.get("mcpServers", {}).get(name, {})
                 if isinstance(spec, dict) and spec:
                     entry = {k: v for k, v in spec.items() if k != "disabled"}
@@ -312,7 +312,7 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
         # Ensure all servers exist in kirocrew.json mcpServers
         mcp_servers = cfg.setdefault("mcpServers", {})
         try:
-            gdata = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
+            gdata = loads_mcp_config(_global_mcp_json().read_text(encoding="utf-8"), jsonc=True)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):  # see the single path
             gdata = {}
         granted_refs: list[str] = []

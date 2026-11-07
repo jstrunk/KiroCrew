@@ -27,7 +27,7 @@ from aiohttp import web
 from kiro_crew import platform_compat
 from kiro_crew.agent import _atomic_json_write
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.paths import data_home
+from kiro_crew.config.paths import data_home, kiro_mcp_settings_path
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.user_json import has_json_comments, loads_user_jsonc
 
@@ -59,7 +59,10 @@ def _is_valid_mcp_name(name: str) -> bool:
     return bool(_VALID_MCP_NAME_RE.match(name))
 
 
-_GLOBAL_MCP_JSON = Path.home() / ".kiro" / "settings" / "mcp.json"
+# kiro-cli's global registry, ``<kiro home>/settings/mcp.json``. Override hook +
+# accessor rather than a constant: a Path bound at import would freeze the home
+# and ignore ``KIRO_HOME``. None = live. Importers call :func:`_global_mcp_json`.
+_GLOBAL_MCP_JSON: Path | None = None
 # Surface label carried into the provenance decision so a declined rewrite names
 # the file it declined to touch.
 _KIRO_GLOBAL_SURFACE = "~/.kiro/settings/mcp.json"
@@ -68,7 +71,18 @@ _KIRO_GLOBAL_SURFACE = "~/.kiro/settings/mcp.json"
 # File-based lock for mcp.json — shared with bridges_mcp_config.py so that app
 # registration and dashboard MCP handlers coordinate properly.
 # Uses fcntl.flock on a sidecar .lock file (works cross-process too).
-_MCP_LOCK_PATH = _GLOBAL_MCP_JSON.with_suffix(".lock")
+# Same hook shape; None = the sidecar of the live registry.
+_MCP_LOCK_PATH: Path | None = None
+
+
+def _global_mcp_json() -> Path:
+    return _GLOBAL_MCP_JSON if _GLOBAL_MCP_JSON is not None else kiro_mcp_settings_path()
+
+
+def _mcp_lock_path() -> Path:
+    if _MCP_LOCK_PATH is not None:
+        return _MCP_LOCK_PATH
+    return _global_mcp_json().with_suffix(".lock")
 
 
 class _McpFileLockSync:
@@ -88,11 +102,11 @@ class _McpFileLockSync:
 
     def __enter__(self) -> None:
         try:
-            _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
-            _MCP_LOCK_PATH.touch(exist_ok=True)
+            _global_mcp_json().parent.mkdir(parents=True, exist_ok=True)
+            _mcp_lock_path().touch(exist_ok=True)
             # Non-truncating "r+", kept inline for the same reason as
             # :class:`_McpFileLock` in handlers/mcp.py.
-            fd = open(_MCP_LOCK_PATH, "r+")
+            fd = open(_mcp_lock_path(), "r+")
         except OSError as exc:
             # Same report, same rationale as :class:`_McpFileLock`: the sweep
             # that takes this lock runs under a request's finally, so its
@@ -100,9 +114,9 @@ class _McpFileLockSync:
             logger.warning(
                 "cannot open the mcp config lock %s (%s) -- writes to %s cannot be "
                 "serialized, so this update is being skipped",
-                _MCP_LOCK_PATH,
+                _mcp_lock_path(),
                 exc.strerror or exc,
-                _GLOBAL_MCP_JSON,
+                _global_mcp_json(),
             )
             raise
         try:
@@ -112,7 +126,7 @@ class _McpFileLockSync:
             # OSError only, as in :class:`_McpFileLock`: the lock's own
             # refusal, never this caller's lifecycle.
             if isinstance(exc, OSError):
-                logger.warning("mcp config lock %s: %s", _MCP_LOCK_PATH, exc)
+                logger.warning("mcp config lock %s: %s", _mcp_lock_path(), exc)
             raise
         self._fd = fd
 
@@ -288,7 +302,7 @@ def _read_global_mcp_text() -> str:
     """
     from kiro_crew.atomic_write import read_bytes_with_retry
 
-    return read_bytes_with_retry(_GLOBAL_MCP_JSON).decode("utf-8")
+    return read_bytes_with_retry(_global_mcp_json()).decode("utf-8")
 
 
 def _load_config_or_refusal(path: Path) -> dict[str, Any] | web.Response:
@@ -437,7 +451,7 @@ def _user_mcp_config_paths() -> list[Path]:
     """The MCP config files a person edits by hand, which may hold JSONC."""
     return [
         _kirocrew_mcp_json(),
-        _GLOBAL_MCP_JSON,
+        _global_mcp_json(),
         *(scope.global_json for scope in _extra_mcp_scopes()),
     ]
 

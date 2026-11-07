@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.config.paths import data_home
+from kiro_crew.config.paths import data_home, kiro_mcp_settings_path
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 # Well-known MCP config locations, tagged by scope.  Scope names match
@@ -63,7 +63,7 @@ def _mcp_sources() -> tuple[tuple[Path, str], ...]:
         return _MCP_SOURCES
     return (
         (data_home() / "mcp.json", SCOPE_KIROCREW),
-        (Path.home() / ".kiro" / "settings" / "mcp.json", SCOPE_KIRO_GLOBAL),
+        (kiro_mcp_settings_path(), SCOPE_KIRO_GLOBAL),
     )
 
 

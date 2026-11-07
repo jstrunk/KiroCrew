@@ -16,12 +16,12 @@ from typing import Any
 from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.handlers.mcp_config_files import (
-    _GLOBAL_MCP_JSON,
     AmbiguousServerKey,
     _atomic_write,
     _config_entry_for,
     _config_key_for,
     _extra_mcp_scopes,
+    _global_mcp_json,
     _kirocrew_mcp_json,
     _load_config_for_update,
     _load_json_or_empty,
@@ -90,7 +90,7 @@ def _find_server_spec_anywhere(name: str) -> dict | None:
         return found
     for path in (
         _kirocrew_mcp_json(),
-        _GLOBAL_MCP_JSON,
+        _global_mcp_json(),
         *[s.global_json for s in _extra_mcp_scopes()],
     ):
         found = _usable(_load_json_or_empty(path))

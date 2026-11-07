@@ -649,16 +649,16 @@ class TestPatchReordersManagedSkills:
     reorder and leaves an interleaved layout byte-for-byte alone.
     """
 
-    ONE = "skill://~/.kiro/skills/one/SKILL.md"
-    TWO = "skill://~/.kiro/skills/two/SKILL.md"
-    THREE = "skill://~/.kiro/skills/three/SKILL.md"
+    ONE = "skill://~/ambient-kiro/skills/one/SKILL.md"
+    TWO = "skill://~/ambient-kiro/skills/two/SKILL.md"
+    THREE = "skill://~/ambient-kiro/skills/three/SKILL.md"
 
     def _agent(self, fake_home: Path, monkeypatch, resources: list) -> Path:
         from kiro_crew.dashboard.handlers import agents as agents_handlers
 
         monkeypatch.setenv("KIRO_HOME", str(fake_home / "ambient-kiro"))
-        _make_skill(fake_home / ".kiro" / "skills", "one")
-        _make_skill(fake_home / ".kiro" / "skills", "two")
+        _make_skill(fake_home / "ambient-kiro" / "skills", "one")
+        _make_skill(fake_home / "ambient-kiro" / "skills", "two")
         d = _agents_dir(fake_home)
         cfg = d / "victim.json"
         # The handler's own serialisation (``json.dump(..., indent=2)`` plus a newline),
@@ -722,7 +722,7 @@ class TestPatchReordersManagedSkills:
             [
                 self.ONE,
                 "file://.kiro/steering/**/*.md",
-                "skill://~/.kiro/skills/*/SKILL.md",
+                "skill://~/ambient-kiro/skills/*/SKILL.md",
                 self.TWO,
             ],
         )
@@ -745,7 +745,7 @@ class TestPatchReordersManagedSkills:
         from kiro_crew.dashboard.handlers import agents as agents_handlers
 
         cfg = self._agent(fake_home, monkeypatch, [self.ONE, self.TWO, self.THREE])
-        _make_skill(fake_home / ".kiro" / "skills", "three")
+        _make_skill(fake_home / "ambient-kiro" / "skills", "three")
         real_read = agents_handlers._read_agent_spec
         calls = {"n": 0}
 
@@ -778,7 +778,7 @@ class TestPatchReordersManagedSkills:
         from kiro_crew.dashboard.handlers import agents as agents_handlers
 
         cfg = self._agent(fake_home, monkeypatch, [self.ONE, self.TWO])
-        _make_skill(fake_home / ".kiro" / "skills", "three")
+        _make_skill(fake_home / "ambient-kiro" / "skills", "three")
         real_read = agents_handlers._read_agent_spec
         calls = {"n": 0}
 
@@ -812,7 +812,7 @@ class TestPatchReordersManagedSkills:
         reply is still the persisted order, not an echo of the request.
         """
         cfg = self._agent(fake_home, monkeypatch, [self.ONE, self.TWO])
-        _settle(fake_home / ".kiro" / "skills")
+        _settle(fake_home / "ambient-kiro" / "skills")
         walks = self._count_walks(monkeypatch)
 
         body = self._patch(["kiro-user/two", "kiro-user/one"])
@@ -833,7 +833,7 @@ class TestPatchReordersManagedSkills:
         from kiro_crew.dashboard.handlers import agents as agents_handlers
 
         cfg = self._agent(fake_home, monkeypatch, [self.ONE, self.TWO])
-        _settle(fake_home / ".kiro" / "skills")
+        _settle(fake_home / "ambient-kiro" / "skills")
         real_read = agents_handlers._read_agent_spec
         calls = {"n": 0}
 
@@ -845,7 +845,7 @@ class TestPatchReordersManagedSkills:
             # The mapping's walk sits between the second and the third, so a skill
             # installed here is one that walk never saw.
             if calls["n"] == 3:
-                _make_skill(fake_home / ".kiro" / "skills", "three")
+                _make_skill(fake_home / "ambient-kiro" / "skills", "three")
                 cfg.write_text(
                     json.dumps({"name": "victim", "resources": [self.ONE, self.TWO, self.THREE]})
                 )

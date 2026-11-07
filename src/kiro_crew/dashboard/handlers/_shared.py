@@ -257,6 +257,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F401
     from kiro_crew.config.loader import config_dir  # noqa: F401
     from kiro_crew.config.paths import kiro_agents_dir  # noqa: F401
+    from kiro_crew.config.paths import kiro_home  # noqa: F401
     from kiro_crew.dashboard.state import VALID_MEMORY_MODES  # noqa: F401
     from kiro_crew.dashboard.state import DashboardState  # noqa: F401
     from kiro_crew.dashboard.state import _normalize_slot_key  # noqa: F401

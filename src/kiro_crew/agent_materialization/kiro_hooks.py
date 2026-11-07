@@ -1332,7 +1332,7 @@ def resolve_kiro_hooks_dir(agent_cfg: dict, *, audit: bool = True) -> Path:
     same rejection on each turn. The fallback itself is unchanged -- only the
     reporting is suppressed.
     """
-    hooks_dir = agent_mod._DEFAULT_KIRO_HOOKS_DIR
+    hooks_dir = agent_mod._kiro_hooks_dir()
     if not isinstance(agent_cfg, dict):
         return hooks_dir
     custom_dir = agent_cfg.get("kiro_hooks_dir")
@@ -1374,12 +1374,12 @@ def resolve_kiro_hooks_dir(agent_cfg: dict, *, audit: bool = True) -> Path:
                 "sensitive), falling back to %s",
                 agent_mod._hook_diagnostic(custom_dir),
                 home,
-                agent_mod._DEFAULT_KIRO_HOOKS_DIR,
+                agent_mod._kiro_hooks_dir(),
             )
             agent_mod._sel_hook_rejected(
                 "autoimport", str(requested), "kiro_hooks_dir outside HOME or sensitive"
             )
-        return agent_mod._DEFAULT_KIRO_HOOKS_DIR
+        return agent_mod._kiro_hooks_dir()
     # Return the already-resolved path, not the unresolved ``requested``. Keeping
     # ``requested`` would leave a symlink-swap window: a path component could be
     # swapped between this resolve() and a later one, bypassing the HOME
@@ -1412,7 +1412,7 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
     agent_cfg = mc_cfg.get("agent") if isinstance(mc_cfg.get("agent"), dict) else {}
     user_hooks = agent_cfg.get("kiro_hooks") if isinstance(agent_cfg, dict) else None
     autoimport_enabled = True
-    hooks_dir = agent_mod._DEFAULT_KIRO_HOOKS_DIR
+    hooks_dir = agent_mod._kiro_hooks_dir()
     if isinstance(agent_cfg, dict):
         if "kiro_hooks_autoimport" in agent_cfg:
             autoimport_enabled = bool(agent_cfg.get("kiro_hooks_autoimport"))

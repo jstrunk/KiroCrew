@@ -265,6 +265,8 @@ from kiro_crew.config.paths import (
     ambient_agents_dir,
     isolated_agents_dir,
     kiro_agents_dir,
+    kiro_home,
+    kiro_mcp_settings_path,
     shared_kiro_agents_writable,
 )
 from kiro_crew.env import (
@@ -579,7 +581,15 @@ class SharedAgentHomeRefused(OSError):
     """
 
 
-_KIRO_MCP_JSON = Path.home() / ".kiro" / "settings" / "mcp.json"
+# Override hook + accessor (the ``mcp_cleanup._KIRO_MCP_JSON`` shape): None = live,
+# resolved per call so ``KIRO_HOME`` is honoured and tests can still setattr it.
+_KIRO_MCP_JSON: Path | None = None
+
+
+def _kiro_mcp_json() -> Path:
+    return _KIRO_MCP_JSON if _KIRO_MCP_JSON is not None else kiro_mcp_settings_path()
+
+
 # Well-known Claude Code global MCP config. The core does not read this at
 # rebuild/discovery/apply time (OSS is Kiro-only); a companion contributes it as
 # a scope via the extra_mcp_scopes() CPP seam. Retained as the canonical path
@@ -879,7 +889,7 @@ def _all_skill_paths() -> list[str]:
     # Open-standard global location: ``~/.kiro/skills/`` — canonical home for
     # ``cp -r my-skill ~/.kiro/skills/`` installs and AIM-published skills
     # that follow the spec.  See docs/reference/kiro-cli/skills.md.
-    kiro_user = Path.home() / ".kiro" / "skills"
+    kiro_user = kiro_home() / "skills"
     if kiro_user.is_dir() and not is_sensitive_path(str(kiro_user)):
         paths.add(str(kiro_user))
     return sorted(paths)
@@ -889,8 +899,15 @@ def _all_skill_paths() -> list[str]:
 _aim_skill_paths = _all_skill_paths
 
 
-# Default hooks directory matches kiro-cli's discovery path.
-_DEFAULT_KIRO_HOOKS_DIR = Path.home() / ".kiro" / "hooks"
+# Default hooks directory matches kiro-cli's discovery path (``<kiro home>/hooks``).
+# Override hook + accessor, as for ``_KIRO_MCP_JSON`` above.
+_DEFAULT_KIRO_HOOKS_DIR: Path | None = None
+
+
+def _kiro_hooks_dir() -> Path:
+    if _DEFAULT_KIRO_HOOKS_DIR is not None:
+        return _DEFAULT_KIRO_HOOKS_DIR
+    return kiro_home() / "hooks"
 
 
 def resolved_kiro_hooks_dir() -> Path:

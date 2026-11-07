@@ -736,7 +736,9 @@ class TestLegacyScrubIsLocked:
         from kiro_crew.apps import bridges as bridges_mod
 
         src = inspect.getsource(bridges_mod._scrub_legacy_shared_mcp)
-        assert "with _mcp_lock(target=_LEGACY_SHARED_MCP_PATH):" in src
+        # Resolved once per call (KIRO_HOME-aware), then locked and rewritten.
+        assert "legacy = _legacy_shared_mcp_path()" in src
+        assert "with _mcp_lock(target=legacy):" in src
 
     def test_scrub_removes_only_the_apps_entries(self, tmp_path, monkeypatch) -> None:
         import json
