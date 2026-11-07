@@ -53,6 +53,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from kiro_crew.config.paths import kiro_home
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.security import redact
@@ -249,7 +250,7 @@ class UserQuickPrompt:
 
 
 def _user_prompts_dir() -> Path:
-    return Path.home() / ".kiro" / "prompts"
+    return kiro_home() / "prompts"
 
 
 def _read_user_prompt(path: Path, root: str) -> UserQuickPrompt | None:

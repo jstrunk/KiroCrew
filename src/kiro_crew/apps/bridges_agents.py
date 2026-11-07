@@ -45,6 +45,7 @@ from kiro_crew.config.loader import (
     publish_materialized_agents,
     schedule_materialized_agents_refresh,
 )
+from kiro_crew.config.paths import kiro_mcp_settings_path
 from kiro_crew.file_uri import file_uri_path_text
 from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_provenance import DERIVED_KEY
@@ -89,9 +90,7 @@ def _global_mcp_specs() -> dict[str, Any]:
     that cannot read it neutralizes nothing rather than failing app enable.
     """
     try:
-        raw = loads_user_json(
-            (Path.home() / ".kiro" / "settings" / "mcp.json").read_text(encoding="utf-8")
-        )
+        raw = loads_user_json(kiro_mcp_settings_path().read_text(encoding="utf-8"))
         specs = raw.get("mcpServers")
         return dict(specs) if isinstance(specs, dict) else {}
     except FileNotFoundError:

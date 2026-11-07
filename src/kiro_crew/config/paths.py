@@ -1156,16 +1156,26 @@ def kiro_home() -> Path:
     rewriting costs: managed MCP servers that read one credential while calling a
     gateway that expects another, and 403 on every call).
 
-    SCOPE CAVEAT — read before setting this. ``KIRO_HOME`` redirects kiro-cli's
-    WHOLE user directory (agents, prompts, skills, steering, settings, sessions),
-    but KiroCrew currently resolves the host ``~/.kiro`` for most of those readers
-    (session transcripts in ``session_map.py`` / ``acp/*`` / ``providers/acp_*.py``
-    / ``dashboard/handlers/usage_sessions.py``, and the ``settings/mcp.json`` registry).
-    Setting ``KIRO_HOME`` therefore moves where kiro-cli WRITES sessions without
-    moving where KiroCrew READS them, which breaks session resume. Only the agents
-    directory follows it today, so this is not yet a supported way to isolate an
-    instance. (``build_pod_env()`` does set it, to ``<pod home>/kiro``.) Bringing
-    the remaining readers through this resolver is the prerequisite.
+    SCOPE. ``KIRO_HOME`` redirects kiro-cli's WHOLE user directory, and Kiro Crew's
+    readers and writers of that directory resolve it here at call time: agents
+    (:func:`kiro_agents_dir`), session transcripts (:func:`kiro_sessions_dir`),
+    the ``settings/mcp.json`` registry (:func:`kiro_mcp_settings_path`: the
+    default agent's shared-server merge, the dashboard MCP page and its lock,
+    discovery, app policy and the legacy app scrub), global steering (the
+    dashboard tab and the member essential-context snapshot), global skills,
+    prompts and hooks. (``build_pod_env()`` sets it, to ``<pod home>/kiro``.)
+
+    Deliberately NOT moved by it: the Kiro Crew data home (``KIROCREW_HOME`` /
+    :func:`data_home`, set it alongside), the protected-path lists (they guard the
+    host ``~/.kiro`` AND the ``KIRO_HOME`` form, see
+    ``security.paths_targets._home_dir_targets_uncached``), the gateway-owned
+    ``$HOME/.kiro/crew-auth-staging`` (every sandbox tier hides it by that
+    HOME-relative spelling, so it moves only together with those lists),
+    project-local ``<project>/.kiro`` scopes, and onboarding imports that name a
+    ``user_home`` explicitly. The agents dir still obeys
+    ``agent._decline_shared_agent_home``: specs another home wrote are not
+    rewritten. A module-level path constant cannot follow it: resolve lazily, or
+    the value freezes at import (see :data:`_agents_dir_override`).
 
     Rejects the same unsafe targets as :func:`_valid_override_home` (a
     filesystem/drive root, or a known POSIX system directory) so a malformed
@@ -1212,6 +1222,15 @@ def kiro_sessions_dir() -> Path:
     if _sessions_dir_override is not None:
         return _sessions_dir_override()
     return kiro_home() / "sessions" / "cli"
+
+
+def kiro_mcp_settings_path() -> Path:
+    """kiro-cli's global MCP registry: ``<kiro home>/settings/mcp.json``.
+
+    Resolved per call so a ``KIRO_HOME`` set (or patched) after import is honoured.
+    Modules that keep a patchable ``_X: Path | None`` hook fall back to this.
+    """
+    return kiro_home() / "settings" / "mcp.json"
 
 
 def kiro_oauth_cache_home() -> Path:

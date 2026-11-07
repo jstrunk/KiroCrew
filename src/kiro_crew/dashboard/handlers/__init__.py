@@ -1016,8 +1016,9 @@ def _build_prompt_base() -> list[dict[str, Any]]:
     # root. Pinning it still costs nothing and denies a swap landing mid-scan, and
     # a resolve that cannot answer (a cyclic ~/.kiro, which raises RuntimeError
     # rather than OSError) yields no global entries instead of an unaudited 500.
-    home = Path.home()
-    global_dir = home / ".kiro" / "prompts"
+    from kiro_crew.config.paths import kiro_home
+
+    global_dir = kiro_home() / "prompts"
     try:
         global_real = global_dir.resolve()
     except (OSError, RuntimeError):

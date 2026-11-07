@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import pinned_fs
+from kiro_crew.config.paths import kiro_home
 from kiro_crew.platform_compat import is_link_or_junction
 
 
@@ -74,7 +75,7 @@ def _prompt_read_root(entry: dict[str, Any], project_dir: Path | None) -> Path |
         # listing walks a symlinked one on purpose (the documented asymmetry), so
         # the resolution follows that link and its destination is the root.
         try:
-            return (Path.home() / ".kiro" / "prompts").resolve()
+            return (kiro_home() / "prompts").resolve()
         except (OSError, RuntimeError):
             return None
     return None
@@ -366,7 +367,7 @@ def _user_prompt_dir(scope: str, project_dir: Path | None) -> Path | None:
     flows into the existing ``no_active_project`` contract.
     """
     if scope == "global":
-        return Path.home() / ".kiro" / "prompts"
+        return kiro_home() / "prompts"
     proj = project_dir
     return proj / ".kiro" / "prompts" if proj else None
 

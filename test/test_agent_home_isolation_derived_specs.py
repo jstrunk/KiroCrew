@@ -753,11 +753,16 @@ class TestTheMcpRegistryStaysWithItsWriter:
     """
 
     def test_the_restriction_reader_stays_with_its_writer(self, tmp_path):
-        """The registry a RESTRICTION and a MUTE are read from must not follow ``KIRO_HOME``.
+        """The registry a RESTRICTION and a MUTE are read from moves only WITH its writer.
 
-        ``dashboard.handlers.mcp`` writes ``disabledTools`` and ``disabled`` to a fixed
-        ``Path.home() / ".kiro" / "settings" / "mcp.json"``; moving the reader alone
-        would read a restriction as allow.
+        ``dashboard.handlers.mcp`` writes both ``disabledTools`` and the
+        per-server ``disabled`` mute to ``<kiro home>/settings/mcp.json``, and for
+        Crew's own managed servers that file is the only place such an entry can
+        live. Moving the reader alone reads the entry as absent: the restriction
+        degrades to allow, and the rebuild pops ``disabled`` from the rendered
+        entry and re-appends the server to ``allowedTools``, which never reaches
+        the PreToolUse gate. Both now resolve through ``kiro_mcp_settings_path()``,
+        so under ``KIRO_HOME`` they must name the same file, beneath it.
         """
         kiro_home_dir = tmp_path / "gateway-kiro"
         kiro_home_dir.mkdir()
@@ -768,10 +773,10 @@ class TestTheMcpRegistryStaysWithItsWriter:
             "from kiro_crew.dashboard.handlers import mcp as mcp_handlers\n"
             "import inspect\n"
             "print(json.dumps({\n"
-            "    'reader': str(agent._KIRO_MCP_JSON),\n"
+            "    'reader': str(agent._kiro_mcp_json()),\n"
             "    'merge_names_the_constant':\n"
-            "        '_KIRO_MCP_JSON' in inspect.getsource(mcp_sources.merge_mcp_sources),\n"
-            "    'writer': str(mcp_handlers._GLOBAL_MCP_JSON),\n"
+            "        '_kiro_mcp_json()' in inspect.getsource(mcp_sources.merge_mcp_sources),\n"
+            "    'writer': str(mcp_handlers._global_mcp_json()),\n"
             "    'home': str(pathlib.Path.home()),\n"
             "}))\n"
         )
@@ -795,9 +800,9 @@ class TestTheMcpRegistryStaysWithItsWriter:
             "a split lets a disabled tool read as enabled"
         )
         assert seen["reader"] == str(
-            Path(seen["home"]) / ".kiro" / "settings" / "mcp.json"
-        ), "the restriction registry must stay on the host home its writer uses"
-        assert str(kiro_home_dir) not in seen["reader"]
+            kiro_home_dir.resolve() / "settings" / "mcp.json"
+        ), "reader and writer follow KIRO_HOME together"
+        assert seen["reader"] != str(Path(seen["home"]) / ".kiro" / "settings" / "mcp.json")
         assert seen["merge_names_the_constant"], (
             "the rebuild's merge reads some other registry than the one its writer "
             "writes; the per-server mute lives in that file, so a split re-enables a "

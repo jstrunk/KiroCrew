@@ -193,7 +193,7 @@ def _mcp_global_entry(name: str) -> tuple[bool, dict[str, Any] | None]:
     from kiro_crew.dashboard.handlers import mcp as mcp_handlers
 
     try:
-        data = json.loads(mcp_handlers._GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
+        data = json.loads(mcp_handlers._global_mcp_json().read_text(encoding="utf-8"))
     except FileNotFoundError:
         data = {}
     except (OSError, ValueError):

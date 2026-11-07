@@ -22,12 +22,12 @@ from kiro_crew.dashboard.handlers.mcp_config_entries import (
     _rmw_remove_entry,
 )
 from kiro_crew.dashboard.handlers.mcp_config_files import (
-    _GLOBAL_MCP_JSON,
     AmbiguousServerKey,
     _atomic_write,
     _config_key_for,
     _extra_mcp_scopes,
     _get_mcp_lock_sync,
+    _global_mcp_json,
     _kirocrew_mcp_json,
     _load_json_or_empty,
 )
@@ -65,7 +65,7 @@ def _uninstall_scope_files() -> list[tuple[str, Path]]:
     ones :func:`_purge_server_config` reports."""
     scopes: list[tuple[str, Path]] = [
         (SCOPE_KIROCREW, _kirocrew_mcp_json()),
-        (SCOPE_KIRO_GLOBAL, _GLOBAL_MCP_JSON),
+        (SCOPE_KIRO_GLOBAL, _global_mcp_json()),
         ("agent", kiro_agents_dir() / "kirocrew.json"),
     ]
     for scope in _extra_mcp_scopes():
@@ -159,7 +159,7 @@ def _purge_server_config(
         actions[SCOPE_KIROCREW] = _remove_kirocrew_entry(name, preferred=_pref(SCOPE_KIROCREW))
     if scopes is None or SCOPE_KIRO_GLOBAL in scopes:
         actions[SCOPE_KIRO_GLOBAL] = _rmw_remove_entry(
-            _GLOBAL_MCP_JSON, name, preferred=_pref(SCOPE_KIRO_GLOBAL)
+            _global_mcp_json(), name, preferred=_pref(SCOPE_KIRO_GLOBAL)
         )
     for scope in _extra_mcp_scopes():
         label = f"{scope.id}Global"
@@ -202,7 +202,7 @@ def _scrub_preregistered_oauth_copies(slug: str) -> dict[str, str]:
     actions: dict[str, str] = {}
     targets: list[tuple[str, Path]] = [
         (SCOPE_KIROCREW, _kirocrew_mcp_json()),
-        (SCOPE_KIRO_GLOBAL, _GLOBAL_MCP_JSON),
+        (SCOPE_KIRO_GLOBAL, _global_mcp_json()),
         *[(f"{s.id}Global", s.global_json) for s in _extra_mcp_scopes()],
     ]
     for label, path in targets:

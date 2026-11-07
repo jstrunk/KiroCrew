@@ -22,7 +22,7 @@ from kiro_crew.agent_discovery import (
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.config import KiroCrewConfig, config_dir
 from kiro_crew.config.loader import workspace_dir_for
-from kiro_crew.config.paths import project_agents_dir
+from kiro_crew.config.paths import kiro_home, project_agents_dir
 from kiro_crew.file_uri import file_uri_path_text, is_windows_drive_uri
 from kiro_crew.frontmatter import STEERING_LOADER, split_frontmatter
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink, validate_file_path
@@ -31,6 +31,23 @@ from kiro_crew.session_work_dir import DERIVED_NAME_RE
 from kiro_crew.validation import is_registered_agent_name
 
 logger = logging.getLogger(__name__)
+
+
+def _kiro_home_anchor(relative: Path) -> tuple[Path, str]:
+    """``(root, glob)`` for a ``.kiro/...`` path under the user's home, honouring ``KIRO_HOME``.
+
+    The default home keeps the walk rooted at ``Path.home()`` exactly as before,
+    so a linked ``~/.kiro`` is still left out by the no-link walk; only a moved
+    kiro home is walked from that home itself.
+    """
+    home = kiro_home()
+    # ``kiro_home()`` resolves a working link, so one still standing here is
+    # dangling or cyclic: an unusable override, which degrades to the default the
+    # way ``kiro_home()`` degrades an unsafe one. A missing directory does not.
+    if home == Path.home() / ".kiro" or is_link_or_junction(home):
+        return Path.home(), str(relative)
+    return home, str(Path(*relative.parts[1:]))
+
 
 ESSENTIAL_MAX_CHARS = 64_000
 _MAX_SOURCE_BYTES = ESSENTIAL_MAX_CHARS * 4
@@ -1495,6 +1512,7 @@ def documents_for_member(
             outside=outside,
             absolute_out=absolute,
             over_cap=over_cap,
+            home_fallback=project_root is None,
         ):
             add(
                 match,
@@ -1563,6 +1581,7 @@ def _resource_paths(
     outside: list[Path] | None = None,
     absolute_out: set[Path] | None = None,
     over_cap: list[Path] | None = None,
+    home_fallback: bool = False,
 ) -> list[tuple[Path, Path]]:
     """Declared ``file://`` matches; an absent literal one goes to *missing* instead.
 
@@ -1572,6 +1591,11 @@ def _resource_paths(
 
     When *absolute_out* is given, every match of an ABSOLUTE declaration is also
     added to it, so a reader can tell those apart from project-relative ones.
+
+    *home_fallback* says *source_root* is the user's home standing in for a missing
+    project, not a real working directory: a relative ``.kiro/...`` resource then
+    names kiro-cli's user dir and follows ``KIRO_HOME`` (:func:`_kiro_home_anchor`),
+    except ``.kiro/steering/...``: global steering stays under the home.
 
     A caller that passes *linked* has a steering glob (a ``steering`` component in
     its pattern, the test :func:`documents_for_member` applies to a match) leave a
@@ -1599,6 +1623,8 @@ def _resource_paths(
         root = absolute_root if path.is_absolute() else source_root
         if path.is_absolute():
             pattern = _resource_pattern(path, root)
+        elif home_fallback and path.parts[:1] == (".kiro",) and path.parts[1:2] != ("steering",):
+            root, pattern = _kiro_home_anchor(path)
         else:
             pattern = str(path)
         steering_glob = "steering" in Path(pattern).parts

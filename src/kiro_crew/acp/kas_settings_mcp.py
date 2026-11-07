@@ -89,8 +89,9 @@ def _kiro_home_servers(notices: list[str]) -> dict[str, Any]:
     """The servers of ``$KIRO_HOME/settings/mcp.json``, when that is not Crew's global file.
 
     KAS reads its global ``mcp.json`` under ``KIRO_HOME``
-    (:func:`kiro_crew.config.paths.kiro_home`); Crew's own global path
-    (``agent._KIRO_MCP_JSON``) does not follow that variable. Where the two
+    (:func:`kiro_crew.config.paths.kiro_home`). Crew's own global path
+    (``agent._kiro_mcp_json()``) follows that variable too, so the two differ
+    only when the ``agent._KIRO_MCP_JSON`` hook is overridden. Where they
     differ, KAS starts servers that only its own file names, so they are named
     here for :func:`excluded_whole`. Read only to name servers and their
     ``disabledTools``: it adds exclusions, and a server that Crew's global file
@@ -112,7 +113,7 @@ def _kiro_home_servers(notices: list[str]) -> dict[str, Any]:
     path = kiro_home() / "settings" / "mcp.json"
     # ``kiro_home`` resolves links; compare like with like so one file is read once.
     try:
-        if path == agent_mod._KIRO_MCP_JSON.resolve():
+        if path == agent_mod._kiro_mcp_json().resolve():
             return {}
     except (OSError, RuntimeError):
         # An unresolvable Crew file must not hide the distinct Kiro home settings.
@@ -204,7 +205,7 @@ def _init_timeout_ms(work_dir: str | Path | None) -> int | None:
     from kiro_crew.acp.session_mcp import _read_mcp_settings
 
     # Beside the global mcp.json: kiro-cli keeps both in ``~/.kiro/settings``.
-    paths = [agent_mod._KIRO_MCP_JSON.parent / "cli.json"]
+    paths = [agent_mod._kiro_mcp_json().parent / "cli.json"]
     if work_dir:
         paths.append(Path(work_dir) / ".kiro" / "settings" / "cli.json")
     found: int | None = None

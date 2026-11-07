@@ -600,3 +600,14 @@ class TestPrefixedTurnStillExpands:
             prefix="[Memory - pending]\nthe user typed /plain earlier.\n\n",
         )
         assert "QUICK PROMPT" not in msg
+
+
+def test_user_prompts_follow_kiro_home(tmp_path, prompts_dir, monkeypatch):
+    """The menu reads ``$KIRO_HOME/prompts``, where the dashboard writes them."""
+    moved = tmp_path / "kiro-home"
+    (moved / "prompts").mkdir(parents=True)
+    (moved / "prompts" / "moved.md").write_text(_opted_in("MOVED", "moved"), encoding="utf-8")
+    (prompts_dir / "host.md").write_text(_opted_in("HOST", "host"), encoding="utf-8")
+    monkeypatch.setenv("KIRO_HOME", str(moved))
+
+    assert [row["name"] for row in user_quick_prompt_menu()] == ["/moved"]

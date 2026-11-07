@@ -28,9 +28,9 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.handlers.mcp_agent_sync import _builtin_mcp_server_names
 from kiro_crew.dashboard.handlers.mcp_config_files import (
-    _GLOBAL_MCP_JSON,
     _KIRO_GLOBAL_SURFACE,
     _config_entry_for,
+    _global_mcp_json,
     _kirocrew_mcp_json,
     _load_json_or_empty,
     _string_identifier,
@@ -302,7 +302,7 @@ def _read_global_mcps() -> Any:
     from kiro_crew.atomic_write import read_bytes_with_retry
 
     try:
-        raw = read_bytes_with_retry(_GLOBAL_MCP_JSON).decode("utf-8")
+        raw = read_bytes_with_retry(_global_mcp_json()).decode("utf-8")
         data = loads_mcp_config(raw, jsonc=True)
         return data.get("mcpServers", {})
     except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError):

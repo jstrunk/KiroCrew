@@ -44,6 +44,7 @@ from kiro_crew.apps.interpreter import (
 from kiro_crew.apps.manager import app_dir
 from kiro_crew.apps.manifest import AppManifest, has_stdio_mcp_server, is_module_style_entry_point
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.config.paths import kiro_mcp_settings_path
 from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
 from kiro_crew.platform.governance import strip_ungoverned_auto_approve
@@ -113,9 +114,16 @@ def kiro_crew_file() -> str:
     return str(kiro_crew.__file__)
 
 
-# The pre-fix location. Still scrubbed on deregister so an upgrade removes
-# entries an older build leaked into the shared file.
-_LEGACY_SHARED_MCP_PATH = Path.home() / ".kiro" / "settings" / "mcp.json"
+# The pre-fix location (kiro-cli's ``<kiro home>/settings/mcp.json``). Still
+# scrubbed on deregister so an upgrade removes entries an older build leaked into
+# the shared file. Override hook (None = live), resolved per call for KIRO_HOME.
+_LEGACY_SHARED_MCP_PATH: Path | None = None
+
+
+def _legacy_shared_mcp_path() -> Path:
+    if _LEGACY_SHARED_MCP_PATH is not None:
+        return _LEGACY_SHARED_MCP_PATH
+    return kiro_mcp_settings_path()
 
 
 def _resolve_live_mcp_url(app_name: str, url: str, live_port: int | None = None) -> str:
@@ -1242,7 +1250,8 @@ def _scrub_legacy_shared_mcp(app_name: str) -> int:
     """
     prefix = f"{app_name}:"
     try:
-        if not _LEGACY_SHARED_MCP_PATH.is_file():
+        legacy = _legacy_shared_mcp_path()
+        if not legacy.is_file():
             return 0
         # Hold the shared file's own lock across read+remove+write: this file can
         # be written concurrently (Kiro IDE, another kiro-cli agent, another
@@ -1250,15 +1259,15 @@ def _scrub_legacy_shared_mcp(app_name: str) -> int:
         # clobber a server another writer added between our read and our atomic
         # rename. It is a DIFFERENT sidecar than _mcp_lock's default (that guards
         # kirocrew.json), so pass the legacy path explicitly.
-        with _mcp_lock(target=_LEGACY_SHARED_MCP_PATH):
-            data = loads_mcp_config(_LEGACY_SHARED_MCP_PATH.read_text(encoding="utf-8"))
+        with _mcp_lock(target=legacy):
+            data = loads_mcp_config(legacy.read_text(encoding="utf-8"))
             servers = data.get("mcpServers", {})
             stale = [k for k in servers if k.startswith(prefix)]
             if not stale:
                 return 0
             for k in stale:
                 del servers[k]
-            atomic_write(_LEGACY_SHARED_MCP_PATH, json.dumps(data, indent=2) + "\n")
+            atomic_write(legacy, json.dumps(data, indent=2) + "\n")
         logger.info("Scrubbed %d legacy shared MCP entry(ies) for app %s", len(stale), app_name)
         return len(stale)
     except Exception as exc:  # noqa: BLE001 — cleanup must never block deregistration
