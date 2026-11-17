@@ -61,6 +61,7 @@ from kiro_crew.config.sections import (
     ExternalRegistryConfig,
     JiraAuthEntry,
     SessionConfig,
+    SteeringConfig,
     TelemetryConfig,
     _archive_retention_days,
     _coerce_gitlab_hosts,
@@ -1075,6 +1076,11 @@ def _otlp_endpoint_rows(value: object, default: list) -> list:
     if not isinstance(value, list):
         return default
     return [dict(row) if isinstance(row, dict) else row for row in value]
+
+
+def _build_steering_config(steering_data: dict) -> SteeringConfig:
+    value = _sections.SectionReader(SteeringConfig, steering_data).get("global_dir")
+    return SteeringConfig(global_dir=value if isinstance(value, str) else None)
 
 
 def _build_telemetry_config(telemetry_data: dict) -> TelemetryConfig:

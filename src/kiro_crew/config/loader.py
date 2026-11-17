@@ -720,6 +720,7 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _build_agent_config,
         _build_dashboard_config,
         _build_session_config,
+        _build_steering_config,
         _build_telemetry_config,
         _builtin_adoption_markers,
         _clamp_compact_wait_secs,

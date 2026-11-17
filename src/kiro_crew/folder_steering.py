@@ -199,6 +199,24 @@ def _is_within(path: Path, parent: Path) -> bool:
     return str(path).startswith(str(parent) + os.sep)
 
 
+def global_steering_dir(home: Path | None = None) -> Path | None:
+    """The global steering directory, or ``None`` when global steering is disabled.
+
+    ``steering.global_dir`` unset keeps ``<home>/.kiro/steering`` (*home* defaults
+    to ``Path.home()``); a path is that directory, ``~`` expanded; an empty
+    string disables global steering. The session loader and the folder-steering
+    dedup both read it here, so the root one skips is the root the other loads.
+    """
+    try:
+        configured = KiroCrewConfig.load().steering.global_dir
+    except Exception:  # an unreadable config keeps the default, as every other reader does
+        configured = None
+    if configured is None:
+        return (home if home is not None else Path.home()) / ".kiro" / "steering"
+    configured = configured.strip()
+    return Path(configured).expanduser() if configured else None
+
+
 def _double_load_roots(project: str | None, home: Path | None) -> tuple[Path, ...]:
     """Steering roots a provider with its own steering path ALREADY delivers.
 
@@ -213,7 +231,6 @@ def _double_load_roots(project: str | None, home: Path | None) -> tuple[Path, ..
     candidates: list[Path] = []
     if project:
         candidates.append(Path(project))
-    candidates.append(home if home is not None else Path.home())
     for candidate in candidates:
         try:
             # RuntimeError, not only OSError: ``Path.resolve()`` raises it on a
@@ -222,6 +239,12 @@ def _double_load_roots(project: str | None, home: Path | None) -> tuple[Path, ..
         except (OSError, RuntimeError):
             continue
         roots.append(resolved / ".kiro" / "steering")
+    global_dir = global_steering_dir(home)
+    if global_dir is not None:
+        try:
+            roots.append(global_dir.expanduser().resolve())
+        except (OSError, RuntimeError):
+            pass
     return tuple(roots)
 
 

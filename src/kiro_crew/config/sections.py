@@ -471,6 +471,7 @@ from kiro_crew.config.sections_telegram import (  # noqa: F401
     _parse_telegram_accounts,
     _validate_telegram_activation,
 )
+from kiro_crew.config.sections_steering import SteeringConfig  # noqa: F401
 from kiro_crew.config.sections_telemetry import (  # noqa: F401
     _DEFAULT_BEACON_ENDPOINT,
     TelemetryConfig,
@@ -547,6 +548,7 @@ _OWNERS = (
     "kiro_crew.config.sections_stt",
     "kiro_crew.config.sections_browser",
     "kiro_crew.config.sections_decisions",
+    "kiro_crew.config.sections_steering",
     "kiro_crew.config.sections_telemetry",
 )
 for _owner in _OWNERS:
