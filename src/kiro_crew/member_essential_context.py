@@ -49,6 +49,31 @@ def _kiro_home_anchor(relative: Path) -> tuple[Path, str]:
     return home, str(Path(*relative.parts[1:]))
 
 
+def _global_steering_anchor(relative: Path) -> tuple[Path, str] | None:
+    """``(root, glob)`` for a ``.kiro/steering/...`` path, or ``None`` when disabled.
+
+    The tree is :func:`kiro_crew.folder_steering.global_steering_dir`, the one the
+    session loader, the folder dedup and the Steering tab read; ``KIRO_HOME`` does
+    not move it. The default keeps the walk rooted at ``Path.home()`` exactly as
+    before, so a linked ``~/.kiro`` is still left out by the no-link walk.
+    """
+    # Imported here: folder_steering imports this module.
+    from kiro_crew.folder_steering import global_steering_dir
+
+    directory = global_steering_dir()
+    if directory is None:
+        return None
+    if directory == Path.home() / ".kiro" / "steering":
+        return Path.home(), str(relative)
+    rest = relative.parts[2:]
+    return directory, str(Path(*rest)) if rest else "."
+
+
+def _global_steering_scan() -> tuple[Path, str] | None:
+    """``(root, glob)`` for global steering, or ``None`` when ``steering.global_dir`` is empty."""
+    return _global_steering_anchor(Path(".kiro", "steering", "**", "*.md"))
+
+
 ESSENTIAL_MAX_CHARS = 64_000
 _MAX_SOURCE_BYTES = ESSENTIAL_MAX_CHARS * 4
 #: Source label of the in-band notice that names guides left out of the envelope.
@@ -1385,11 +1410,11 @@ def documents_for_member(
     # member whose workspace opts out loads just what its template declares, so
     # the snapshot must not re-add the operator's global steering behind it.
     inherits = include_project and not native_only and inherits_default_resources
-    if inherits:
-        for path in _matches(
-            Path.home(), ".kiro/steering/**/*.md", skipped, linked, over_cap=over_cap
-        ):
-            add(path, Path.home(), steering=True)
+    scan = _global_steering_scan() if inherits else None
+    if scan is not None:
+        steering_root, steering_glob = scan
+        for path in _matches(steering_root, steering_glob, skipped, linked, over_cap=over_cap):
+            add(path, steering_root, steering=True)
 
     if project_root is not None and include_project and not native_only:
         # SOUL.md is Crew's own member file, not a kiro-cli default resource, so
@@ -1595,7 +1620,8 @@ def _resource_paths(
     *home_fallback* says *source_root* is the user's home standing in for a missing
     project, not a real working directory: a relative ``.kiro/...`` resource then
     names kiro-cli's user dir and follows ``KIRO_HOME`` (:func:`_kiro_home_anchor`),
-    except ``.kiro/steering/...``: global steering stays under the home.
+    except ``.kiro/steering/...``, which names the global steering directory
+    (:func:`_global_steering_anchor`) and matches nothing when that is disabled.
 
     A caller that passes *linked* has a steering glob (a ``steering`` component in
     its pattern, the test :func:`documents_for_member` applies to a match) leave a
@@ -1621,13 +1647,19 @@ def _resource_paths(
             continue
         path = _file_uri_path(resource)
         root = absolute_root if path.is_absolute() else source_root
+        global_steering = home_fallback and path.parts[:2] == (".kiro", "steering")
         if path.is_absolute():
             pattern = _resource_pattern(path, root)
-        elif home_fallback and path.parts[:1] == (".kiro",) and path.parts[1:2] != ("steering",):
+        elif global_steering:
+            anchor = _global_steering_anchor(path)
+            if anchor is None:
+                continue
+            root, pattern = anchor
+        elif home_fallback and path.parts[:1] == (".kiro",):
             root, pattern = _kiro_home_anchor(path)
         else:
             pattern = str(path)
-        steering_glob = "steering" in Path(pattern).parts
+        steering_glob = global_steering or "steering" in Path(pattern).parts
         left_out = linked if steering_glob else None
         escaping = outside if path.is_absolute() else left_out
         for match in _matches(
@@ -1825,9 +1857,13 @@ def global_always_steering_documents() -> dict[str, str]:
     # Steering past the document cap is left out too, as in the snapshot: only the
     # always-included files kept here count against it.
     documents: dict[str, str] = {}
-    for path in _matches(Path.home(), ".kiro/steering/**/*.md", linked=[], over_cap=[]):
+    scan = _global_steering_scan()
+    if scan is None:
+        return documents
+    steering_root, steering_glob = scan
+    for path in _matches(steering_root, steering_glob, linked=[], over_cap=[]):
         try:
-            body = _read(path, Path.home())
+            body = _read(path, steering_root)
         except _UnreadableEssentialSourceError as exc:
             logger.warning("Steering %s not loaded: %s", path, exc)
             continue

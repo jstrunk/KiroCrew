@@ -446,6 +446,7 @@ from kiro_crew.config.sections_slack import (  # noqa: F401
     is_slack_user_id,
     shared_user_ids,
 )
+from kiro_crew.config.sections_steering import SteeringConfig  # noqa: F401
 from kiro_crew.config.sections_stt import (  # noqa: F401
     _DEFERRED_STT_PROVIDERS,
     _RETIRED_STT_PROVIDERS,
@@ -570,6 +571,7 @@ _OWNERS = (
     "kiro_crew.config.sections_stt",
     "kiro_crew.config.sections_browser",
     "kiro_crew.config.sections_decisions",
+    "kiro_crew.config.sections_steering",
     "kiro_crew.config.sections_telemetry",
 )
 for _owner in _OWNERS:

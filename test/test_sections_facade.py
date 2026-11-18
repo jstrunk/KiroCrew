@@ -38,6 +38,7 @@ _OWNERS = tuple(
         "stt",
         "browser",
         "decisions",
+        "steering",
         "telemetry",
     )
 )

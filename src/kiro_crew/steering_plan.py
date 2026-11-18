@@ -172,18 +172,24 @@ def tree_verdict(
     return REACHES_NO, REASON_HARNESS_HAS_NO_PATH
 
 
-def _tree_root(entry: dict[str, Any], project: str | None) -> Path | None:
-    """The steering tree one listed entry sits in, or ``None`` when it has none."""
+def _tree_root(entry: dict[str, Any], project: str | None, global_root: Path | None) -> Path | None:
+    """The steering tree one listed entry sits in, or ``None`` when it has none.
+
+    *global_root* is :func:`kiro_crew.folder_steering.global_steering_dir`, read once
+    per plan: ``None`` when ``steering.global_dir`` disables global steering.
+    """
     if entry.get("source") == "user":
-        return Path.home() / ".kiro" / "steering"
+        return global_root
     if project:
         return Path(project) / ".kiro" / "steering"
     return None
 
 
-def _resolved_target(entry: dict[str, Any], project: str | None) -> Path | None:
+def _resolved_target(
+    entry: dict[str, Any], project: str | None, global_root: Path | None
+) -> Path | None:
     """The resolved path of one listed entry, or ``None`` when it has none."""
-    root = _tree_root(entry, project)
+    root = _tree_root(entry, project, global_root)
     rel = entry.get("rel")
     if root is None or not isinstance(rel, str) or not rel:
         return None
@@ -193,15 +199,26 @@ def _resolved_target(entry: dict[str, Any], project: str | None) -> Path | None:
         return None
 
 
-def _inside_tree(target: Path, entry: dict[str, Any], project: str | None) -> bool:
+def _inside_tree(
+    target: Path, entry: dict[str, Any], project: str | None, global_root: Path | None
+) -> bool:
     """Whether *target* resolves inside the entry's own steering tree.
 
     A link out of the tree can name a file the harness loads by itself
     (``~/.claude/CLAUDE.md``), so only an in-tree file is Crew's alone to send.
     Only the home or project anchor is resolved: ``.kiro/steering`` is appended
-    as written, so a tree root that is itself a link elsewhere holds nothing.
+    as written, so a tree root that is itself a link elsewhere holds nothing. A
+    relocated global tree (``steering.global_dir``) is anchored the same way, at its
+    parent folder.
     """
     if entry.get("source") == "user":
+        if global_root is None:
+            return False
+        if global_root != Path.home() / ".kiro" / "steering":
+            try:
+                return target.is_relative_to(global_root.parent.resolve() / global_root.name)
+            except (OSError, RuntimeError):
+                return False
         anchor = Path.home()
     elif project:
         anchor = Path(project)
@@ -273,8 +290,11 @@ def chat_steering_plan(
     switched off (:mod:`kiro_crew.steering_off`); the caller still lists those.
     """
     from kiro_crew import context as ctx
+    from kiro_crew.folder_steering import global_steering_dir
 
     folder_resolved = folder_resolved or {}
+    # Read once per plan: it loads the config, and every global row needs it.
+    global_root = global_steering_dir()
 
     declared = (
         declared_steering_targets(agent, project)
@@ -306,7 +326,7 @@ def chat_steering_plan(
         readable = bool(entry.get("readable", True))
         applies = str(entry.get("inclusion") or _ALWAYS) if readable else APPLIES_UNKNOWN
         path = str(entry.get("path") or "")
-        target = _resolved_target(entry, project)
+        target = _resolved_target(entry, project, global_root)
         if path in via_folder:
             reaches, reason = folder_yes
         else:
@@ -350,7 +370,9 @@ def chat_steering_plan(
         # folder section, a file the load withholds and anything outside the two
         # trees are not switchable.
         crew_written = (
-            dropped_by_load and target is not None and _inside_tree(target, entry, project)
+            dropped_by_load
+            and target is not None
+            and _inside_tree(target, entry, project, global_root)
         )
         rows.append(
             _switched(

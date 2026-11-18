@@ -774,3 +774,20 @@ def test_a_link_to_a_switched_off_file_reads_switched_off_too(home, tmp_path):
         plan.REACHES_NO,
         plan.REASON_SWITCHED_OFF,
     )
+
+
+def test_a_relocated_global_dir_is_judged_where_the_loader_reads_it(home, monkeypatch):
+    """``steering.global_dir``: a global row's target is in the configured tree."""
+    from kiro_crew import folder_steering
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.config.sections import SteeringConfig
+
+    moved = home / "dotfiles" / "steering"
+    _write(moved / "moved.md", "# Moved\nMOVED-RULE-7d2e\n")
+    cfg = KiroCrewConfig()
+    cfg.steering = SteeringConfig(global_dir=str(moved))
+    monkeypatch.setattr(folder_steering.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+
+    rows = [row for row in _claude_rows(None) if row["name"] == "moved.md"]
+
+    assert [(row["source"], row["reaches"]) for row in rows] == [("global", plan.REACHES_YES)]

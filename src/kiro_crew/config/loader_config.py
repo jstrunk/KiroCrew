@@ -115,6 +115,7 @@ from kiro_crew.config.sections import (
     SessionSummaryConfig,
     SkillsConfig,
     SlackConfig,
+    SteeringConfig,
     SttConfig,
     TaskRunnerConfig,
     TeamsConfig,
@@ -206,6 +207,10 @@ class KiroCrewConfig:
             "Telemetry",
             "Metrics telemetry (local-first JSONL sink). Off by default.",
         ),
+    )
+    steering: SteeringConfig = field(
+        default_factory=SteeringConfig,
+        metadata=_meta("Steering", "Global steering location."),
     )
     stt: SttConfig = field(
         default_factory=SttConfig,
@@ -791,6 +796,7 @@ class KiroCrewConfig:
             "skills": asdict(self.skills),
             "session_summary": asdict(self.session_summary),
             "session_environments": asdict(self.session_environments),
+            "steering": asdict(self.steering),
             "telemetry": asdict(self.telemetry),
             "snapshot_dir": self.snapshot_dir,
             "timezone": self.timezone,

@@ -193,6 +193,7 @@ from kiro_crew.config.section_builders import (  # noqa: F401
     _build_shared_access,
     _build_skills_config,
     _build_slack_config,
+    _build_steering_config,
     _build_stt_config,
     _build_taskrunner_config,
     _build_teams_config,

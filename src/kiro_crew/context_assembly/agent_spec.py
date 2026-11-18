@@ -92,6 +92,18 @@ _PROJECT_DEFAULT_RESOURCES = ("file://.kiro/steering/**/*.md", "file://AGENTS.md
 _GLOBAL_DEFAULT_RESOURCE = "file://~/.kiro/steering/**/*.md"
 
 
+def _global_default_resources() -> tuple[str, ...]:
+    """The global steering entry: the pin, ``steering.global_dir``, or none when disabled."""
+    from kiro_crew.folder_steering import global_steering_dir
+
+    global_dir = global_steering_dir()
+    if global_dir is None:
+        return ()
+    if global_dir == Path.home() / ".kiro" / "steering":
+        return (_GLOBAL_DEFAULT_RESOURCE,)
+    return (f"file://{global_dir.as_posix()}/**/*.md",)
+
+
 def _steering_glob_anchor(pattern: str, project: Path | None) -> tuple[Path, str]:
     """``(anchor directory, glob relative to it)`` for one ``file://`` *pattern*.
 
@@ -196,7 +208,7 @@ def steering_resource_documents(
         project_root = Path(project).expanduser() if project else None
         resources = [
             *(declared if isinstance(declared, list) else []),
-            _GLOBAL_DEFAULT_RESOURCE,
+            *_global_default_resources(),
             *(_PROJECT_DEFAULT_RESOURCES if project_root is not None else ()),
         ]
         # Matched by resolved path, as the de-duplication below is: an entry

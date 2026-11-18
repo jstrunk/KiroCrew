@@ -91,6 +91,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "session_summary",
         "session_environments",
         "telemetry",
+        "steering",
         "snapshot_dir",
         "timezone",
         "auto_update",

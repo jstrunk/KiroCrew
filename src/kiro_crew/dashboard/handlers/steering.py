@@ -53,6 +53,7 @@ from kiro_crew.context import steering_target_admissible
 from kiro_crew.dashboard.handlers.prompts_paths import _is_path_too_long_error
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import discovery_executor
+from kiro_crew.folder_steering import global_steering_dir
 from kiro_crew.frontmatter import STEERING_LOADER, set_frontmatter_fields, split_frontmatter
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.security import is_sensitive_path, is_sensitive_write_path
@@ -240,8 +241,9 @@ def steering_roots(project_dir: Path | None = None) -> list[tuple[str, Path]]:
     still excluded.
     """
     out: list[tuple[str, Path]] = []
-    user_dir = Path.home() / ".kiro" / "steering"
-    if not is_sensitive_path(str(user_dir)):
+    # The directory the session loader reads, whatever KIRO_HOME is; None = disabled.
+    user_dir = global_steering_dir()
+    if user_dir is not None and not is_sensitive_path(str(user_dir)):
         out.append(("user", user_dir))
     if project_dir:
         ws_dir = Path(project_dir) / ".kiro" / "steering"

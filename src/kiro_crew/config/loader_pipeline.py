@@ -110,6 +110,7 @@ from kiro_crew.config.section_builders import (
     _build_session_summary_config,
     _build_skills_config,
     _build_slack_config,
+    _build_steering_config,
     _build_stt_config,
     _build_taskrunner_config,
     _build_teams_config,
@@ -1005,6 +1006,7 @@ def build_config(
     session_environments_data = _coerced_section(data, "session_environments", _degraded)
     messaging_data = _coerced_section(data, "messaging", _degraded)
     telemetry_data = _coerced_section(data, "telemetry", _degraded)
+    steering_data = _coerced_section(data, "steering", _degraded)
     watchdog_data = _coerced_section(data, "watchdog", _degraded)
     work_ledger_data = _coerced_section(data, "work_ledger", _degraded)
     power_data = _coerced_section(data, "power", _degraded)
@@ -1250,6 +1252,7 @@ def build_config(
         power=_build_power_config(power_data),
         resource_limits=ResourceLimitsConfig.from_raw(resource_limits_data),
         telemetry=_build_telemetry_config(telemetry_data),
+        steering=_build_steering_config(steering_data),
         memory=_build_memory_config(memory_data),
         knowledge=_build_knowledge_config(knowledge_data),
         telegram=_build_telegram_config(telegram_data),

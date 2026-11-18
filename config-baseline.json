@@ -5126,6 +5126,37 @@
       "defaultValue": "https://d175o3ylxqum0e.cloudfront.net"
     },
     {
+      "path": "steering",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Steering",
+      "help": "Global steering location.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {
+        "global_dir": null
+      }
+    },
+    {
+      "path": "steering.global_dir",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Global Steering Dir",
+      "help": "Directory of global steering documents. Unset = ~/.kiro/steering. A path (~ is expanded) reads that directory instead; it must be under your home folder. Empty disables global steering. Project steering is unaffected.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null,
+      "nullable": true
+    },
+    {
       "path": "stt",
       "kind": "core",
       "type": "object",
